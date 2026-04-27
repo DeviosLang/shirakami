@@ -8,6 +8,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/DeviosLang/shirakami/internal/config"
+	"github.com/DeviosLang/shirakami/internal/feedback"
 	"github.com/DeviosLang/shirakami/internal/logger"
 )
 
@@ -37,6 +38,7 @@ func main() {
 				w.WriteHeader(http.StatusOK)
 				fmt.Fprintln(w, "ok")
 			})
+			mux.Handle("/metrics", feedback.Handler())
 
 			log.Sugar().Infof("listening on %s", addr)
 			return http.ListenAndServe(addr, mux)
