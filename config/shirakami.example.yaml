@@ -1,0 +1,26 @@
+workspace: /tmp/shirakami-workspace
+
+llm:
+  endpoint: https://api.openai.com/v1
+  api_key: ""
+  model: gpt-4o
+
+db:
+  dsn: postgres://user:password@localhost:5432/shirakami?sslmode=disable
+
+redis:
+  addr: localhost:6379
+
+repos:
+  - name: api-gateway
+    url: git@github.com:org/api-gateway.git
+    branch: main
+    role: entry
+  - name: payment-service
+    url: git@github.com:org/payment-service.git
+    branch: main
+
+changes:
+  - repo: payment-service
+    diff: ./diffs/payment.patch
+    desc: 修改支付超时重试逻辑
