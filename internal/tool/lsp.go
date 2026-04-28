@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	lspjson "encoding/json"
@@ -187,9 +188,28 @@ func (t *LSPTool) Execute(ctx context.Context, input json.RawMessage) (string, e
 }
 
 // ensureStarted starts gopls if not already running. Caller must hold t.mu.
+// If the process previously started but has since died, it is automatically
+// restarted (health check / auto-restart).
 func (t *LSPTool) ensureStarted(ctx context.Context) error {
 	if t.started {
-		return nil
+		// Health check: verify the process is still alive.
+		if t.proc != nil && t.proc.ProcessState != nil {
+			// ProcessState is non-nil only after Wait() has been called or the
+			// process has exited. Reset and fall through to restart.
+			t.started = false
+			t.proc = nil
+		} else if t.proc != nil {
+			// Try signal(0) to check liveness without actually killing.
+			if err := t.proc.Process.Signal(syscall.Signal(0)); err != nil {
+				// Process is gone — reset and restart.
+				t.started = false
+				t.proc = nil
+			} else {
+				return nil
+			}
+		} else {
+			return nil
+		}
 	}
 
 	workDir := t.WorkspaceDir

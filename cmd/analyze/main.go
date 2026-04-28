@@ -81,6 +81,7 @@ func defaultTools(workspaceDir string) []agent.Tool {
 		itool.NewRipgrepTool(workspaceDir),
 		itool.NewGlobTool(workspaceDir),
 		itool.NewReaderTool(),
+		itool.GlobalLSPManager.GetOrCreate(workspaceDir),
 	}
 	adapted := make([]agent.Tool, len(tools))
 	for i, t := range tools {
@@ -112,6 +113,9 @@ func buildAnalyzeCmd() *cobra.Command {
 			}
 			log := logger.Must("production")
 			defer log.Sync() //nolint:errcheck
+
+			// Ensure all gopls processes are cleaned up at session end.
+			defer itool.GlobalLSPManager.Close()
 
 			// Override workspace dir if provided.
 			if workspaceDir != "" {
