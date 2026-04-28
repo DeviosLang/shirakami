@@ -427,6 +427,71 @@ type lspOutgoingCall struct {
 	FromRanges []lspRange           `json:"fromRanges"`
 }
 
+// LSPManager is a process-level singleton that reuses gopls instances across
+// multiple tool calls within the same analysis session. Each unique workspace
+// directory gets exactly one gopls process.
+//
+// Usage:
+//
+//	tool := GlobalLSPManager.GetOrCreate("/path/to/workspace")
+//	defer GlobalLSPManager.Close()   // call at session end
+var GlobalLSPManager = &lspManager{tools: make(map[string]*LSPTool)}
+
+type lspManager struct {
+	mu    sync.Mutex
+	tools map[string]*LSPTool
+}
+
+// GetOrCreate returns an LSPTool for the given workspace, creating one if it
+// does not exist yet. The returned tool is shared — callers must not call
+// Close() on it directly; use lspManager.Close() or lspManager.CloseOne().
+func (m *lspManager) GetOrCreate(workspaceDir string) *LSPTool {
+	abs, err := filepath.Abs(workspaceDir)
+	if err != nil {
+		abs = workspaceDir
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if t, ok := m.tools[abs]; ok {
+		return t
+	}
+	t := NewLSPTool(abs)
+	m.tools[abs] = t
+	return t
+}
+
+// CloseOne shuts down the gopls process for a specific workspace and removes
+// it from the manager so a fresh one will be created on next GetOrCreate.
+func (m *lspManager) CloseOne(workspaceDir string) {
+	abs, err := filepath.Abs(workspaceDir)
+	if err != nil {
+		abs = workspaceDir
+	}
+	m.mu.Lock()
+	t, ok := m.tools[abs]
+	if ok {
+		delete(m.tools, abs)
+	}
+	m.mu.Unlock()
+	if ok {
+		t.Close()
+	}
+}
+
+// Close shuts down all managed gopls processes.
+func (m *lspManager) Close() {
+	m.mu.Lock()
+	tools := make([]*LSPTool, 0, len(m.tools))
+	for _, t := range m.tools {
+		tools = append(tools, t)
+	}
+	m.tools = make(map[string]*LSPTool)
+	m.mu.Unlock()
+	for _, t := range tools {
+		t.Close()
+	}
+}
+
 // pathToURI converts an absolute file path to a file:// URI.
 func pathToURI(path string) string {
 	u := &url.URL{
