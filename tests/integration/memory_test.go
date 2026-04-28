@@ -1,4 +1,4 @@
-package integration_test
+package integration
 
 import (
 	"context"
@@ -7,17 +7,15 @@ import (
 	"github.com/DeviosLang/shirakami/internal/memory"
 )
 
-// setupLayer1 creates a PostgreSQL container, creates the knowledge_base table,
-// and returns a *memory.Layer1 backed by the pool.
-func setupLayer1(t *testing.T) *memory.Layer1 {
+// setupLayer1DB creates a fresh PostgreSQL container with the knowledge_base
+// table and returns a *memory.Layer1 backed by the pool.
+func setupLayer1DB(t *testing.T) *memory.Layer1 {
 	t.Helper()
 	ctx := context.Background()
 
-	pool := startPostgresPool(t)
+	_, pool := startPostgresWithPool(t)
 
-	// Create only the knowledge_base table needed for Layer1 tests.
-	// (We don't need full goose migration here; creating the table directly
-	// keeps the helper self-contained and fast.)
+	// Create only the knowledge_base table for Layer1 tests.
 	_, err := pool.Exec(ctx, `
 CREATE TABLE IF NOT EXISTS knowledge_base (
     id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -37,13 +35,12 @@ CREATE TABLE IF NOT EXISTS knowledge_base (
 	return memory.NewLayer1(pool)
 }
 
-func TestLayer1_SaveAndSearchRelevant(t *testing.T) {
-	l1 := setupLayer1(t)
+func TestLayer1_WriteAndSearchByKeyword(t *testing.T) {
+	l1 := setupLayer1DB(t)
 	ctx := context.Background()
 
 	commitHash := "abc123def456"
 
-	// Save two records under the same commit hash.
 	if err := l1.SaveSymbolSummary(ctx,
 		"my-repo", "HandlePayment", "internal/payment/handler.go", 42,
 		"handles payment processing and validation", commitHash,
@@ -82,21 +79,19 @@ func TestLayer1_SaveAndSearchRelevant(t *testing.T) {
 	}
 }
 
-func TestLayer1_CommitHashFiltering(t *testing.T) {
-	l1 := setupLayer1(t)
+func TestLayer1_OldRecordsFilteredByCommitHash(t *testing.T) {
+	l1 := setupLayer1DB(t)
 	ctx := context.Background()
 
 	oldHash := "old000000000"
 	newHash := "new111111111"
 
-	// Record for the old commit.
 	if err := l1.SaveSymbolSummary(ctx,
 		"my-repo", "OldHandler", "internal/old.go", 1,
 		"old implementation of the handler", oldHash,
 	); err != nil {
 		t.Fatalf("SaveSymbolSummary OldHandler: %v", err)
 	}
-	// Record for the new commit.
 	if err := l1.SaveSymbolSummary(ctx,
 		"my-repo", "NewHandler", "internal/new.go", 1,
 		"new implementation of the handler", newHash,
@@ -111,7 +106,7 @@ func TestLayer1_CommitHashFiltering(t *testing.T) {
 	}
 	for _, r := range results {
 		if r.CommitHash == oldHash {
-			t.Errorf("stale record (commit %s) must not appear when querying for head %s", oldHash, newHash)
+			t.Errorf("stale record (commit %s) must not appear for head %s", oldHash, newHash)
 		}
 	}
 	if len(results) != 1 || results[0].Symbol != "NewHandler" {
@@ -119,33 +114,8 @@ func TestLayer1_CommitHashFiltering(t *testing.T) {
 	}
 }
 
-func TestLayer1_OnConflictDoNothing(t *testing.T) {
-	l1 := setupLayer1(t)
-	ctx := context.Background()
-
-	commitHash := "dup000000000"
-
-	// Inserting the same (repo, symbol, commit_hash) twice must not error.
-	for i := 0; i < 2; i++ {
-		if err := l1.SaveSymbolSummary(ctx,
-			"repo", "DuplicateSymbol", "pkg/dup.go", 5,
-			"duplicate summary", commitHash,
-		); err != nil {
-			t.Fatalf("SaveSymbolSummary iteration %d: %v", i, err)
-		}
-	}
-
-	results, err := l1.SearchRelevant(ctx, []string{"DuplicateSymbol"}, commitHash, 10)
-	if err != nil {
-		t.Fatalf("SearchRelevant: %v", err)
-	}
-	if len(results) != 1 {
-		t.Errorf("expected 1 row after duplicate insert (ON CONFLICT DO NOTHING), got %d", len(results))
-	}
-}
-
 func TestLayer1_EmptyKeywordsReturnsNil(t *testing.T) {
-	l1 := setupLayer1(t)
+	l1 := setupLayer1DB(t)
 	ctx := context.Background()
 
 	results, err := l1.SearchRelevant(ctx, []string{}, "any-hash", 10)

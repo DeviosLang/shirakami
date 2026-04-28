@@ -1,4 +1,4 @@
-package integration_test
+package integration
 
 import (
 	"context"
@@ -8,7 +8,7 @@ import (
 )
 
 func TestMigrations_AllTablesCreated(t *testing.T) {
-	db := startPostgresSQL(t)
+	db, _ := startPostgresWithPool(t)
 	ctx := context.Background()
 
 	if err := goose.SetDialect("postgres"); err != nil {
@@ -41,7 +41,7 @@ func TestMigrations_AllTablesCreated(t *testing.T) {
 }
 
 func TestAnalysisTasks_CRUD(t *testing.T) {
-	db := startPostgresSQL(t)
+	db, _ := startPostgresWithPool(t)
 	ctx := context.Background()
 
 	if err := goose.SetDialect("postgres"); err != nil {
@@ -121,7 +121,7 @@ func TestAnalysisTasks_CRUD(t *testing.T) {
 }
 
 func TestAnalysisTasks_CascadeDelete(t *testing.T) {
-	db := startPostgresSQL(t)
+	db, _ := startPostgresWithPool(t)
 	ctx := context.Background()
 
 	if err := goose.SetDialect("postgres"); err != nil {
@@ -131,7 +131,7 @@ func TestAnalysisTasks_CascadeDelete(t *testing.T) {
 		t.Fatalf("goose up: %v", err)
 	}
 
-	// Create a task
+	// Create a task.
 	var taskID string
 	err := db.QueryRowContext(ctx,
 		`INSERT INTO analysis_tasks (input_type) VALUES ($1) RETURNING id`,
@@ -141,7 +141,7 @@ func TestAnalysisTasks_CascadeDelete(t *testing.T) {
 		t.Fatalf("insert task: %v", err)
 	}
 
-	// Create a dependent result
+	// Create a dependent result.
 	_, err = db.ExecContext(ctx,
 		`INSERT INTO analysis_results (task_id, token_usage, step_count) VALUES ($1, $2, $3)`,
 		taskID, 100, 5,
@@ -150,7 +150,7 @@ func TestAnalysisTasks_CascadeDelete(t *testing.T) {
 		t.Fatalf("insert analysis_result: %v", err)
 	}
 
-	// Delete the task – result should cascade
+	// Delete the task – result should cascade.
 	_, err = db.ExecContext(ctx, "DELETE FROM analysis_tasks WHERE id = $1", taskID)
 	if err != nil {
 		t.Fatalf("delete task: %v", err)

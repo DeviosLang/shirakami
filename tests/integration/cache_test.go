@@ -1,4 +1,4 @@
-package integration_test
+package integration
 
 import (
 	"context"
@@ -26,18 +26,16 @@ func TestCacheKey_DifferentInputDifferentKey(t *testing.T) {
 }
 
 func TestCacheKey_DifferentGitHashDifferentKey(t *testing.T) {
-	// Without real git repos we simulate the effect: different path strings
-	// with no valid git repos will include the raw path in the hash, so two
-	// calls with different path slices must produce different keys.
+	// Without real git repos, different path strings cause different keys.
 	key1 := cache.CacheKey("same input", []string{"/repo/commit-aaa"})
 	key2 := cache.CacheKey("same input", []string{"/repo/commit-bbb"})
 	if key1 == key2 {
-		t.Error("CacheKey: different repo paths (simulating different commit hashes) produced the same key")
+		t.Error("CacheKey: different repo paths produced the same key")
 	}
 }
 
 func TestCache_SetGetRoundTrip(t *testing.T) {
-	rdb := startRedis(t)
+	rdb := startRedisClient(t)
 	c := cache.New(rdb)
 	ctx := context.Background()
 
@@ -72,7 +70,7 @@ func TestCache_SetGetRoundTrip(t *testing.T) {
 }
 
 func TestCache_MissOnUnknownKey(t *testing.T) {
-	rdb := startRedis(t)
+	rdb := startRedisClient(t)
 	c := cache.New(rdb)
 	ctx := context.Background()
 
@@ -83,7 +81,7 @@ func TestCache_MissOnUnknownKey(t *testing.T) {
 }
 
 func TestCache_TTLExpiry(t *testing.T) {
-	rdb := startRedis(t)
+	rdb := startRedisClient(t)
 	c := cache.New(rdb)
 	ctx := context.Background()
 

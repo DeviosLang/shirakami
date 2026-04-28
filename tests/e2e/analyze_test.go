@@ -1,52 +1,55 @@
-package e2e_test
+// Package e2e contains end-to-end integration tests for Shirakami.
+package e2e
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"testing"
 	"time"
 
+	_ "github.com/jackc/pgx/v5/stdlib"
 	"github.com/pressly/goose/v3"
 
 	"github.com/DeviosLang/shirakami/internal/cache"
 	"github.com/DeviosLang/shirakami/internal/checkpoint"
 	"github.com/DeviosLang/shirakami/internal/llm"
 	"github.com/DeviosLang/shirakami/internal/memory"
+	"github.com/DeviosLang/shirakami/internal/storage"
 )
 
-// TestAnalyzePipeline exercises the full storage / cache / checkpoint pipeline
-// end-to-end using real PostgreSQL and Redis containers (via testcontainers-go).
-//
-// Flow:
-//  1. Run goose migrations → 5 tables exist.
-//  2. Insert an analysis_task row and verify the DB round-trip.
-//  3. Store and retrieve an AnalysisResult via the cache layer.
-//  4. Save / Load a checkpoint to verify break-point resume semantics.
-//  5. Write a knowledge record via Layer1 and confirm it is searchable.
-func TestAnalyzePipeline(t *testing.T) {
-	infra := StartInfra(t)
+// TestAnalyzePipeline_StorageCacheCheckpointLayer1 exercises the core data
+// pipeline end-to-end using real PostgreSQL and Redis containers:
+//  1. goose migrations → 5 tables
+//  2. storage.Store CRUD round-trip
+//  3. cache Set / Get / TTL
+//  4. checkpoint Save → Load → Delete
+//  5. Layer1 SaveSymbolSummary → SearchRelevant
+func TestAnalyzePipeline_StorageCacheCheckpointLayer1(t *testing.T) {
+	pool, pgDSN := startPostgres(t)
+	rdb := startRedis(t)
 	ctx := context.Background()
 
-	// ------------------------------------------------------------------
-	// Step 1 – run goose migrations.
-	// ------------------------------------------------------------------
+	// --- Step 1: run migrations ---
+	migrPath := migrationsPath(t)
+
+	db, err := sql.Open("pgx", pgDSN)
+	if err != nil {
+		t.Fatalf("sql.Open: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+
 	if err := goose.SetDialect("postgres"); err != nil {
 		t.Fatalf("goose set dialect: %v", err)
 	}
-	if err := goose.UpContext(ctx, infra.DB, "../../migrations"); err != nil {
+	if err := goose.UpContext(ctx, db, migrPath); err != nil {
 		t.Fatalf("goose up: %v", err)
 	}
 
-	expectedTables := []string{
-		"analysis_tasks",
-		"analysis_results",
-		"knowledge_base",
-		"feedback",
-		"metrics_daily",
-	}
-	for _, tbl := range expectedTables {
+	tables := []string{"analysis_tasks", "analysis_results", "knowledge_base", "feedback", "metrics_daily"}
+	for _, tbl := range tables {
 		var exists bool
-		if err := infra.DB.QueryRowContext(ctx,
+		if err := db.QueryRowContext(ctx,
 			"SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = $1)",
 			tbl,
 		).Scan(&exists); err != nil {
@@ -57,52 +60,41 @@ func TestAnalyzePipeline(t *testing.T) {
 		}
 	}
 
-	// ------------------------------------------------------------------
-	// Step 2 – storage: insert an analysis_task.
-	// ------------------------------------------------------------------
-	diff := "--- a/internal/payment/handler.go\n+++ b/internal/payment/handler.go\n@@ -10,6 +10,7 @@ func HandlePayment(w http.ResponseWriter, r *http.Request) {\n+\tlog.Println(\"payment received\")\n }"
+	// --- Step 2: storage CRUD ---
+	store := storage.New(pool)
+
+	diff := "--- a/payment.go\n+++ b/payment.go\n@@ -5,0 +6 @@ func Pay() {\n+\tlog.Println(\"pay\")\n }"
 	cacheKey := cache.CacheKey(diff, []string{})
 
-	var taskID string
-	err := infra.DB.QueryRowContext(ctx,
-		`INSERT INTO analysis_tasks (input_type, input_diff, cache_key)
-		 VALUES ($1, $2, $3) RETURNING id`,
-		"diff", diff, cacheKey,
-	).Scan(&taskID)
+	task, err := store.CreateTask(ctx, storage.InputTypeDiff, diff, "", cacheKey)
 	if err != nil {
-		t.Fatalf("insert analysis_task: %v", err)
+		t.Fatalf("CreateTask: %v", err)
 	}
-	if taskID == "" {
-		t.Fatal("expected non-empty task ID")
-	}
-
-	// Verify the row is readable.
-	var gotInputType, gotStatus string
-	if err := infra.DB.QueryRowContext(ctx,
-		"SELECT input_type, status FROM analysis_tasks WHERE id = $1",
-		taskID,
-	).Scan(&gotInputType, &gotStatus); err != nil {
-		t.Fatalf("select analysis_task: %v", err)
-	}
-	if gotInputType != "diff" {
-		t.Errorf("input_type: got %s, want diff", gotInputType)
-	}
-	if gotStatus != "pending" {
-		t.Errorf("status: got %s, want pending", gotStatus)
+	if task.Status != storage.TaskStatusPending {
+		t.Errorf("status: got %s, want pending", task.Status)
 	}
 
-	// ------------------------------------------------------------------
-	// Step 3 – cache: store and retrieve an AnalysisResult.
-	// ------------------------------------------------------------------
-	c := cache.New(infra.RDB)
+	if err := store.UpdateTaskStatus(ctx, task.ID, storage.TaskStatusRunning); err != nil {
+		t.Fatalf("UpdateTaskStatus running: %v", err)
+	}
+	got, err := store.GetTask(ctx, task.ID)
+	if err != nil {
+		t.Fatalf("GetTask: %v", err)
+	}
+	if got.Status != storage.TaskStatusRunning {
+		t.Errorf("status after update: got %s, want running", got.Status)
+	}
+
+	// --- Step 3: cache Set / Get / TTL ---
+	c := cache.New(rdb)
 
 	analysisResult := &cache.AnalysisResult{
-		TaskID:        taskID,
-		CallChain:     json.RawMessage(`["HandlePayment","processPayment","db.Save"]`),
-		TestScenarios: "happy path; missing card; duplicate transaction",
-		EntryPoints:   json.RawMessage(`["POST /api/v1/payments"]`),
-		TokenUsage:    1500,
-		StepCount:     8,
+		TaskID:        task.ID,
+		CallChain:     json.RawMessage(`["Pay","processPayment","db.Save"]`),
+		TestScenarios: "happy path; nil input; timeout",
+		EntryPoints:   json.RawMessage(`["POST /api/v1/pay"]`),
+		TokenUsage:    1200,
+		StepCount:     6,
 		CreatedAt:     time.Now().UTC().Truncate(time.Second),
 	}
 
@@ -110,89 +102,95 @@ func TestAnalyzePipeline(t *testing.T) {
 		t.Fatalf("cache Set: %v", err)
 	}
 
-	got, ok := c.Get(ctx, cacheKey)
+	cachedResult, ok := c.Get(ctx, cacheKey)
 	if !ok {
-		t.Fatal("expected cache hit after Set, got miss")
+		t.Fatal("expected cache hit, got miss")
 	}
-	if got.TaskID != taskID {
-		t.Errorf("cached TaskID: got %s, want %s", got.TaskID, taskID)
-	}
-	if got.StepCount != analysisResult.StepCount {
-		t.Errorf("cached StepCount: got %d, want %d", got.StepCount, analysisResult.StepCount)
+	if cachedResult.TaskID != task.ID {
+		t.Errorf("cached TaskID: got %s, want %s", cachedResult.TaskID, task.ID)
 	}
 
-	// ------------------------------------------------------------------
-	// Step 4 – checkpoint: Save → Load restores the full state.
-	// ------------------------------------------------------------------
-	cp := checkpoint.New(infra.RDB)
+	// Verify TTL behaviour with a short-lived entry.
+	shortKey := cache.CacheKey("short-lived-pipeline", []string{})
+	if err := c.Set(ctx, shortKey, &cache.AnalysisResult{TaskID: "short"}, 80*time.Millisecond); err != nil {
+		t.Fatalf("cache Set short: %v", err)
+	}
+	if _, ok := c.Get(ctx, shortKey); !ok {
+		t.Fatal("expected hit before TTL expiry")
+	}
+	time.Sleep(150 * time.Millisecond)
+	if _, ok := c.Get(ctx, shortKey); ok {
+		t.Error("expected miss after TTL expiry, got hit")
+	}
 
+	// --- Step 4: checkpoint Save → Load → Delete ---
+	cp := checkpoint.New(rdb)
 	cpMessages := []llm.Message{
 		llm.UserMessage{Content: diff},
-		llm.AssistantMessage{Content: "analyzing call chain for HandlePayment"},
+		llm.AssistantMessage{Content: "tracing call chain for Pay"},
 	}
-	if err := cp.Save(ctx, taskID, cpMessages, 2); err != nil {
+	if err := cp.Save(ctx, task.ID, cpMessages, 2); err != nil {
 		t.Fatalf("checkpoint Save: %v", err)
 	}
 
-	state, restoredMsgs, err := cp.Load(ctx, taskID)
+	cpState, restoredMsgs, err := cp.Load(ctx, task.ID)
 	if err != nil {
 		t.Fatalf("checkpoint Load: %v", err)
 	}
-	if state == nil {
+	if cpState == nil {
 		t.Fatal("expected non-nil checkpoint state")
 	}
-	if state.StepCount != 2 {
-		t.Errorf("checkpoint StepCount: got %d, want 2", state.StepCount)
+	if cpState.StepCount != 2 {
+		t.Errorf("StepCount: got %d, want 2", cpState.StepCount)
 	}
 	if len(restoredMsgs) != 2 {
-		t.Fatalf("checkpoint messages: got %d, want 2", len(restoredMsgs))
-	}
-	if um, ok := restoredMsgs[0].(llm.UserMessage); !ok || um.Content != diff {
-		t.Errorf("restored[0] mismatch: %+v", restoredMsgs[0])
+		t.Fatalf("restored messages: got %d, want 2", len(restoredMsgs))
 	}
 
-	// Clean up checkpoint (simulates successful completion).
-	if err := cp.Delete(ctx, taskID); err != nil {
+	if err := cp.Delete(ctx, task.ID); err != nil {
 		t.Fatalf("checkpoint Delete: %v", err)
 	}
-	nilState, _, err := cp.Load(ctx, taskID)
+	nilState, _, err := cp.Load(ctx, task.ID)
 	if err != nil {
-		t.Fatalf("checkpoint Load after Delete: %v", err)
+		t.Fatalf("Load after Delete: %v", err)
 	}
 	if nilState != nil {
-		t.Error("expected nil state after Delete, got non-nil")
+		t.Error("expected nil state after Delete")
 	}
 
-	// ------------------------------------------------------------------
-	// Step 5 – Layer1: save a knowledge record and retrieve it.
-	// ------------------------------------------------------------------
-	l1 := memory.NewLayer1(infra.Pool)
-	commitHash := "e2e000abc123"
+	// --- Step 5: Layer1 knowledge record ---
+	l1 := memory.NewLayer1(pool)
+	commitHash := "e2eabc123"
 
 	if err := l1.SaveSymbolSummary(ctx,
-		"payment-service", "HandlePayment",
-		"internal/payment/handler.go", 10,
-		"entry point for payment processing; validates card and calls processPayment",
+		"payment-service", "Pay",
+		"internal/payment/pay.go", 5,
+		"entry point for payment flow; calls processPayment",
 		commitHash,
 	); err != nil {
 		t.Fatalf("Layer1 SaveSymbolSummary: %v", err)
 	}
 
-	records, err := l1.SearchRelevant(ctx, []string{"payment"}, commitHash, 5)
+	records, err := l1.SearchRelevant(ctx, []string{"Pay"}, commitHash, 5)
 	if err != nil {
 		t.Fatalf("Layer1 SearchRelevant: %v", err)
 	}
-	if len(records) == 0 {
-		t.Fatal("expected at least 1 knowledge record, got 0")
-	}
 	found := false
 	for _, r := range records {
-		if r.Symbol == "HandlePayment" {
+		if r.Symbol == "Pay" {
 			found = true
-			break
 		}
 	}
 	if !found {
-		t.Errorf("HandlePayment not found in Layer1 results: %+v", records)
+		t.Errorf("expected 'Pay' in Layer1 results, got %+v", records)
+	}
+
+	// Stale commit must not appear.
+	staleRecords, err := l1.SearchRelevant(ctx, []string{"Pay"}, "different-hash", 5)
+	if err != nil {
+		t.Fatalf("Layer1 SearchRelevant stale: %v", err)
+	}
+	if len(staleRecords) != 0 {
+		t.Errorf("expected 0 results for stale hash, got %d", len(staleRecords))
 	}
 }

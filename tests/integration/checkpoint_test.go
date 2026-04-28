@@ -1,4 +1,4 @@
-package integration_test
+package integration
 
 import (
 	"context"
@@ -10,7 +10,7 @@ import (
 )
 
 func TestCheckpointer_SaveLoadRestoresFullState(t *testing.T) {
-	rdb := startRedis(t)
+	rdb := startRedisClient(t)
 	cp := checkpoint.New(rdb)
 	ctx := context.Background()
 
@@ -48,7 +48,7 @@ func TestCheckpointer_SaveLoadRestoresFullState(t *testing.T) {
 		t.Errorf("restored[0]: got %+v, want UserMessage{analyze this diff}", restored[0])
 	}
 	if am, ok := restored[1].(llm.AssistantMessage); !ok || am.Content != "I will trace the call chain" {
-		t.Errorf("restored[1]: got %+v, want AssistantMessage{I will trace...}", restored[1])
+		t.Errorf("restored[1]: got %+v", restored[1])
 	}
 	if tr, ok := restored[2].(llm.ToolResultMessage); !ok || tr.ToolCallID != "tc-1" {
 		t.Errorf("restored[2]: got %+v, want ToolResultMessage{tc-1}", restored[2])
@@ -56,7 +56,7 @@ func TestCheckpointer_SaveLoadRestoresFullState(t *testing.T) {
 }
 
 func TestCheckpointer_MissOnUnknownKey(t *testing.T) {
-	rdb := startRedis(t)
+	rdb := startRedisClient(t)
 	cp := checkpoint.New(rdb)
 	ctx := context.Background()
 
@@ -70,7 +70,7 @@ func TestCheckpointer_MissOnUnknownKey(t *testing.T) {
 }
 
 func TestCheckpointer_DeleteRemovesKey(t *testing.T) {
-	rdb := startRedis(t)
+	rdb := startRedisClient(t)
 	cp := checkpoint.New(rdb)
 	ctx := context.Background()
 
@@ -94,7 +94,7 @@ func TestCheckpointer_DeleteRemovesKey(t *testing.T) {
 }
 
 func TestCheckpointer_TTLExpiry(t *testing.T) {
-	rdb := startRedis(t)
+	rdb := startRedisClient(t)
 	cp := checkpoint.New(rdb)
 	ctx := context.Background()
 
