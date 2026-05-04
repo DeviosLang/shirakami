@@ -52,6 +52,7 @@ func buildRoot() *cobra.Command {
 		buildResultsCmd(),
 		buildFeedbackCmd(),
 		buildWorkspaceCmd(),
+		buildIndexCmd(),
 	)
 	return root
 }
