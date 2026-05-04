@@ -1,0 +1,2 @@
+source_repo: vstation_compute
+description: "VMachineCreate 增加资源配额校验和通知，影响跨仓库调用链"

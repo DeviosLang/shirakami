@@ -1,0 +1,21 @@
+diff --git a/compute/image/install_win_virtio.py b/compute/image/install_win_virtio.py
+index abc1234..def5678 100644
+--- a/compute/image/install_win_virtio.py
++++ b/compute/image/install_win_virtio.py
+@@ -220,6 +220,15 @@ class VirtioInstaller:
+     def install_virtio_driver(self, instance_id, image_path):
+         """Install virtio driver for Windows instance."""
+         log_info("Installing virtio driver for instance %s" % instance_id)
++
++    def install_virtio_driver_v2(self, instance_id, image_path, driver_version=None):
++        """Install virtio driver v2 with version selection support.
++
++        Args:
++            instance_id: VM instance identifier
++            image_path: path to the Windows image
++            driver_version: optional specific driver version (default: latest)
++        """
++        if driver_version is None:
++            driver_version = self._get_latest_driver_version()
++        log_info("Installing virtio driver v2 (%s) for %s" % (driver_version, instance_id))
+         return self._do_install(instance_id, image_path)
