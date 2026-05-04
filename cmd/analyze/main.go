@@ -17,6 +17,7 @@ import (
 	"github.com/DeviosLang/shirakami/internal/cache"
 	"github.com/DeviosLang/shirakami/internal/checkpoint"
 	"github.com/DeviosLang/shirakami/internal/config"
+	"github.com/DeviosLang/shirakami/internal/index"
 	"github.com/DeviosLang/shirakami/internal/llm"
 	"github.com/DeviosLang/shirakami/internal/logger"
 	"github.com/DeviosLang/shirakami/internal/report"
@@ -225,8 +226,10 @@ func buildAnalyzeCmd() *cobra.Command {
 
 			// Set up DB.
 			var store *storage.Store
+			var pool *pgxpool.Pool
 			if cfg.DB.DSN != "" {
-				pool, err := pgxpool.New(ctx, cfg.DB.DSN)
+				var err error
+				pool, err = pgxpool.New(ctx, cfg.DB.DSN)
 				if err != nil {
 					log.Sugar().Warnw("db connect failed, skipping persistence", "err", err)
 				} else {
@@ -301,6 +304,37 @@ func buildAnalyzeCmd() *cobra.Command {
 				}
 				orch.SetContractHints(hints)
 				log.Sugar().Infow("contracts.loaded", "count", len(hints))
+			}
+
+			// Index mode: load symbol graph for hybrid/deterministic analysis.
+			indexMode := "off"
+			if cmd.Flags().Changed("index-mode") {
+				indexMode, _ = cmd.Flags().GetString("index-mode")
+			}
+			orch.SetIndexMode(indexMode)
+
+			if indexMode != "off" && pool != nil {
+				// Try to load index graph from DB
+				idxStore := index.NewStore(pool)
+				repoNames := make([]string, 0, len(repos))
+				for _, r := range repos {
+					repoNames = append(repoNames, r.Name)
+				}
+				nodes, _ := idxStore.LoadAllNodes(ctx, repoNames)
+				edges, _ := idxStore.LoadAllEdges(ctx, repoNames)
+				if len(nodes) > 0 {
+					graph := index.NewInMemoryGraph()
+					graph.Load(nodes, edges)
+					orch.SetIndexGraph(&graphAdapter{graph: graph})
+					log.Sugar().Infow("index.graph_loaded",
+						"nodes", graph.NodeCount(),
+						"edges", graph.EdgeCount(),
+						"mode", indexMode,
+					)
+				} else {
+					log.Sugar().Infow("index.graph_empty", "mode", indexMode,
+						"hint", "run 'shirakami index update' to build the symbol index")
+				}
 			}
 
 			_ = maxSteps // max-steps is passed to orchestrator via constructor in future
@@ -392,6 +426,7 @@ func buildAnalyzeCmd() *cobra.Command {
 	cmd.Flags().BoolVar(&noCache, "no-cache", false, "skip cache lookup and force fresh analysis")
 	cmd.Flags().StringVar(&analysisConfig, "analysis", "", "YAML analysis config file (supports multiple patches + scope filter); when set, overrides --diff")
 	cmd.Flags().BoolVar(&fastMode, "fast", false, "fast mode: limit cross-repo rounds to 3 (default is deep mode with 10 rounds)")
+	cmd.Flags().String("index-mode", "off", "index usage mode: off (pure LLM), shadow, hybrid, deterministic")
 
 	return cmd
 }

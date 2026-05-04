@@ -76,6 +76,44 @@ type Orchestrator struct {
 	// contractHints are pre-declared cross-repo relationships from config.
 	// Formatted as human-readable strings injected into Worker prompts.
 	contractHints []string
+	// indexGraph is the in-memory symbol graph for deterministic call chain analysis.
+	// When non-nil, enables hybrid mode: graph traversal first, LLM fallback for uncovered.
+	indexGraph IndexGraph
+	// indexMode controls how the index is used: "off", "shadow", "hybrid", "deterministic".
+	indexMode string
+}
+
+// IndexGraph is the interface consumed by Orchestrator for deterministic analysis.
+// Satisfied by *index.InMemoryGraph.
+type IndexGraph interface {
+	// Impact performs BFS traversal and returns affected symbols.
+	Impact(startIDs []string, direction string, maxDepth int, minConfidence float64) []IndexAffectedSymbol
+	// FindNodesByName returns nodes matching a name.
+	FindNodesByName(name string) []IndexSymbolNode
+	// NodeCount returns total nodes in graph.
+	NodeCount() int
+}
+
+// IndexAffectedSymbol is the interface-compatible version of index.AffectedSymbol.
+type IndexAffectedSymbol struct {
+	ID         string
+	Name       string
+	FilePath   string
+	Repo       string
+	Depth      int
+	Confidence float64
+	EdgeType   string
+}
+
+// IndexSymbolNode is the interface-compatible version of index.SymbolNode (subset).
+type IndexSymbolNode struct {
+	ID        string
+	Repo      string
+	FilePath  string
+	Name      string
+	Kind      string
+	StartLine int
+	EndLine   int
 }
 
 // NewOrchestrator creates a new Orchestrator.
@@ -114,6 +152,18 @@ func (o *Orchestrator) SetContractHints(hints []string) {
 	o.contractHints = hints
 }
 
+// SetIndexGraph injects the in-memory symbol graph for hybrid/deterministic mode.
+// When set, the orchestrator will attempt graph-based analysis before falling back to LLM.
+func (o *Orchestrator) SetIndexGraph(graph IndexGraph) {
+	o.indexGraph = graph
+}
+
+// SetIndexMode sets how the index is used during analysis.
+// Valid values: "off" (default, pure LLM), "shadow", "hybrid", "deterministic".
+func (o *Orchestrator) SetIndexMode(mode string) {
+	o.indexMode = mode
+}
+
 // Run analyses the provided diff and returns the complete call-chain graph.
 func (o *Orchestrator) Run(ctx context.Context, input AnalysisInput) (*AnalysisOutput, error) {
 	log := logger.S()
@@ -135,6 +185,7 @@ func (o *Orchestrator) Run(ctx context.Context, input AnalysisInput) (*AnalysisO
 		"description", input.Description,
 		"mode", mode,
 		"max_rounds", maxRounds,
+		"index_mode", o.indexMode,
 	)
 
 	// Step 1 – extract changed functions from the diff.
@@ -153,6 +204,46 @@ func (o *Orchestrator) Run(ctx context.Context, input AnalysisInput) (*AnalysisO
 	output := &AnalysisOutput{
 		ChangedFunctions: changed,
 		WorkerOutputs:    make(map[string]*WorkerResult),
+	}
+
+	// Step 1b – Hybrid/Deterministic mode: try graph-based analysis first.
+	// If the index graph is available, resolve call chains deterministically
+	// before (or instead of) launching LLM Workers.
+	if o.indexGraph != nil && o.indexGraph.NodeCount() > 0 &&
+		(o.indexMode == "hybrid" || o.indexMode == "deterministic") {
+
+		graphResult := o.runGraphAnalysis(changed, input.SourceRepo)
+
+		if o.indexMode == "deterministic" || len(graphResult.uncovered) == 0 {
+			// Deterministic mode OR full coverage: return graph result directly
+			log.Infow("analyse.graph_complete",
+				"mode", o.indexMode,
+				"graph_nodes", len(graphResult.nodes),
+				"graph_entries", len(graphResult.entryPoints),
+				"uncovered", len(graphResult.uncovered),
+				"duration_ms", time.Since(runStart).Milliseconds(),
+			)
+			output.CallGraph = graphResult.nodes
+			output.EntryPoints = graphResult.entryPoints
+			// In deterministic mode, skip LLM Workers entirely
+			if o.indexMode == "deterministic" {
+				return output, nil
+			}
+			// Hybrid with full coverage: still skip LLM
+			return output, nil
+		}
+
+		// Hybrid mode with partial coverage: merge graph results + continue with LLM for uncovered
+		output.CallGraph = append(output.CallGraph, graphResult.nodes...)
+		output.EntryPoints = append(output.EntryPoints, graphResult.entryPoints...)
+		// Override changed to only include uncovered functions (LLM handles only what graph missed)
+		changed = graphResult.uncovered
+		log.Infow("analyse.graph_partial",
+			"graph_nodes", len(graphResult.nodes),
+			"graph_entries", len(graphResult.entryPoints),
+			"uncovered_for_llm", len(changed),
+			"duration_ms", time.Since(step1).Milliseconds(),
+		)
 	}
 
 	// Step 2 – group changed functions by repo, then by file within each repo.
@@ -1213,4 +1304,99 @@ func (o *Orchestrator) applyTriage(ctx context.Context, pending map[string][]str
 		"skipped", len(triageResult.Skipped),
 	)
 	return merged
+}
+
+// ---------------------------------------------------------------------------
+// Graph-based analysis (hybrid/deterministic mode)
+// ---------------------------------------------------------------------------
+
+// graphAnalysisResult holds the output from deterministic graph traversal.
+type graphAnalysisResult struct {
+	nodes       []CallNode
+	entryPoints []CallNode
+	uncovered   []string // function names not found in the index (need LLM)
+}
+
+// runGraphAnalysis performs deterministic call chain analysis using the index graph.
+// For each changed function, it resolves the symbol in the graph and runs BFS
+// to find all upstream callers (up to depth 3).
+func (o *Orchestrator) runGraphAnalysis(changedFunctions []string, sourceRepo string) *graphAnalysisResult {
+	log := logger.S()
+	result := &graphAnalysisResult{}
+
+	var startIDs []string
+
+	for _, fn := range changedFunctions {
+		// Try to resolve function name to a graph node
+		// Extract the function name part (after :: if present)
+		funcName := fn
+		if idx := strings.LastIndex(fn, "::"); idx >= 0 {
+			funcName = fn[idx+2:]
+		}
+		// Strip repo prefix if present (e.g. "vstation_compute/compute/disk/encrypt_disk.py::func")
+		if idx := strings.Index(funcName, "/"); idx >= 0 {
+			parts := strings.SplitN(fn, "/", 2)
+			if len(parts) == 2 && o.repoExists(parts[0]) {
+				// Already handled by funcName extraction above
+			}
+		}
+
+		nodes := o.indexGraph.FindNodesByName(funcName)
+		if len(nodes) == 0 {
+			// Try with simple name (last segment after .)
+			if dotIdx := strings.LastIndex(funcName, "."); dotIdx >= 0 {
+				simpleName := funcName[dotIdx+1:]
+				nodes = o.indexGraph.FindNodesByName(simpleName)
+			}
+		}
+
+		if len(nodes) == 0 {
+			result.uncovered = append(result.uncovered, fn)
+			continue
+		}
+
+		// Use first matching node (TODO: disambiguate by file path)
+		for _, n := range nodes {
+			startIDs = append(startIDs, n.ID)
+		}
+	}
+
+	if len(startIDs) == 0 {
+		result.uncovered = changedFunctions
+		return result
+	}
+
+	log.Infow("graph.analysis_start",
+		"start_symbols", len(startIDs),
+		"uncovered", len(result.uncovered),
+	)
+
+	// BFS upstream (find callers)
+	affected := o.indexGraph.Impact(startIDs, "upstream", 3, 0.0)
+
+	// Convert to CallNodes
+	for _, a := range affected {
+		node := CallNode{
+			Repo:     a.Repo,
+			File:     a.FilePath,
+			Function: a.Name,
+		}
+		result.nodes = append(result.nodes, node)
+
+		// Check if this node is in an entry-role repo
+		for _, r := range o.repos {
+			if strings.EqualFold(r.Role, "entry") && r.Name == a.Repo {
+				result.entryPoints = append(result.entryPoints, node)
+				break
+			}
+		}
+	}
+
+	log.Infow("graph.analysis_done",
+		"affected_symbols", len(affected),
+		"entry_points", len(result.entryPoints),
+		"uncovered", len(result.uncovered),
+	)
+
+	return result
 }
