@@ -211,7 +211,7 @@ func getIndexableRepos(cfg *config.Config, filterRepo string) []indexableRepo {
 		// Detect language by checking for go.mod in the repo
 		repoPath := cfg.Workspace.Dir + "/" + r.Name
 		lang := detectLanguage(repoPath)
-		if lang == "go" { // Currently only Go repos are indexable
+		if lang == "go" || lang == "python" { // Go and Python repos are indexable
 			repos = append(repos, indexableRepo{Name: r.Name, Language: lang})
 		}
 	}
@@ -256,7 +256,7 @@ func indexRepo(ctx context.Context, store *index.Store, repo indexableRepo, work
 		}
 	}
 
-	fmt.Printf("INDEX  %-30s  ...", repo.Name)
+	fmt.Printf("INDEX  %-30s  [%s] ...", repo.Name, repo.Language)
 	start := time.Now()
 
 	// Full rebuild: delete existing data first
@@ -266,9 +266,21 @@ func indexRepo(ctx context.Context, store *index.Store, repo indexableRepo, work
 		}
 	}
 
-	// Run Go indexer
-	indexer := index.NewGoIndexer(repo.Name, repoPath, head)
-	result, err := indexer.Index()
+	// Run the appropriate indexer based on language
+	var result *index.IndexResult
+	var err error
+
+	switch repo.Language {
+	case "go":
+		indexer := index.NewGoIndexer(repo.Name, repoPath, head)
+		result, err = indexer.Index()
+	case "python":
+		indexer := index.NewPythonIndexer(repo.Name, repoPath, head)
+		result, err = indexer.Index()
+	default:
+		return fmt.Errorf("unsupported language: %s", repo.Language)
+	}
+
 	if err != nil {
 		return fmt.Errorf("index failed: %w", err)
 	}

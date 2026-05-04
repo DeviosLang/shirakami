@@ -33,6 +33,9 @@ type WorkerTask struct {
 	// ContractHints are known cross-repo relationships declared in shirakami.yaml.
 	// Injected into the Worker prompt so the LLM can confirm/deny without searching.
 	ContractHints []string
+	// ImportContext is a pre-built import graph summary for the repo (Python).
+	// Reduces LLM search rounds by providing known import relationships upfront.
+	ImportContext string
 }
 
 // SearchResult holds one raw ripgrep hit — file path, line, and caller name.
@@ -337,11 +340,21 @@ func (w *WorkerAgent) Analyse(ctx context.Context, task WorkerTask) (*WorkerResu
 			"record the cross-repo call directly (confidence is high for declared contracts).\n\n"
 	}
 
+	// Build import context section (from Python index — reduces search rounds).
+	importContextSection := ""
+	if task.ImportContext != "" {
+		importContextSection = task.ImportContext + "\n" +
+			"Use the import graph above to trace callers WITHOUT ripgrep when possible.\n" +
+			"If file A imports function X from file B, and X is in the changed functions list,\n" +
+			"then A is a direct caller — record it in nodes[] without needing to search.\n\n"
+	}
+
 	prompt := fmt.Sprintf(
 		"SOURCE REPOSITORY: %s\n"+
 			"REPOSITORY PATH: %s\n"+
 			"CHANGED FUNCTIONS TO TRACE:\n%s"+
 			"EXTERNAL CALLERS (from other repos calling into this repo):\n%s\n"+
+			"%s"+
 			"%s"+
 			"ENTRY-ROLE REPOSITORIES (stop tracing when you reach these): %s\n\n"+
 			"MANDATORY INSTRUCTIONS:\n\n"+
@@ -392,6 +405,7 @@ func (w *WorkerAgent) Analyse(ctx context.Context, task WorkerTask) (*WorkerResu
 		formatList(combinedFuncs),
 		formatList(task.ExternalCallers),
 		contractHintsSection,
+		importContextSection,
 		entryRepoList,
 		task.RepoName,
 		task.RepoName,

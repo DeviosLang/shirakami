@@ -332,6 +332,17 @@ func buildAnalyzeCmd() *cobra.Command {
 						"edges", graph.EdgeCount(),
 						"mode", indexMode,
 					)
+
+					// Build import context for Python repos (reduces LLM search rounds)
+					changedFiles := extractDiffFilesFromInput(input)
+					importCtx := index.BuildImportContext(nodes, edges, input.SourceRepo, changedFiles)
+					if importCtx != "" {
+						orch.SetImportContext(importCtx)
+						log.Sugar().Infow("index.import_context_built",
+							"repo", input.SourceRepo,
+							"context_bytes", len(importCtx),
+						)
+					}
 				} else {
 					log.Sugar().Infow("index.graph_empty", "mode", indexMode,
 						"hint", "run 'shirakami index update' to build the symbol index")
@@ -646,6 +657,23 @@ func buildWorkspaceSyncCmd() *cobra.Command {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+func extractDiffFilesFromInput(input agent.AnalysisInput) []string {
+	// Extract changed file paths from diff using ParseDiffHunks
+	if input.Diff == "" {
+		return nil
+	}
+	hunks := itool.ParseDiffHunks(input.Diff)
+	seen := make(map[string]bool)
+	var files []string
+	for _, h := range hunks {
+		if !seen[h.File] {
+			seen[h.File] = true
+			files = append(files, h.File)
+		}
+	}
+	return files
+}
 
 func configRepos(cfg *config.Config) []agent.RepoInfo {
 	// Multi-repo mode: use repos defined in workspace.repos config.
