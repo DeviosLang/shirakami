@@ -1,0 +1,9 @@
+{
+  "case_id": "compute-mr1681-encrypt-disk",
+  "description": "vstation_compute MR1681: encrypt_disk.py 块设备大小检测改进 + Python 2/3 兼容性",
+  "created_at": "2026-05-05",
+  "source": "reports/v29_best_result.md",
+  "difficulty": "medium",
+  "tags": ["cross-repo", "python", "dynamic-dispatch", "encryption"],
+  "notes": "跨仓库关系通过 dispatch dict 动态注册(Python getattr pattern)，确定性层难以覆盖"
+}
