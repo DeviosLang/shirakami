@@ -26,10 +26,18 @@ type CallNode struct {
 	Repo     string `json:"repo"`
 }
 
-// LSPTool manages a gopls process and exposes call hierarchy operations.
+// LSPTool manages an LSP server process and exposes call hierarchy operations.
+// It auto-detects the repository language and selects the appropriate server:
+//   - Go        → gopls
+//   - Python     → pyright (pyright-langserver)
+//   - TypeScript/JavaScript → typescript-language-server
+//   - (others)  → gopls as fallback (may not work, but won't panic)
 type LSPTool struct {
-	// WorkspaceDir is the root of the Go workspace/module.
+	// WorkspaceDir is the root of the repository to analyse.
 	WorkspaceDir string
+	// Language is auto-detected from repository contents.
+	// May be overridden before first use.
+	Language string
 
 	mu      sync.Mutex
 	proc    *exec.Cmd
@@ -46,7 +54,118 @@ func NewLSPTool(workspaceDir string) *LSPTool {
 func (t *LSPTool) Name() string { return "lsp_call_hierarchy" }
 
 func (t *LSPTool) Description() string {
-	return "Query the Go call hierarchy via gopls LSP. Operations: incomingCalls (callers of a function) or outgoingCalls (callees of a function)."
+	lang := t.detectLanguage()
+	server := lspServerForLanguage(lang)
+	return fmt.Sprintf(
+		"Query call hierarchy via %s LSP (%s). "+
+			"Operations: incomingCalls (find callers), outgoingCalls (find callees). "+
+			"Use 'repo' parameter to specify which repository to analyse.",
+		server, lang,
+	)
+}
+
+// detectLanguage returns the primary language of WorkspaceDir by scanning
+// marker files and source file extensions.
+func (t *LSPTool) detectLanguage() string {
+	if t.Language != "" {
+		return t.Language
+	}
+	lang := detectRepoLanguage(t.WorkspaceDir)
+	t.Language = lang
+	return lang
+}
+
+// detectRepoLanguage scans a directory for language marker files.
+// Priority: marker files first, then dominant file extension.
+func detectRepoLanguage(dir string) string {
+	if dir == "" {
+		return "go"
+	}
+
+	// Marker files → definitive language signal.
+	markers := map[string]string{
+		"go.mod":           "go",
+		"go.sum":           "go",
+		"pyproject.toml":   "python",
+		"setup.py":         "python",
+		"setup.cfg":        "python",
+		"requirements.txt": "python",
+		"Pipfile":          "python",
+		"package.json":     "typescript",
+		"tsconfig.json":    "typescript",
+		"pom.xml":          "java",
+		"build.gradle":     "java",
+		"CMakeLists.txt":   "cpp",
+		"Cargo.toml":       "rust",
+	}
+	for marker, lang := range markers {
+		if _, err := os.Stat(filepath.Join(dir, marker)); err == nil {
+			return lang
+		}
+	}
+
+	// Count source files by extension.
+	counts := map[string]int{}
+	extLang := map[string]string{
+		".go": "go", ".py": "python", ".ts": "typescript",
+		".tsx": "typescript", ".js": "typescript",
+		".java": "java", ".cpp": "cpp", ".cc": "cpp", ".rs": "rust",
+	}
+	entries, _ := os.ReadDir(dir)
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		ext := strings.ToLower(filepath.Ext(e.Name()))
+		if lang, ok := extLang[ext]; ok {
+			counts[lang]++
+		}
+	}
+	best, bestCount := "go", 0
+	for lang, count := range counts {
+		if count > bestCount {
+			best, bestCount = lang, count
+		}
+	}
+	return best
+}
+
+// lspServerForLanguage returns the LSP server binary name for a language.
+// Returns "" if no suitable server is known (caller should skip LSP).
+func lspServerForLanguage(lang string) string {
+	switch lang {
+	case "go":
+		return "gopls"
+	case "python":
+		// pyright supports callHierarchy; pylsp and jedi-language-server do not.
+		return "pyright-langserver"
+	case "typescript", "javascript":
+		return "typescript-language-server"
+	case "java":
+		return "jdtls"
+	case "cpp":
+		return "clangd"
+	case "rust":
+		return "rust-analyzer"
+	default:
+		return "gopls" // best-effort fallback
+	}
+}
+
+// lspServerArgs returns the command-line arguments for a language server.
+func lspServerArgs(server string) []string {
+	switch server {
+	case "gopls":
+		return []string{"-mode=stdio"}
+	case "pyright-langserver":
+		return []string{"--stdio"}
+	case "typescript-language-server":
+		return []string{"--stdio"}
+	case "clangd":
+		return []string{}
+	default:
+		return []string{"--stdio"}
+	}
 }
 
 func (t *LSPTool) InputSchema() map[string]interface{} {
@@ -221,21 +340,30 @@ func (t *LSPTool) ensureStarted(ctx context.Context) error {
 		return err
 	}
 
-	cmd := exec.CommandContext(ctx, "gopls", "-mode=stdio")
+	lang := t.detectLanguage()
+	server := lspServerForLanguage(lang)
+	args := lspServerArgs(server)
+
+	// Check if the language server binary exists; skip if not installed.
+	if _, err := exec.LookPath(server); err != nil {
+		return fmt.Errorf("lsp server %q not found (language: %s): %w", server, lang, err)
+	}
+
+	cmd := exec.CommandContext(ctx, server, args...)
 	cmd.Dir = absWork
 
 	stdinPipe, err := cmd.StdinPipe()
 	if err != nil {
-		return fmt.Errorf("gopls stdin pipe: %w", err)
+		return fmt.Errorf("lsp stdin pipe: %w", err)
 	}
 	stdoutPipe, err := cmd.StdoutPipe()
 	if err != nil {
-		return fmt.Errorf("gopls stdout pipe: %w", err)
+		return fmt.Errorf("lsp stdout pipe: %w", err)
 	}
 	cmd.Stderr = os.Stderr
 
 	if err := cmd.Start(); err != nil {
-		return fmt.Errorf("gopls start: %w", err)
+		return fmt.Errorf("lsp start (%s): %w", server, err)
 	}
 
 	t.proc = cmd
@@ -244,29 +372,136 @@ func (t *LSPTool) ensureStarted(ctx context.Context) error {
 	t.nextID = 1
 	t.started = true
 
-	// Initialize LSP
-	initParams := map[string]interface{}{
-		"processId": os.Getpid(),
-		"rootUri":   pathToURI(absWork),
-		"capabilities": map[string]interface{}{
-			"textDocument": map[string]interface{}{
-				"callHierarchy": map[string]interface{}{
-					"dynamicRegistration": false,
-				},
-			},
-		},
-	}
+	// Build language-specific initialization params.
+	initParams := buildInitParams(absWork, lang)
+
 	if _, err := t.sendRequest(ctx, "initialize", initParams); err != nil {
-		return fmt.Errorf("gopls initialize: %w", err)
+		return fmt.Errorf("lsp initialize (%s): %w", server, err)
 	}
 	// Send initialized notification
 	if err := t.sendNotification("initialized", map[string]interface{}{}); err != nil {
-		return fmt.Errorf("gopls initialized notification: %w", err)
+		return fmt.Errorf("lsp initialized notification: %w", err)
 	}
-	// Small delay to let gopls process workspace
-	time.Sleep(500 * time.Millisecond)
+	// Delay to let the language server index the workspace.
+	// pyright needs more time than gopls for large Python projects.
+	delay := 500 * time.Millisecond
+	if lang == "python" {
+		delay = 2 * time.Second
+	}
+	time.Sleep(delay)
 
 	return nil
+}
+
+// buildInitParams builds LSP initialize parameters tailored to each language.
+//
+// Key differences:
+//   - pyright: needs pythonPath, venvPath, pythonVersion in initializationOptions
+//              and workspace folders to correctly resolve imports
+//   - gopls:   standard rootUri is sufficient
+//   - others:  standard rootUri + workspace folders
+func buildInitParams(absWork, lang string) map[string]interface{} {
+	rootURI := pathToURI(absWork)
+
+	// Common capabilities required by all language servers.
+	capabilities := map[string]interface{}{
+		"textDocument": map[string]interface{}{
+			"callHierarchy": map[string]interface{}{
+				"dynamicRegistration": false,
+			},
+			"synchronization": map[string]interface{}{
+				"dynamicRegistration": false,
+			},
+		},
+		"workspace": map[string]interface{}{
+			"workspaceFolders": true,
+		},
+	}
+
+	base := map[string]interface{}{
+		"processId":        os.Getpid(),
+		"rootUri":          rootURI,
+		"rootPath":         absWork,
+		"capabilities":     capabilities,
+		"workspaceFolders": []map[string]interface{}{{"uri": rootURI, "name": filepath.Base(absWork)}},
+	}
+
+	switch lang {
+	case "python":
+		// pyright-specific initialization options.
+		// pythonPath: look for common virtual environment locations.
+		pythonPath := findPythonInterpreter(absWork)
+
+		base["initializationOptions"] = map[string]interface{}{
+			// Tell pyright which Python interpreter to use.
+			"pythonPath": pythonPath,
+			// Disable type-checking diagnostics — we only want call hierarchy.
+			"typeCheckingMode": "off",
+			// Use the project root as the include path.
+			"include": []string{absWork},
+			// Auto-search for virtual environments.
+			"venvPath": absWork,
+		}
+
+		// Also write a minimal pyrightconfig.json if one doesn't exist,
+		// so pyright can resolve imports correctly.
+		writePyrightConfig(absWork)
+
+	case "go":
+		// gopls works well with just rootUri; no extra options needed.
+
+	case "typescript":
+		base["initializationOptions"] = map[string]interface{}{
+			"preferences": map[string]interface{}{
+				"includeInlayParameterNameHints": "none",
+			},
+		}
+	}
+
+	return base
+}
+
+// findPythonInterpreter searches common locations for a Python interpreter.
+func findPythonInterpreter(projectRoot string) string {
+	// 1. Virtual environment in project.
+	candidates := []string{
+		filepath.Join(projectRoot, ".venv", "bin", "python"),
+		filepath.Join(projectRoot, "venv", "bin", "python"),
+		filepath.Join(projectRoot, "env", "bin", "python"),
+	}
+	for _, p := range candidates {
+		if _, err := os.Stat(p); err == nil {
+			return p
+		}
+	}
+	// 2. System Python.
+	for _, name := range []string{"python3", "python"} {
+		if path, err := exec.LookPath(name); err == nil {
+			return path
+		}
+	}
+	return "python3"
+}
+
+// writePyrightConfig writes a minimal pyrightconfig.json to projectRoot
+// if one does not already exist.  This helps pyright resolve imports correctly
+// for projects that don't ship a pyrightconfig.json.
+func writePyrightConfig(projectRoot string) {
+	cfgPath := filepath.Join(projectRoot, "pyrightconfig.json")
+	if _, err := os.Stat(cfgPath); err == nil {
+		return // already exists, don't overwrite
+	}
+	cfg := `{
+  "include": ["."],
+  "exclude": ["**/__pycache__", "**/node_modules", "**/.git"],
+  "reportMissingImports": false,
+  "reportMissingModuleSource": false,
+  "typeCheckingMode": "off",
+  "useLibraryCodeForTypes": true
+}
+`
+	// Best-effort write; ignore errors (read-only FS, etc.)
+	_ = os.WriteFile(cfgPath, []byte(cfg), 0644)
 }
 
 // lspRequest is a JSON-RPC 2.0 request.

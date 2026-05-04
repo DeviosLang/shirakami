@@ -13,7 +13,8 @@ import (
 
 // RipgrepTool searches file contents using the system rg (ripgrep) command.
 type RipgrepTool struct {
-	// WorkspaceDir restricts searches to this directory to prevent out-of-bounds access.
+	// WorkspaceDir is the root workspace containing all repositories.
+	// Searches are restricted to this directory tree to prevent path traversal.
 	WorkspaceDir string
 }
 
@@ -25,7 +26,7 @@ func NewRipgrepTool(workspaceDir string) *RipgrepTool {
 func (t *RipgrepTool) Name() string { return "ripgrep" }
 
 func (t *RipgrepTool) Description() string {
-	return "Search file contents using ripgrep. Returns matching lines in 'file:line:content' format."
+	return "Search file contents using ripgrep. Use 'repo' to restrict search to a specific repository directory (e.g. 'vstation_compute'). Returns matching lines in 'repo/file:line:content' format."
 }
 
 func (t *RipgrepTool) InputSchema() map[string]interface{} {
@@ -36,9 +37,13 @@ func (t *RipgrepTool) InputSchema() map[string]interface{} {
 				"type":        "string",
 				"description": "Regular expression pattern to search for",
 			},
+			"repo": map[string]interface{}{
+				"type":        "string",
+				"description": "Repository name to restrict search to (e.g. 'vstation_compute', 'vstation_api'). Omit to search all repositories.",
+			},
 			"glob": map[string]interface{}{
 				"type":        "string",
-				"description": "File glob filter (e.g. **/*.go). Optional.",
+				"description": "File glob filter (e.g. **/*.py). Optional.",
 			},
 			"max_results": map[string]interface{}{
 				"type":        "integer",
@@ -52,6 +57,7 @@ func (t *RipgrepTool) InputSchema() map[string]interface{} {
 // ripgrepInput is the parsed input for the ripgrep tool.
 type ripgrepInput struct {
 	Pattern    string `json:"pattern"`
+	Repo       string `json:"repo"`
 	Glob       string `json:"glob"`
 	MaxResults int    `json:"max_results"`
 }
@@ -88,32 +94,40 @@ func (t *RipgrepTool) Execute(ctx context.Context, input json.RawMessage) (strin
 		maxResults = 100
 	}
 
+	// Determine search directory: workspace root or a specific repo subdir.
+	searchDir := t.WorkspaceDir
+	if searchDir == "" {
+		searchDir = "."
+	}
+	if inp.Repo != "" {
+		searchDir = filepath.Join(searchDir, filepath.Clean(inp.Repo))
+	}
+
+	// Prevent path traversal: ensure searchDir is within WorkspaceDir.
+	absWorkspace, err := filepath.Abs(t.WorkspaceDir)
+	if err != nil {
+		return "", fmt.Errorf("ripgrep: cannot resolve workspace dir: %w", err)
+	}
+	absDir, err := filepath.Abs(searchDir)
+	if err != nil {
+		return "", fmt.Errorf("ripgrep: cannot resolve search dir: %w", err)
+	}
+	if !strings.HasPrefix(absDir, absWorkspace) {
+		return "", fmt.Errorf("ripgrep: search dir %q is outside workspace", inp.Repo)
+	}
+
 	// Build rg arguments
 	args := []string{
 		"--json",
 		"--max-count", fmt.Sprintf("%d", maxResults),
 	}
-
 	if inp.Glob != "" {
 		args = append(args, "--glob", inp.Glob)
 	}
-
-	// If pattern starts with '-', use -e to avoid misinterpretation
 	if strings.HasPrefix(inp.Pattern, "-") {
 		args = append(args, "-e", inp.Pattern)
 	} else {
 		args = append(args, inp.Pattern)
-	}
-
-	// Restrict to workspace dir
-	searchDir := t.WorkspaceDir
-	if searchDir == "" {
-		searchDir = "."
-	}
-	// Prevent path traversal: resolve and verify
-	absDir, err := filepath.Abs(searchDir)
-	if err != nil {
-		return "", fmt.Errorf("ripgrep: cannot resolve workspace dir: %w", err)
 	}
 	args = append(args, absDir)
 
@@ -144,9 +158,9 @@ func (t *RipgrepTool) Execute(ctx context.Context, input json.RawMessage) (strin
 		if match.Type != "match" {
 			continue
 		}
-		// Normalize path relative to workspace
+		// Normalize path relative to workspace root (includes repo name as prefix).
 		filePath := match.Data.Path.Text
-		if rel, err := filepath.Rel(absDir, filePath); err == nil {
+		if rel, err := filepath.Rel(absWorkspace, filePath); err == nil {
 			filePath = rel
 		}
 		lineNum := match.Data.LineNumber

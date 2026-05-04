@@ -9,6 +9,114 @@ import (
 	"strings"
 )
 
+// DiffHunk represents a contiguous block of changed lines in one file.
+// Used by the deterministic diff parser (Layer A) to map diff hunks to
+// symbol definitions without LLM involvement.
+type DiffHunk struct {
+	File      string // file path (repo-relative, from +++ b/path)
+	StartLine int    // first changed line number (new side)
+	EndLine   int    // last changed line number (new side)
+}
+
+// ParseDiffHunks extracts all changed-line ranges from a unified diff.
+// Pure text parsing — no external dependencies, no LLM, no DB.
+// Each returned DiffHunk covers one contiguous block of added/modified lines
+// within a single file.
+//
+// This is Layer A of the DiffToSymbols pipeline (see architecture-v2-design §3.4):
+//   - Layer A (this function): pure diff parsing, always available
+//   - Layer B (DiffToSymbols):  line→symbol mapping, requires index
+func ParseDiffHunks(diff string) []DiffHunk {
+	var hunks []DiffHunk
+	scanner := bufio.NewScanner(strings.NewReader(diff))
+
+	currentFile := ""
+	currentNewLine := 0
+	hunkStart := 0    // start of current contiguous changed block
+	hunkEnd := 0      // end of current contiguous changed block
+	inChange := false // tracking a contiguous block of + lines
+
+	flushHunk := func() {
+		if inChange && currentFile != "" && hunkStart > 0 {
+			hunks = append(hunks, DiffHunk{
+				File:      currentFile,
+				StartLine: hunkStart,
+				EndLine:   hunkEnd,
+			})
+		}
+		inChange = false
+		hunkStart = 0
+		hunkEnd = 0
+	}
+
+	for scanner.Scan() {
+		line := scanner.Text()
+
+		// New file header: +++ b/path/to/file
+		if strings.HasPrefix(line, "+++ ") {
+			flushHunk()
+			path := strings.TrimPrefix(line, "+++ ")
+			path = strings.TrimPrefix(path, "b/")
+			if path == "/dev/null" {
+				currentFile = ""
+			} else {
+				currentFile = path
+			}
+			currentNewLine = 0
+			continue
+		}
+
+		// Hunk header: @@ -oldstart,oldcount +newstart,newcount @@
+		if strings.HasPrefix(line, "@@") {
+			flushHunk()
+			newStart := parseHunkNewStart(line)
+			if newStart > 0 {
+				currentNewLine = newStart - 1
+			}
+			continue
+		}
+
+		// Skip --- lines, diff headers, index lines
+		if strings.HasPrefix(line, "--- ") ||
+			strings.HasPrefix(line, "diff ") ||
+			strings.HasPrefix(line, "index ") ||
+			strings.HasPrefix(line, "new file") ||
+			strings.HasPrefix(line, "deleted file") {
+			continue
+		}
+
+		// Added line: part of the change
+		if strings.HasPrefix(line, "+") {
+			currentNewLine++
+			if currentFile == "" {
+				continue
+			}
+			if !inChange {
+				inChange = true
+				hunkStart = currentNewLine
+			}
+			hunkEnd = currentNewLine
+			continue
+		}
+
+		// Removed line: does not advance new-file line counter
+		// but breaks a contiguous + block
+		if strings.HasPrefix(line, "-") {
+			// Don't flush — interleaved -/+ lines are part of the same logical change
+			continue
+		}
+
+		// Context line: breaks a contiguous change block, advances line counter
+		flushHunk()
+		currentNewLine++
+	}
+
+	// Flush any trailing hunk
+	flushHunk()
+
+	return hunks
+}
+
 // ChangedFunction represents a function that was added or modified in a diff.
 type ChangedFunction struct {
 	File     string `json:"file"`

@@ -1,0 +1,11 @@
+.git
+bin/
+diffs/
+k8s/
+*.patch
+*.yaml
+!go.mod
+!go.sum
+tmp/
+*.log
+pwd.txt

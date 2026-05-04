@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
+	"time"
 
 	openai "github.com/sashabaranov/go-openai"
 )
@@ -64,6 +66,14 @@ type Response struct {
 	StopReason StopReason
 	Content    string
 	ToolCalls  []ToolCall
+	Usage      Usage
+}
+
+// Usage reports token usage for a single LLM response.
+type Usage struct {
+	PromptTokens     int
+	CompletionTokens int
+	TotalTokens      int
 }
 
 // Client wraps an OpenAI-compatible API client.
@@ -99,18 +109,81 @@ func NewClient(cfg Config) *Client {
 }
 
 // Complete sends messages to the LLM and returns the response.
+// It automatically retries on transient errors (429 rate limit, 503 unavailable)
+// using exponential backoff: 2s, 4s, 8s (3 attempts total).
 func (c *Client) Complete(ctx context.Context, messages []Message, tools []ToolDefinition) (*Response, error) {
 	req, err := c.buildRequest(messages, tools, false)
 	if err != nil {
 		return nil, fmt.Errorf("build request: %w", err)
 	}
 
-	resp, err := c.openai.CreateChatCompletion(ctx, req)
-	if err != nil {
-		return nil, fmt.Errorf("chat completion: %w", err)
+	const maxAttempts = 3
+	backoff := 2 * time.Second
+
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		resp, err := c.openai.CreateChatCompletion(ctx, req)
+		if err == nil {
+			return parseResponse(resp)
+		}
+
+		// Check whether the error is retryable.
+		if !isRetryableError(err) {
+			return nil, fmt.Errorf("chat completion: %w", err)
+		}
+
+		// Last attempt — don't sleep, just return the error.
+		if attempt == maxAttempts {
+			return nil, fmt.Errorf("chat completion: %w (after %d attempts)", err, maxAttempts)
+		}
+
+		// Wait before retrying, respecting context cancellation.
+		select {
+		case <-ctx.Done():
+			return nil, fmt.Errorf("chat completion: context cancelled during retry: %w", ctx.Err())
+		case <-time.After(backoff):
+		}
+
+		backoff *= 2 // exponential: 2s → 4s → 8s
 	}
 
-	return parseResponse(resp)
+	// Unreachable, but satisfies the compiler.
+	return nil, fmt.Errorf("chat completion: exhausted retries")
+}
+
+// isRetryableError returns true for transient HTTP errors that should be retried:
+//   - 429 Too Many Requests (rate limit)
+//   - 500 Internal Server Error
+//   - 502 Bad Gateway
+//   - 503 Service Unavailable
+//   - 504 Gateway Timeout
+func isRetryableError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	retryablePhrases := []string{
+		"429",
+		"500",
+		"502",
+		"503",
+		"504",
+		"rate limit",
+		"rate exceeded",
+		"too many requests",
+		"service unavailable",
+		"bad gateway",
+		"gateway timeout",
+		"connection reset",
+		"connection refused",
+		"EOF",
+	}
+	lower := strings.ToLower(msg)
+	for _, phrase := range retryablePhrases {
+		if strings.Contains(lower, strings.ToLower(phrase)) {
+			return true
+		}
+	}
+	return false
 }
 
 func (c *Client) buildRequest(messages []Message, tools []ToolDefinition, stream bool) (openai.ChatCompletionRequest, error) {
@@ -200,7 +273,13 @@ func parseResponse(resp openai.ChatCompletionResponse) (*Response, error) {
 	}
 
 	choice := resp.Choices[0]
-	result := &Response{}
+	result := &Response{
+		Usage: Usage{
+			PromptTokens:     resp.Usage.PromptTokens,
+			CompletionTokens: resp.Usage.CompletionTokens,
+			TotalTokens:      resp.Usage.TotalTokens,
+		},
+	}
 
 	// Map finish reason
 	switch choice.FinishReason {

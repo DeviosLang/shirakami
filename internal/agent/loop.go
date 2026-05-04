@@ -4,12 +4,14 @@ import (
 	"context"
 	"fmt"
 	"sync"
+	"time"
 
 	"github.com/DeviosLang/shirakami/internal/checkpoint"
 	"github.com/DeviosLang/shirakami/internal/llm"
+	"github.com/DeviosLang/shirakami/internal/logger"
 )
 
-const maxSteps = 100
+const maxSteps = 300
 
 // Tool is the interface that any executable tool must satisfy.
 type Tool interface {
@@ -91,8 +93,14 @@ func (a *AgentLoop) Run(ctx context.Context, taskID string, task string) (*Resul
 	}
 
 	// Main loop.
+	log := logger.S()
 	for {
 		if stepCount >= limit {
+			log.Warnw("loop.truncated",
+				"task_id", taskID,
+				"step", stepCount,
+				"limit", limit,
+			)
 			return &Result{
 				Content:   lastContent(messages),
 				StepCount: stepCount,
@@ -100,11 +108,30 @@ func (a *AgentLoop) Run(ctx context.Context, taskID string, task string) (*Resul
 			}, nil
 		}
 
+		stepStart := time.Now()
 		resp, err := a.llm.Complete(ctx, messages, toolDefs)
 		if err != nil {
+			log.Errorw("loop.llm_failed",
+				"task_id", taskID,
+				"step", stepCount,
+				"err", err.Error(),
+				"duration_ms", time.Since(stepStart).Milliseconds(),
+			)
 			return nil, fmt.Errorf("step %d llm complete: %w", stepCount, err)
 		}
 		stepCount++
+
+		log.Debugw("loop.step",
+			"task_id", taskID,
+			"step", stepCount,
+			"stop_reason", string(resp.StopReason),
+			"tool_calls", len(resp.ToolCalls),
+			"content_bytes", len(resp.Content),
+			"prompt_tokens", resp.Usage.PromptTokens,
+			"completion_tokens", resp.Usage.CompletionTokens,
+			"total_tokens", resp.Usage.TotalTokens,
+			"duration_ms", time.Since(stepStart).Milliseconds(),
+		)
 
 		// Append assistant turn to history.
 		assistantMsg := llm.AssistantMessage{
@@ -149,6 +176,64 @@ func (a *AgentLoop) Run(ctx context.Context, taskID string, task string) (*Resul
 			}, nil
 		}
 	}
+}
+
+// RunFollowUp continues a conversation after a previous Run, appending
+// the assistant's prior response and a new user follow-up message.
+// This is used to ask the LLM to produce JSON when it gave prose instead.
+func (a *AgentLoop) RunFollowUp(ctx context.Context, taskID string, priorAssistantContent, followUpMsg string) (*Result, error) {
+	toolDefs := make([]llm.ToolDefinition, 0, len(a.tools))
+	for _, t := range a.tools {
+		toolDefs = append(toolDefs, t.Definition())
+	}
+
+	// Build a minimal message history: system + prior assistant + follow-up user.
+	messages := []llm.Message{
+		llm.UserMessage{Content: a.systemPrompt},
+		llm.AssistantMessage{Content: priorAssistantContent},
+		llm.UserMessage{Content: followUpMsg},
+	}
+
+	resp, err := a.llm.Complete(ctx, messages, toolDefs)
+	if err != nil {
+		return nil, fmt.Errorf("follow-up llm complete: %w", err)
+	}
+	return &Result{Content: resp.Content, StepCount: 1}, nil
+}
+
+// RunFollowUpNoTools is like RunFollowUp but passes an empty tool list to the LLM.
+// Use this for follow-up tasks that should be pure text generation (e.g. scenario
+// generation, JSON reformatting) where giving the LLM access to tools like ripgrep
+// causes it to waste time on unnecessary tool calls.
+//
+// Performance insight: scenario follow-ups observed on v38 took 3-8 minutes when
+// tools were exposed, but ~20 seconds when the LLM had no tool option. Forcing
+// no-tools mode makes the path deterministic.
+func (a *AgentLoop) RunFollowUpNoTools(ctx context.Context, taskID string, priorAssistantContent, followUpMsg string) (*Result, error) {
+	log := logger.S()
+	start := time.Now()
+
+	// Build a minimal message history: system + prior assistant + follow-up user.
+	messages := []llm.Message{
+		llm.UserMessage{Content: a.systemPrompt},
+		llm.AssistantMessage{Content: priorAssistantContent},
+		llm.UserMessage{Content: followUpMsg},
+	}
+
+	// Explicitly pass nil for tool defs — the LLM must answer in prose/JSON.
+	resp, err := a.llm.Complete(ctx, messages, nil)
+	if err != nil {
+		return nil, fmt.Errorf("follow-up-no-tools llm complete: %w", err)
+	}
+	log.Debugw("loop.followup_no_tools",
+		"task_id", taskID,
+		"content_bytes", len(resp.Content),
+		"stop_reason", string(resp.StopReason),
+		"prompt_tokens", resp.Usage.PromptTokens,
+		"completion_tokens", resp.Usage.CompletionTokens,
+		"duration_ms", time.Since(start).Milliseconds(),
+	)
+	return &Result{Content: resp.Content, StepCount: 1}, nil
 }
 
 // executeTools runs all tool calls in the slice concurrently and returns

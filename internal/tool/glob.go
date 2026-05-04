@@ -22,7 +22,7 @@ func NewGlobTool(workspaceDir string) *GlobTool {
 func (t *GlobTool) Name() string { return "glob" }
 
 func (t *GlobTool) Description() string {
-	return "List files matching a glob pattern (e.g. 'internal/**/*.go'). Returns a newline-separated list of matching file paths."
+	return "List files matching a glob pattern. Use 'repo' to restrict to a specific repository (e.g. 'vstation_compute'). Returns a newline-separated list of matching file paths relative to the workspace root."
 }
 
 func (t *GlobTool) InputSchema() map[string]interface{} {
@@ -31,7 +31,11 @@ func (t *GlobTool) InputSchema() map[string]interface{} {
 		"properties": map[string]interface{}{
 			"pattern": map[string]interface{}{
 				"type":        "string",
-				"description": "Glob pattern to match files, e.g. 'internal/**/*.go'",
+				"description": "Glob pattern to match files, e.g. '**/*.py'",
+			},
+			"repo": map[string]interface{}{
+				"type":        "string",
+				"description": "Repository name to restrict search to (e.g. 'vstation_compute'). Omit to search all repositories.",
 			},
 		},
 		"required": []string{"pattern"},
@@ -40,6 +44,7 @@ func (t *GlobTool) InputSchema() map[string]interface{} {
 
 type globInput struct {
 	Pattern string `json:"pattern"`
+	Repo    string `json:"repo"`
 }
 
 func (t *GlobTool) Execute(ctx context.Context, input json.RawMessage) (string, error) {
@@ -56,9 +61,18 @@ func (t *GlobTool) Execute(ctx context.Context, input json.RawMessage) (string, 
 	if base == "" {
 		base = "."
 	}
+	if inp.Repo != "" {
+		base = filepath.Join(base, filepath.Clean(inp.Repo))
+	}
 	absBase, err := filepath.Abs(base)
 	if err != nil {
-		return "", fmt.Errorf("glob: cannot resolve workspace dir: %w", err)
+		return "", fmt.Errorf("glob: cannot resolve dir: %w", err)
+	}
+
+	// Security: ensure base is within workspace
+	absWorkspace, _ := filepath.Abs(t.WorkspaceDir)
+	if !strings.HasPrefix(absBase, absWorkspace) {
+		return "", fmt.Errorf("glob: repo %q is outside workspace", inp.Repo)
 	}
 
 	matches, err := matchGlob(ctx, absBase, inp.Pattern)
@@ -66,10 +80,10 @@ func (t *GlobTool) Execute(ctx context.Context, input json.RawMessage) (string, 
 		return "", fmt.Errorf("glob: %w", err)
 	}
 
-	// Make paths relative to workspace
+	// Make paths relative to workspace root (includes repo name as prefix).
 	rel := make([]string, 0, len(matches))
 	for _, m := range matches {
-		if r, relErr := filepath.Rel(absBase, m); relErr == nil {
+		if r, relErr := filepath.Rel(absWorkspace, m); relErr == nil {
 			rel = append(rel, r)
 		} else {
 			rel = append(rel, m)

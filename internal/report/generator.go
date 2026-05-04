@@ -160,18 +160,28 @@ func generateMarkdown(result *schema.AnalysisResult) string {
 
 	b.WriteString("# Shirakami 分析报告\n\n")
 
-	// Changed function
-	if len(result.DownwardChain.Nodes) > 0 {
-		changed := result.DownwardChain.Nodes[0]
-		fmt.Fprintf(&b, "**变更函数:** `[%s] %s` (`%s:%d`)\n\n",
-			changed.Repo, changed.FuncName, changed.FilePath, changed.Line)
-	}
+	// Header: source repo and changed function count
+	sourceRepo := directRepo(result)
+	fmt.Fprintf(&b, "**源仓库:** `%s`  \n", sourceRepo)
+	fmt.Fprintf(&b, "**变更函数数量:** %d\n\n", result.ImpactSummary.DirectCount)
 
-	// Downward chain
-	if len(result.DownwardChain.Nodes) > 1 {
-		b.WriteString("## 向下追踪（实现路径）\n\n```\n")
-		writeMarkdownTree(&b, result.DownwardChain.Nodes[1:])
-		b.WriteString("```\n\n")
+	// Call graph nodes table — only nodes with file paths (real analysis results).
+	// Nodes without FilePath are internal placeholders and are excluded.
+	nodesWithFile := make([]schema.CallNode, 0, len(result.DownwardChain.Nodes))
+	for _, n := range result.DownwardChain.Nodes {
+		if n.FilePath != "" {
+			nodesWithFile = append(nodesWithFile, n)
+		}
+	}
+	if len(nodesWithFile) > 0 {
+		fmt.Fprintf(&b, "## 调用链节点 (%d)\n\n", len(nodesWithFile))
+		b.WriteString("| 仓库 | 文件 | 行 | 函数 |\n")
+		b.WriteString("|------|------|----|------|\n")
+		for _, n := range nodesWithFile {
+			fmt.Fprintf(&b, "| `%s` | `%s` | %d | `%s` |\n",
+				n.Repo, n.FilePath, n.Line, n.FuncName)
+		}
+		b.WriteString("\n")
 	}
 
 	// Upward chains
@@ -190,21 +200,68 @@ func generateMarkdown(result *schema.AnalysisResult) string {
 		}
 	}
 
-	// Entry points with test scenarios
+	// Entry points — grouped by repo for readability.
 	if len(result.EntryPoints) > 0 {
-		b.WriteString("## 集成测试入口\n\n")
-		for i, ep := range result.EntryPoints {
-			fmt.Fprintf(&b, "### 入口%d\n\n", i+1)
-			fmt.Fprintf(&b, "- **协议:** %s\n", ep.Protocol)
-			fmt.Fprintf(&b, "- **路径:** `%s`\n", ep.Path)
-			fmt.Fprintf(&b, "- **函数:** `%s` (`%s:%d`)\n", ep.Node.FuncName, ep.Node.FilePath, ep.Node.Line)
-			if len(ep.TestScenarios) > 0 {
-				b.WriteString("- **测试场景:**\n")
-				for _, ts := range ep.TestScenarios {
-					fmt.Fprintf(&b, "  - %s\n", ts)
+		fmt.Fprintf(&b, "## 集成测试入口 (%d)\n\n", len(result.EntryPoints))
+
+		// Group by repo.
+		repoOrder := make([]string, 0)
+		repoEps := make(map[string][]schema.EntryPoint)
+		for _, ep := range result.EntryPoints {
+			r := ep.Node.Repo
+			if _, exists := repoEps[r]; !exists {
+				repoOrder = append(repoOrder, r)
+			}
+			repoEps[r] = append(repoEps[r], ep)
+		}
+		for _, repo := range repoOrder {
+			eps := repoEps[repo]
+			fmt.Fprintf(&b, "### %s\n\n", repo)
+			b.WriteString("| 文件 | 行 | 入口 |\n")
+			b.WriteString("|------|----|----|----|\n")
+			for _, ep := range eps {
+				label := ep.Node.FuncName
+				if ep.Path != "" {
+					label = ep.Path
 				}
+				fmt.Fprintf(&b, "| `%s` | %d | `%s` |\n",
+					ep.Node.FilePath, ep.Node.Line, label)
 			}
 			b.WriteString("\n")
+
+			// Render per-entry test scenarios (from scenario follow-up).
+			for _, ep := range eps {
+				if len(ep.SuggestedScenarios) == 0 {
+					continue
+				}
+				label := ep.Node.FuncName
+				if ep.Path != "" {
+					label = ep.Path
+				}
+				fmt.Fprintf(&b, "#### `%s` — 测试场景\n\n", label)
+				if len(ep.ChangedVia) > 0 {
+					fmt.Fprintf(&b, "**途经变更函数:** %s\n\n",
+						"`"+strings.Join(ep.ChangedVia, "`, `")+"`")
+				}
+				if len(ep.Preconditions) > 0 {
+					b.WriteString("**前置条件:**\n")
+					for _, pre := range ep.Preconditions {
+						fmt.Fprintf(&b, "- %s\n", pre)
+					}
+					b.WriteString("\n")
+				}
+				if ep.TypicalInputs != "" {
+					fmt.Fprintf(&b, "**典型入参:** `%s`\n\n", ep.TypicalInputs)
+				}
+				b.WriteString("| 优先级 | 类型 | 场景描述 | 关键入参 | 预期结果 | 观察点 Oracle |\n")
+				b.WriteString("|--------|------|----------|----------|----------|----------------|\n")
+				for _, s := range ep.SuggestedScenarios {
+					fmt.Fprintf(&b, "| %s | %s | %s | `%s` | %s | %s |\n",
+						s.Priority, s.Type, s.Description, s.Input, s.Expected,
+						formatOracles(s.Oracles))
+				}
+				b.WriteString("\n")
+			}
 		}
 	}
 
@@ -217,26 +274,89 @@ func generateMarkdown(result *schema.AnalysisResult) string {
 		b.WriteString("\n")
 	}
 
-	// Impact summary
-	b.WriteString("## 影响范围\n\n")
-	fmt.Fprintf(&b, "- **直接影响:** %s 内 %d 个函数\n", directRepo(result), result.ImpactSummary.DirectCount)
-	if len(result.ImpactSummary.DirectFunctions) > 0 {
-		for _, fn := range result.ImpactSummary.DirectFunctions {
-			fmt.Fprintf(&b, "  - `%s`\n", fn)
+	// Function analyses (constraints + suggested scenarios)
+	if len(result.FunctionAnalyses) > 0 {
+		b.WriteString("## 函数约束与测试建议\n\n")
+		for _, fa := range result.FunctionAnalyses {
+			fmt.Fprintf(&b, "### `%s` (%s)\n\n", fa.FuncName, fa.Repo)
+			if len(fa.Constraints) > 0 {
+				b.WriteString("**约束条件:**\n\n")
+				for _, c := range fa.Constraints {
+					fmt.Fprintf(&b, "- [%s] `%s` — %s (`%s:%d`)\n",
+						c.Type, c.Condition, c.Note, c.FilePath, c.Line)
+				}
+				b.WriteString("\n")
+			}
+			if len(fa.SuggestedScenarios) > 0 {
+				b.WriteString("**建议测试场景:**\n\n")
+				for _, s := range fa.SuggestedScenarios {
+					fmt.Fprintf(&b, "- [%s][%s] %s", s.Priority, s.Type, s.Description)
+					if s.Input != "" {
+						fmt.Fprintf(&b, "  \n  输入: `%s`", s.Input)
+					}
+					if s.Expected != "" {
+						fmt.Fprintf(&b, "  \n  预期: `%s`", s.Expected)
+					}
+					b.WriteString("\n")
+				}
+				b.WriteString("\n")
+			}
 		}
 	}
-	if result.ImpactSummary.CrossRepoCount > 0 {
-		fmt.Fprintf(&b, "- **跨仓影响:** %d 处\n", result.ImpactSummary.CrossRepoCount)
-		for _, cr := range result.ImpactSummary.CrossRepoImpact {
-			fmt.Fprintf(&b, "  - `%s`\n", cr)
+
+	// Unit test suggestions (per changed function).
+	if len(result.UTSuggestions) > 0 {
+		fmt.Fprintf(&b, "## 单元测试建议 (UT) — %d 个函数\n\n", len(result.UTSuggestions))
+		b.WriteString("针对 diff 变更函数本身的 UT 建议（mock 级别、分支/边界/异常/兼容）。\n\n")
+		for _, ut := range result.UTSuggestions {
+			fmt.Fprintf(&b, "### `%s` (`%s/%s`)\n\n", ut.FuncName, ut.Repo, ut.FilePath)
+			if ut.Summary != "" {
+				fmt.Fprintf(&b, "**变更摘要:** %s\n\n", ut.Summary)
+			}
+			if len(ut.Constraints) > 0 {
+				b.WriteString("**代码约束:**\n")
+				for _, c := range ut.Constraints {
+					fmt.Fprintf(&b, "- %s\n", c)
+				}
+				b.WriteString("\n")
+			}
+			if len(ut.ExistingTests) > 0 {
+				b.WriteString("**现有 UT:** ")
+				for i, t := range ut.ExistingTests {
+					if i > 0 {
+						b.WriteString(", ")
+					}
+					fmt.Fprintf(&b, "`%s`", t)
+				}
+				b.WriteString("\n\n")
+			}
+			if len(ut.Scenarios) > 0 {
+				b.WriteString("| 优先级 | 类型 | 场景描述 | Mock 设置 | 断言 |\n")
+				b.WriteString("|--------|------|----------|-----------|------|\n")
+				for _, s := range ut.Scenarios {
+					fmt.Fprintf(&b, "| %s | %s | %s | `%s` | %s |\n",
+						s.Priority, s.Type, s.Description, s.MockSetup, s.Assertions)
+				}
+				b.WriteString("\n")
+			}
 		}
+	}
+
+	// Impact summary
+	b.WriteString("## 影响范围\n\n")
+	fmt.Fprintf(&b, "- **直接影响:** `%s` 内 %d 个函数\n", sourceRepo, result.ImpactSummary.DirectCount)
+	if result.ImpactSummary.CrossRepoCount > 0 {
+		fmt.Fprintf(&b, "- **跨仓影响 (%d):** %s\n",
+			result.ImpactSummary.CrossRepoCount,
+			strings.Join(result.ImpactSummary.CrossRepoImpact, "、"))
 	}
 	b.WriteString("\n")
 
-	// Self-check
+	// Worker raw output (shown when structured parsing produced no results)
 	if result.SelfCheckReport != "" {
-		b.WriteString("## 自检报告\n\n")
-		fmt.Fprintf(&b, "```\n%s\n```\n\n", result.SelfCheckReport)
+		b.WriteString("## Worker 分析详情\n\n")
+		b.WriteString(result.SelfCheckReport)
+		b.WriteString("\n")
 	}
 
 	return b.String()
@@ -278,10 +398,33 @@ func entryPointForChain(eps []schema.EntryPoint, i int) *schema.EntryPoint {
 	return nil
 }
 
-// directRepo returns the repo name from the first downward chain node.
+// directRepo returns the source repository name for the impact summary line.
 func directRepo(result *schema.AnalysisResult) string {
+	if result.ImpactSummary.SourceRepo != "" {
+		return result.ImpactSummary.SourceRepo
+	}
 	if len(result.DownwardChain.Nodes) > 0 {
 		return result.DownwardChain.Nodes[0].Repo
 	}
 	return "unknown"
+}
+
+// formatOracles renders a list of TestOracle values into a compact string for
+// in-table display. Multiple oracles are separated by "<br>" (GFM-friendly).
+// Returns "-" when the scenario has no oracles.
+func formatOracles(oracles []schema.TestOracle) string {
+	if len(oracles) == 0 {
+		return "-"
+	}
+	parts := make([]string, 0, len(oracles))
+	for _, o := range oracles {
+		if o.Target == "" && o.Assertion == "" {
+			continue
+		}
+		parts = append(parts, fmt.Sprintf("**[%s]** `%s` — %s", o.Type, o.Target, o.Assertion))
+	}
+	if len(parts) == 0 {
+		return "-"
+	}
+	return strings.Join(parts, "<br>")
 }

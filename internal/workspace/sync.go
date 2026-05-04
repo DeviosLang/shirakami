@@ -16,6 +16,8 @@ type RepoConfig struct {
 	Name string
 	// URL is the remote git URL.
 	URL string
+	// Branch is the branch to checkout (defaults to "master" if empty).
+	Branch string
 	// Role describes the repo's role in the system (e.g. "entry", "library").
 	Role string
 }

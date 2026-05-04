@@ -85,7 +85,10 @@ func runServer(cmd *cobra.Command, args []string) error {
 	store := storage.New(pool)
 
 	// Connect to Redis.
-	rdb := redis.NewClient(&redis.Options{Addr: cfg.Redis.Addr})
+	rdb := redis.NewClient(&redis.Options{
+		Addr:     cfg.Redis.Addr,
+		Password: cfg.Redis.Password,
+	})
 	analysisCache := cache.New(rdb)
 
 	// Build server.

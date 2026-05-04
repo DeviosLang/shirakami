@@ -18,7 +18,20 @@ vendor/
 Thumbs.db
 
 # Config with secrets
+shirakami.yaml
 shirakami.local.yaml
+
+# Runtime data
+diffs/
+reports/
+pwd.txt
+repos_dedup.txt
+MULTI_REPO_ANALYSIS.md
+extract_repos.py
+k8s/
+
+# Diff / patch files
+*.patch
 
 # Coverage
 coverage.out

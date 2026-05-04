@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"sort"
 	"strings"
 	"time"
 
@@ -90,17 +91,40 @@ func defaultTools(workspaceDir string) []agent.Tool {
 	return adapted
 }
 
+// multiRepoTools returns a single tool set rooted at the workspace directory.
+// ripgrep and glob both accept an optional "repo" parameter so the LLM can
+// dynamically restrict searches to any repository without requiring per-repo
+// tool instances.  New repos need only be listed in shirakami.yaml — no code
+// change or image rebuild required.
+func multiRepoTools(workspaceDir string) []agent.Tool {
+	tools := []itool.Tool{
+		itool.NewRipgrepTool(workspaceDir), // supports repo= parameter
+		itool.NewGlobTool(workspaceDir),    // supports repo= parameter
+		itool.NewReaderTool(),
+		itool.GlobalLSPManager.GetOrCreate(workspaceDir),
+	}
+	adapted := make([]agent.Tool, len(tools))
+	for i, t := range tools {
+		adapted[i] = &toolAdapter{inner: t}
+	}
+	return adapted
+}
+
 // ---------------------------------------------------------------------------
 // shirakami analyze
 // ---------------------------------------------------------------------------
 
 func buildAnalyzeCmd() *cobra.Command {
 	var (
-		workspaceDir string
-		diffFiles    []string
-		description  string
-		outputFmt    string
-		maxSteps     int
+		workspaceDir   string
+		diffFiles      []string
+		description    string
+		outputFmt      string
+		maxSteps       int
+		sourceRepo     string
+		noCache        bool
+		analysisConfig string
+		fastMode       bool
 	)
 
 	cmd := &cobra.Command{
@@ -113,6 +137,8 @@ func buildAnalyzeCmd() *cobra.Command {
 			}
 			log := logger.Must("production")
 			defer log.Sync() //nolint:errcheck
+			// Install as default logger for agent / worker / triage packages.
+			logger.SetDefault(log)
 
 			// Ensure all gopls processes are cleaned up at session end.
 			defer itool.GlobalLSPManager.Close()
@@ -123,19 +149,47 @@ func buildAnalyzeCmd() *cobra.Command {
 			}
 
 			// Build analysis input.
-			var diffContent strings.Builder
-			for _, f := range diffFiles {
-				data, err := os.ReadFile(f)
+			// Priority: --analysis (YAML) > --diff (one or more diff files)
+			var input agent.AnalysisInput
+			if analysisConfig != "" {
+				// YAML config mode — supports multiple patches + scope filter.
+				acfg, err := agent.LoadAnalysisConfig(analysisConfig)
 				if err != nil {
-					return fmt.Errorf("read diff file %s: %w", f, err)
+					return err
 				}
-				diffContent.Write(data)
-				diffContent.WriteString("\n")
-			}
-
-			input := agent.AnalysisInput{
-				Diff:        diffContent.String(),
-				Description: description,
+				input, err = acfg.ToAnalysisInput()
+				if err != nil {
+					return err
+				}
+				// --desc / --source-repo override YAML values if explicitly provided.
+				if description != "" {
+					input.Description = description
+				}
+				if sourceRepo != "" {
+					input.SourceRepo = sourceRepo
+				}
+				log.Sugar().Infow("analysis.config_loaded",
+					"path", analysisConfig,
+					"patches", len(input.PatchInfo),
+					"source_repo", input.SourceRepo,
+					"scope_only_repos", input.ScopeOnlyRepos,
+				)
+			} else {
+				// Legacy mode — one or more --diff files.
+				var diffContent strings.Builder
+				for _, f := range diffFiles {
+					data, err := os.ReadFile(f)
+					if err != nil {
+						return fmt.Errorf("read diff file %s: %w", f, err)
+					}
+					diffContent.Write(data)
+					diffContent.WriteString("\n")
+				}
+				input = agent.AnalysisInput{
+					Diff:        diffContent.String(),
+					Description: description,
+					SourceRepo:  sourceRepo,
+				}
 			}
 
 			// Determine input type for storage.
@@ -149,16 +203,23 @@ func buildAnalyzeCmd() *cobra.Command {
 			ctx := context.Background()
 
 			// Set up Redis / cache.
-			rdb := redis.NewClient(&redis.Options{Addr: cfg.Redis.Addr})
+			rdb := redis.NewClient(&redis.Options{
+				Addr:     cfg.Redis.Addr,
+				Password: cfg.Redis.Password,
+			})
 			analysisCache := cache.New(rdb)
 
 			// Compute cache key.
-			cacheKey := cache.CacheKey(input.Diff+input.Description, []string{cfg.Workspace.Dir})
+			cacheKey := cache.CacheKey(input.Diff+input.Description+input.SourceRepo, []string{cfg.Workspace.Dir})
 
-			// Check cache.
-			if cached, ok := analysisCache.Get(ctx, cacheKey); ok {
-				log.Sugar().Infow("cache hit", "task_id", cached.TaskID)
-				return renderCachedResult(cached, report.OutputFormat(outputFmt))
+			// Check cache (skip if --no-cache).
+			if !noCache {
+				if cached, ok := analysisCache.Get(ctx, cacheKey); ok {
+					log.Sugar().Infow("cache hit", "task_id", cached.TaskID)
+					return renderCachedResult(cached, report.OutputFormat(outputFmt))
+				}
+			} else {
+				log.Sugar().Infow("cache skipped (--no-cache)")
 			}
 
 			// Set up DB.
@@ -192,11 +253,25 @@ func buildAnalyzeCmd() *cobra.Command {
 				Model:   cfg.LLM.Model,
 			})
 
-			// Build tools.
-			tools := defaultTools(cfg.Workspace.Dir)
-
 			// Build repos from config.
 			repos := configRepos(cfg)
+
+			// Mark the source repo so LSP + tools are prioritised for it.
+			if sourceRepo != "" {
+				for i := range repos {
+					if repos[i].Name == sourceRepo && repos[i].Role == "" {
+						repos[i].Role = "source"
+					}
+				}
+			}
+
+			// Build tools: workspace-rooted tools with dynamic repo parameter.
+			var tools []agent.Tool
+			if len(repos) > 1 {
+				tools = multiRepoTools(cfg.Workspace.Dir)
+			} else {
+				tools = defaultTools(cfg.Workspace.Dir)
+			}
 
 			// Build checkpointer.
 			cpDir := os.TempDir() + "/shirakami-checkpoints"
@@ -207,6 +282,26 @@ func buildAnalyzeCmd() *cobra.Command {
 
 			// Build and run orchestrator.
 			orch := agent.NewOrchestrator(llmClient, tools, repos, cfg.Workspace.Dir, cp)
+			if fastMode {
+				// Fast mode: cap cross-repo iterations at 3 rounds (default is 10).
+				// Trades coverage for speed — typically 2-3x faster, keeps direct
+				// and one-hop upstream coverage, skips deep transitive exploration.
+				orch.SetMaxRounds(3)
+			}
+
+			// Inject declared contract hints from config into Worker prompts.
+			if len(cfg.Contracts) > 0 {
+				hints := make([]string, 0, len(cfg.Contracts))
+				for _, c := range cfg.Contracts {
+					hint := fmt.Sprintf("%s (%s) → %s (%s)",
+						c.Provider.Repo, c.Provider.Path,
+						c.Consumer.Repo, c.Consumer.Func)
+					hints = append(hints, hint)
+				}
+				orch.SetContractHints(hints)
+				log.Sugar().Infow("contracts.loaded", "count", len(hints))
+			}
+
 			_ = maxSteps // max-steps is passed to orchestrator via constructor in future
 
 			output, err := orch.Run(ctx, input)
@@ -219,8 +314,43 @@ func buildAnalyzeCmd() *cobra.Command {
 
 			// Persist result.
 			if store != nil && taskID != "" {
-				callChainJSON, _ := json.Marshal(output.CallGraph)
+				// Build structured storage from parsed WorkerResult data.
+				// output.EntryPoints is populated by parseWorkerOutput from JSON.
+				// output.CallGraph contains parsed CallNodes (not raw text) when JSON parsing succeeded.
+				// Filter out fallback nodes where Function contains raw LLM text (>500 chars).
+				cleanNodes := make([]agent.CallNode, 0, len(output.CallGraph))
+				for _, n := range output.CallGraph {
+					if len(n.Function) < 500 && n.File != "" {
+						cleanNodes = append(cleanNodes, n)
+					}
+				}
+
+				callChainJSON, _ := json.Marshal(cleanNodes)
 				entryPointsJSON, _ := json.Marshal(output.EntryPoints)
+
+				// Also extract structured data from WorkerOutputs for richer storage.
+				type storageEntry struct {
+					Repo     string `json:"repo"`
+					File     string `json:"file"`
+					Line     int    `json:"line"`
+					Function string `json:"function"`
+					Endpoint string `json:"endpoint,omitempty"`
+				}
+				var structuredEntries []storageEntry
+				for _, ep := range output.EntryPoints {
+					if ep.Repo != "" && ep.Function != "" {
+						structuredEntries = append(structuredEntries, storageEntry{
+							Repo:     ep.Repo,
+							File:     ep.File,
+							Line:     ep.Line,
+							Function: ep.Function,
+						})
+					}
+				}
+				if len(structuredEntries) > 0 {
+					entryPointsJSON, _ = json.Marshal(structuredEntries)
+				}
+
 				_ = store.SaveResult(ctx, &storage.TaskResult{
 					TaskID:      taskID,
 					CallChain:   callChainJSON,
@@ -257,6 +387,10 @@ func buildAnalyzeCmd() *cobra.Command {
 	cmd.Flags().StringVar(&description, "desc", "", "text description of the change")
 	cmd.Flags().StringVar(&outputFmt, "output", "terminal", "output format: terminal / json / markdown")
 	cmd.Flags().IntVar(&maxSteps, "max-steps", 100, "agent max steps")
+	cmd.Flags().StringVar(&sourceRepo, "source-repo", "", "repo name where the diff originates (used to route changed functions)")
+	cmd.Flags().BoolVar(&noCache, "no-cache", false, "skip cache lookup and force fresh analysis")
+	cmd.Flags().StringVar(&analysisConfig, "analysis", "", "YAML analysis config file (supports multiple patches + scope filter); when set, overrides --diff")
+	cmd.Flags().BoolVar(&fastMode, "fast", false, "fast mode: limit cross-repo rounds to 3 (default is deep mode with 10 rounds)")
 
 	return cmd
 }
@@ -477,6 +611,19 @@ func buildWorkspaceSyncCmd() *cobra.Command {
 // ---------------------------------------------------------------------------
 
 func configRepos(cfg *config.Config) []agent.RepoInfo {
+	// Multi-repo mode: use repos defined in workspace.repos config.
+	if len(cfg.Workspace.Repos) > 0 {
+		repos := make([]agent.RepoInfo, 0, len(cfg.Workspace.Repos))
+		for _, r := range cfg.Workspace.Repos {
+			repos = append(repos, agent.RepoInfo{
+				Name: r.Name,
+				Path: cfg.Workspace.Dir + "/" + r.Name,
+				Role: r.Role,
+			})
+		}
+		return repos
+	}
+	// Single-repo fallback: treat workspace.dir itself as the only repo.
 	if cfg.Workspace.Dir == "" {
 		return nil
 	}
@@ -489,24 +636,67 @@ func configRepos(cfg *config.Config) []agent.RepoInfo {
 	}
 }
 
-func configToWorkspaceRepos(_ *config.Config) []workspace.RepoConfig {
-	return nil
+func configToWorkspaceRepos(cfg *config.Config) []workspace.RepoConfig {
+	repos := make([]workspace.RepoConfig, 0, len(cfg.Workspace.Repos))
+	for _, r := range cfg.Workspace.Repos {
+		repos = append(repos, workspace.RepoConfig{
+			Name:   r.Name,
+			URL:    r.URL,
+			Branch: r.Branch,
+		})
+	}
+	return repos
 }
 
 func buildSchemaResult(taskID string, output *agent.AnalysisOutput, input agent.AnalysisInput) *schema.AnalysisResult {
 	nodes := make([]schema.CallNode, 0, len(output.CallGraph))
+	seenNodes := make(map[string]bool)
+	crossRepoSet := make(map[string]bool)
 	for _, n := range output.CallGraph {
+		// Skip internal truncation placeholders.
+		if strings.Contains(n.Function, "[truncated — too many changed functions]") {
+			continue
+		}
+		// Skip raw LLM prose fallback nodes (no file, very long function text).
+		if n.File == "" && len(n.Function) > 200 {
+			continue
+		}
+		// Deduplicate by repo+file+function.
+		nodeKey := n.Repo + "|" + n.File + "|" + n.Function
+		if seenNodes[nodeKey] {
+			continue
+		}
+		seenNodes[nodeKey] = true
+
+		role := schema.NodeTypeMiddle
+		for _, ep := range output.EntryPoints {
+			if ep.Repo == n.Repo && ep.Function == n.Function {
+				role = schema.NodeTypeEntry
+				break
+			}
+		}
 		nodes = append(nodes, schema.CallNode{
 			FuncName: n.Function,
 			FilePath: n.File,
 			Line:     n.Line,
 			Repo:     n.Repo,
-			NodeType: schema.NodeTypeMiddle,
+			NodeType: role,
 		})
+		// Collect cross-repo impact.
+		if n.Repo != "" && n.Repo != input.SourceRepo {
+			crossRepoSet[n.Repo] = true
+		}
 	}
 
+	// Deduplicate entry points by repo+function (preserve first occurrence).
+	seenEntries := make(map[string]bool)
 	entryNodes := make([]schema.EntryPoint, 0, len(output.EntryPoints))
 	for _, e := range output.EntryPoints {
+		epKey := e.Repo + "|" + e.Function
+		if seenEntries[epKey] {
+			continue
+		}
+		seenEntries[epKey] = true
 		entryNodes = append(entryNodes, schema.EntryPoint{
 			Node: schema.CallNode{
 				FuncName: e.Function,
@@ -519,9 +709,160 @@ func buildSchemaResult(taskID string, output *agent.AnalysisOutput, input agent.
 		})
 	}
 
+	// Merge per-entry-point scenario data from WorkerResult.EntryScenarios into entryNodes.
+	// Matching uses a multi-level fallback because the LLM may use slightly different names:
+	//   1. Exact FuncName match
+	//   2. One name contains the other (substring)
+	//   3. FilePath match (entry_file vs node FilePath)
+	mergeScenario := func(es agent.EntryPointScenario) {
+		// Find best matching entryNode.
+		idx := -1
+		for i := range entryNodes {
+			fn := entryNodes[i].Node.FuncName
+			fp := entryNodes[i].Node.FilePath
+			ef := es.EntryFunction
+			eff := es.EntryFile
+			// Level 1: exact name match.
+			if fn == ef {
+				idx = i
+				break
+			}
+			// Level 2: substring match (either direction).
+			if strings.Contains(fn, ef) || strings.Contains(ef, fn) {
+				if idx < 0 {
+					idx = i
+				}
+			}
+			// Level 3: file path match.
+			if eff != "" && fp != "" && (strings.Contains(fp, eff) || strings.Contains(eff, fp)) {
+				if idx < 0 {
+					idx = i
+				}
+			}
+		}
+		if idx < 0 {
+			return
+		}
+		entryNodes[idx].ChangedVia = es.ChangedVia
+		entryNodes[idx].Preconditions = es.Preconditions
+		entryNodes[idx].TypicalInputs = es.TypicalInputs
+		for _, s := range es.Scenarios {
+			sc := schema.SuggestedTestScenario{
+				Type:        s.Type,
+				Description: s.Description,
+				Input:       s.Input,
+				Expected:    s.Expected,
+				Priority:    s.Priority,
+			}
+			for _, o := range s.Oracles {
+				sc.Oracles = append(sc.Oracles, schema.TestOracle{
+					Type:      o.Type,
+					Target:    o.Target,
+					Assertion: o.Assertion,
+				})
+			}
+			entryNodes[idx].SuggestedScenarios = append(entryNodes[idx].SuggestedScenarios, sc)
+		}
+	}
+	for _, wr := range output.WorkerOutputs {
+		if wr == nil {
+			continue
+		}
+		for _, es := range wr.EntryScenarios {
+			mergeScenario(es)
+		}
+	}
+
+	// Convert FunctionAnalyses (constraints + test scenarios).
+	funcAnalyses := make([]schema.FunctionAnalysis, 0, len(output.FunctionAnalyses))
+	for _, fa := range output.FunctionAnalyses {
+		sfa := schema.FunctionAnalysis{
+			FuncName:      fa.Name,
+			Repo:          fa.Repo,
+			FilePath:      fa.File,
+			ExistingTests: fa.ExistingTests,
+		}
+		for _, c := range fa.Constraints {
+			sfa.Constraints = append(sfa.Constraints, schema.FunctionConstraint{
+				Type:      c.Type,
+				Condition: c.Condition,
+				FilePath:  c.File,
+				Line:      c.Line,
+				Note:      c.Note,
+			})
+		}
+		for _, s := range fa.SuggestedScenarios {
+			sfa.SuggestedScenarios = append(sfa.SuggestedScenarios, schema.SuggestedTestScenario{
+				Type:        s.Type,
+				Description: s.Description,
+				Input:       s.Input,
+				Expected:    s.Expected,
+				Priority:    s.Priority,
+			})
+		}
+		funcAnalyses = append(funcAnalyses, sfa)
+	}
+
 	inputType := schema.InputTypeDiff
 	if input.Diff == "" {
 		inputType = schema.InputTypeFuncName
+	}
+
+	// Collect worker raw outputs for display.
+	// Show raw content when there are no structured nodes with file paths,
+	// so the user always sees the LLM's analysis even when JSON nodes are empty.
+	var workerRawOutputs strings.Builder
+	for repoName, wr := range output.WorkerOutputs {
+		if wr == nil || wr.RawContent == "" {
+			continue
+		}
+		hasStructuredNodes := len(wr.Nodes) > 0 && wr.Nodes[0].File != ""
+		hasEntryPoints := len(wr.EntryPoints) > 0
+		if !hasStructuredNodes && !hasEntryPoints {
+			workerRawOutputs.WriteString(fmt.Sprintf("\n### [%s]\n\n", repoName))
+			workerRawOutputs.WriteString(wr.RawContent)
+			workerRawOutputs.WriteString("\n")
+		}
+	}
+
+	crossRepoImpact := make([]string, 0, len(crossRepoSet))
+	for repo := range crossRepoSet {
+		crossRepoImpact = append(crossRepoImpact, repo)
+	}
+	sort.Strings(crossRepoImpact)
+
+	// Collect UT suggestions from all Workers, dedupe by (repo, file, func).
+	utSeen := make(map[string]bool)
+	utSuggestions := make([]schema.UTSuggestion, 0)
+	for repoName, wr := range output.WorkerOutputs {
+		if wr == nil {
+			continue
+		}
+		for _, ut := range wr.UTAnalyses {
+			key := repoName + "|" + ut.FilePath + "|" + ut.FuncName
+			if utSeen[key] {
+				continue
+			}
+			utSeen[key] = true
+			item := schema.UTSuggestion{
+				FuncName:      ut.FuncName,
+				Repo:          repoName,
+				FilePath:      ut.FilePath,
+				Summary:       ut.Summary,
+				Constraints:   ut.Constraints,
+				ExistingTests: ut.ExistingTests,
+			}
+			for _, s := range ut.Scenarios {
+				item.Scenarios = append(item.Scenarios, schema.UTScenario{
+					Priority:    s.Priority,
+					Type:        s.Type,
+					Description: s.Description,
+					MockSetup:   s.MockSetup,
+					Assertions:  s.Assertions,
+				})
+			}
+			utSuggestions = append(utSuggestions, item)
+		}
 	}
 
 	return &schema.AnalysisResult{
@@ -531,10 +872,16 @@ func buildSchemaResult(taskID string, output *agent.AnalysisOutput, input agent.
 			Nodes:     nodes,
 			Direction: schema.DirectionDownward,
 		},
-		EntryPoints: entryNodes,
+		EntryPoints:      entryNodes,
+		FunctionAnalyses: funcAnalyses,
+		UTSuggestions:    utSuggestions,
 		ImpactSummary: schema.ImpactSummary{
-			DirectCount: len(output.ChangedFunctions),
+			SourceRepo:      input.SourceRepo,
+			DirectCount:     len(output.ChangedFunctions),
+			CrossRepoImpact: crossRepoImpact,
+			CrossRepoCount:  len(crossRepoImpact),
 		},
+		SelfCheckReport: workerRawOutputs.String(),
 	}
 }
 

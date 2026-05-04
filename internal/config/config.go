@@ -12,6 +12,22 @@ type Config struct {
 	DB        DBConfig        `mapstructure:"db"`
 	Redis     RedisConfig     `mapstructure:"redis"`
 	Workspace WorkspaceConfig `mapstructure:"workspace"`
+	Contracts []ContractEntry `mapstructure:"contracts"`
+}
+
+// ContractEntry declares a known cross-repo call relationship.
+// These are injected into Worker prompts as hints so the LLM does not need
+// to discover them via ripgrep (faster, more reliable for known relationships).
+type ContractEntry struct {
+	Provider ContractEndpoint `mapstructure:"provider"`
+	Consumer ContractEndpoint `mapstructure:"consumer"`
+}
+
+// ContractEndpoint identifies one side of a cross-repo contract.
+type ContractEndpoint struct {
+	Repo string `mapstructure:"repo"` // repo short name (matches workspace.repos[].name)
+	Path string `mapstructure:"path"` // HTTP path, gRPC method, or MQ topic
+	Func string `mapstructure:"func"` // function/handler name (optional, for display)
 }
 
 type LLMConfig struct {
@@ -26,11 +42,20 @@ type DBConfig struct {
 }
 
 type RedisConfig struct {
-	Addr string `mapstructure:"addr"`
+	Addr     string `mapstructure:"addr"`
+	Password string `mapstructure:"password"`
+}
+
+type RepoConfig struct {
+	Name   string `mapstructure:"name"`
+	URL    string `mapstructure:"url"`
+	Branch string `mapstructure:"branch"`
+	Role   string `mapstructure:"role"`
 }
 
 type WorkspaceConfig struct {
-	Dir string `mapstructure:"dir"`
+	Dir   string       `mapstructure:"dir"`
+	Repos []RepoConfig `mapstructure:"repos"`
 }
 
 // Load reads configuration from file and environment.
@@ -63,6 +88,7 @@ func Load(cfgFile string) (*Config, error) {
 	_ = viper.BindEnv("llm.model", "SHIRAKAMI_LLM_MODEL")
 	_ = viper.BindEnv("db.dsn", "SHIRAKAMI_DB_DSN")
 	_ = viper.BindEnv("redis.addr", "SHIRAKAMI_REDIS_ADDR")
+	_ = viper.BindEnv("redis.password", "SHIRAKAMI_REDIS_PASSWORD")
 
 	// defaults
 	viper.SetDefault("workspace.dir", "/tmp/shirakami-workspace")
