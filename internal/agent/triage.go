@@ -138,6 +138,20 @@ Output JSON only:
 			p2++
 		}
 	}
+
+	// Detect suspiciously uniform results: if every file is P1 (no P0 or P2 at all)
+	// and there are 3+ files, it may indicate a parse failure that still produced
+	// items (e.g. the LLM defaulted every file to P1). Log as warning so this is
+	// distinguishable from "triage.parse_failed" (which signals no JSON at all).
+	if p0 == 0 && p2 == 0 && p1 >= 3 {
+		log.Warnw("triage.all_p1_uniform",
+			"total", len(parsed.Items),
+			"p1", p1,
+			"note", "all items are P1 — triage may have defaulted; verify LLM output",
+			"duration_ms", time.Since(start).Milliseconds(),
+		)
+	}
+
 	log.Infow("triage.llm_done",
 		"total", len(parsed.Items),
 		"p0", p0, "p1", p1, "p2", p2,

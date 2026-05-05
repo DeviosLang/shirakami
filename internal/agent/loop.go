@@ -143,8 +143,13 @@ func (a *AgentLoop) Run(ctx context.Context, taskID string, task string) (*Resul
 		// Persist state after each step.
 		if a.checkpointer != nil {
 			if saveErr := a.checkpointer.Save(taskID, stepCount, messages); saveErr != nil {
-				// Non-fatal: log and continue.
-				_ = saveErr
+				// Non-fatal: checkpoint failure doesn't break the analysis, but log it
+				// so operators know crash recovery won't work for this task.
+				log.Warnw("loop.checkpoint_save_failed",
+					"task_id", taskID,
+					"step", stepCount,
+					"err", saveErr.Error(),
+				)
 			}
 		}
 

@@ -787,32 +787,39 @@ func buildSchemaResult(taskID string, output *agent.AnalysisOutput, input agent.
 	// Merge per-entry-point scenario data from WorkerResult.EntryScenarios into entryNodes.
 	// Matching uses a multi-level fallback because the LLM may use slightly different names:
 	//   1. Exact FuncName match
-	//   2. One name contains the other (substring)
+	//   2. Substring match — only when the shorter string is at least 6 chars, to avoid
+	//      short common tokens like "Create" matching "CreateUser" AND "CreateInstance"
+	//      (keeps the best/longest match when multiple candidates qualify)
 	//   3. FilePath match (entry_file vs node FilePath)
 	mergeScenario := func(es agent.EntryPointScenario) {
 		// Find best matching entryNode.
 		idx := -1
+		bestMatchLen := 0 // length of the shorter string in the best substring match
 		for i := range entryNodes {
 			fn := entryNodes[i].Node.FuncName
 			fp := entryNodes[i].Node.FilePath
 			ef := es.EntryFunction
 			eff := es.EntryFile
-			// Level 1: exact name match.
+			// Level 1: exact name match — takes priority immediately.
 			if fn == ef {
 				idx = i
 				break
 			}
-			// Level 2: substring match (either direction).
+			// Level 2: substring match — only when the shorter side is ≥6 chars
+			// to prevent short tokens like "Create" from matching multiple entries.
 			if strings.Contains(fn, ef) || strings.Contains(ef, fn) {
-				if idx < 0 {
+				shorter := len(ef)
+				if len(fn) < shorter {
+					shorter = len(fn)
+				}
+				if shorter >= 6 && shorter > bestMatchLen {
+					bestMatchLen = shorter
 					idx = i
 				}
 			}
-			// Level 3: file path match.
-			if eff != "" && fp != "" && (strings.Contains(fp, eff) || strings.Contains(eff, fp)) {
-				if idx < 0 {
-					idx = i
-				}
+			// Level 3: file path match — only used when no name match found yet.
+			if idx < 0 && eff != "" && fp != "" && (strings.Contains(fp, eff) || strings.Contains(eff, fp)) {
+				idx = i
 			}
 		}
 		if idx < 0 {

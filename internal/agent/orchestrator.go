@@ -314,6 +314,7 @@ func (o *Orchestrator) Run(ctx context.Context, input AnalysisInput) (*AnalysisO
 	const earlyStopPatience = 3
 	consecutiveNoProgress := 0
 	prevNodeCount := 0
+	prevEntryCount := 0
 
 	// Safety cap on cross-repo hops. Already resolved above (maxRounds).
 	for round := 0; round < maxRounds && len(pending) > 0; round++ {
@@ -378,11 +379,32 @@ func (o *Orchestrator) Run(ctx context.Context, input AnalysisInput) (*AnalysisO
 					skipped++
 					continue
 				}
+				// ScopeOnlyRepos filter: when set, skip repos not in the explicit scope list.
+				// This lets callers restrict cross-repo tracing to a subset of repos
+				// (e.g. only trace into vstation_dispatcher and cvm_api, skip all others).
+				if len(o.input.ScopeOnlyRepos) > 0 && !scopeContains(o.input.ScopeOnlyRepos, cross.TargetRepo) {
+					skipped++
+					continue
+				}
 				targetFunc := cross.TargetFunction
 				if targetFunc == "" {
-					// Use caller_file as a file-level sentinel.
+					// Use caller_file as a file-level sentinel so the next-hop Worker
+					// searches the file broadly instead of a specific function.
+					//
+					// CallerNode.File comes from ripgrep output and may already carry the
+					// repo name as its first path segment (e.g. "vstation_compute_access/dispatch.py").
+					// Strip that prefix before prepending TargetRepo to avoid double-prefixes
+					// like "FILE_CHANGED:cxm_api/vstation_compute_access/dispatch.py".
 					if cross.CallerNode.File != "" {
-						targetFunc = "FILE_CHANGED:" + cross.TargetRepo + "/" + cross.CallerNode.File
+						callerFile := cross.CallerNode.File
+						// Strip leading "<anyRepo>/" prefix if present.
+						if idx := strings.Index(callerFile, "/"); idx > 0 {
+							prefix := callerFile[:idx]
+							if o.repoExists(prefix) {
+								callerFile = callerFile[idx+1:]
+							}
+						}
+						targetFunc = "FILE_CHANGED:" + cross.TargetRepo + "/" + callerFile
 					} else {
 						skipped++
 						continue
@@ -433,13 +455,19 @@ func (o *Orchestrator) Run(ctx context.Context, input AnalysisInput) (*AnalysisO
 
 		// Plateau detection: if no new nodes were added this round and no
 		// new cross-repo batches were discovered, increment the stall counter.
+		// Also check entry point count: discovering new entry points counts as
+		// progress even when cross-repo calls are exhausted (prevents premature
+		// exit when the call chain reaches entry-role repos but finds no further
+		// cross-repo hops to follow).
 		currentNodeCount := len(output.CallGraph)
-		if currentNodeCount == prevNodeCount && len(nextPending) == 0 {
+		currentEntryCount := len(output.EntryPoints)
+		if currentNodeCount == prevNodeCount && currentEntryCount == prevEntryCount && len(nextPending) == 0 {
 			consecutiveNoProgress++
 		} else {
 			consecutiveNoProgress = 0
 		}
 		prevNodeCount = currentNodeCount
+		prevEntryCount = currentEntryCount
 
 		if consecutiveNoProgress >= earlyStopPatience {
 			log.Infow("analyse.early_stop",
@@ -850,6 +878,18 @@ func (o *Orchestrator) repoFromFilePath(filePath string) string {
 func (o *Orchestrator) repoExists(name string) bool {
 	for _, r := range o.repos {
 		if r.Name == name {
+			return true
+		}
+	}
+	return false
+}
+
+// scopeContains returns true if name appears in the scope list.
+// Intentionally a package-level function (not a method) so it can be tested
+// independently and used without an Orchestrator receiver.
+func scopeContains(scope []string, name string) bool {
+	for _, s := range scope {
+		if s == name {
 			return true
 		}
 	}

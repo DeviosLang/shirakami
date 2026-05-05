@@ -244,9 +244,13 @@ type llmEntryScenariosOutput struct {
 	EntryScenarios []llmEntryScenario `json:"entry_scenarios"`
 }
 
-// jsonBlockRe extracts a ```json ... ``` fenced block from LLM output.
-// Uses greedy matching to capture the LAST } so nested JSON objects are included.
-var jsonBlockRe = regexp.MustCompile("(?s)```json\\s*(\\{.+\\})\\s*```")
+// fencedJSONStartRe finds the opening { of a ```json fenced block.
+// Used by extractJSON (strategy 1) as an anchor; the actual JSON object
+// is then extracted via depth-counted brace matching so that:
+//   (a) nested JSON objects are handled correctly, and
+//   (b) multiple fenced blocks in the same response are not merged into
+//       invalid JSON (which the old greedy regex (?s)`{.+}` caused).
+var fencedJSONStartRe = regexp.MustCompile("```json[ \\t]*\\r?\\n?[ \\t]*(\\{")
 
 // WorkerAgent performs local call-chain analysis inside a single repository.
 type WorkerAgent struct {
@@ -375,6 +379,16 @@ func (w *WorkerAgent) Analyse(ctx context.Context, task WorkerTask) (*WorkerResu
 			"  d. No results in this repo → ripgrep WITHOUT repo param (global search)\n"+
 			"  e. Callers > 20 → wide_impact=true, stop\n"+
 			"  f. Record ALL ripgrep result file paths in search_results[] — Go uses these as fallback\n\n"+
+			"## STEP 1b — Probe entry-role repos (MANDATORY after STEP 1)\n"+
+			"For EACH entry-role repo in the list above that you have NOT yet found a caller in:\n"+
+			"  - Search for the SOURCE REPOSITORY name (%s) in that entry-role repo:\n"+
+			"    ripgrep({\"pattern\": \"%s\", \"repo\": \"<entry_role_repo>\"})\n"+
+			"  - Also search for the module path or package name of each CHANGED FUNCTION\n"+
+			"    (e.g. 'compute.procedure.book_resource', 'host_network_info', etc.) in that repo.\n"+
+			"  - If you find any callers, record them as cross_repo_calls AND entry_points.\n"+
+			"  - If STILL no results: search for 'dispatch' or 'handler' patterns in that repo that\n"+
+			"    reference compute operations (e.g. 'compute', 'vstation', 'host_info').\n"+
+			"This step ensures entry-role repos are not missed when direct ripgrep doesn't find them.\n\n"+
 			"## CRITICAL RULES FOR cross_repo_calls:\n"+
 			"You MUST only record cross_repo_calls that you PERSONALLY verified via ripgrep.\n"+
 			"For each entry:\n"+
@@ -409,8 +423,10 @@ func (w *WorkerAgent) Analyse(ctx context.Context, task WorkerTask) (*WorkerResu
 		entryRepoList,
 		task.RepoName,
 		task.RepoName,
-		task.RepoName,
-		task.RepoName,
+		task.RepoName, // STEP 1b: source repo name used as search pattern
+		task.RepoName, // STEP 1b: source repo name used as search pattern (2nd %s)
+		task.RepoName, // CRITICAL RULES: target_function repo name
+		task.RepoName, // STEP 2 JSON template: repo field
 	)
 
 	taskID := "worker-" + task.RepoName
@@ -483,24 +499,19 @@ func (w *WorkerAgent) Analyse(ctx context.Context, task WorkerTask) (*WorkerResu
 	// Uses RunFollowUpNoTools to avoid the LLM wasting time on tool calls
 	// (v38 observed 3-8 minutes per scenario when tools were exposed vs. ~20s
 	// without tools — the LLM wouldn't know when to stop calling ripgrep).
+	//
+	// Batching: entry points are split into chunks of maxScenarioChunkSize to
+	// prevent JSON truncation.  When a chunk produces 0 scenarios, it is retried
+	// once with an explicit "strict JSON" reminder (mirrors runUTAnalysis).
 	if len(workerResult.EntryPoints) > 0 {
-		scenStart := time.Now()
-		scenarioPrompt := buildScenarioFollowUp(task.ChangedFunctions, workerResult.EntryPoints)
-		scenarioResult, scenErr := w.loop.RunFollowUpNoTools(ctx, taskID, result.Content, scenarioPrompt)
-		if scenErr == nil && scenarioResult != nil {
-			workerResult.EntryScenarios = parseEntryScenarios(scenarioResult.Content)
-			log.Infow("worker.scenarios_done",
-				"repo", task.RepoName,
-				"entry_points", len(workerResult.EntryPoints),
-				"scenarios", len(workerResult.EntryScenarios),
-				"duration_ms", time.Since(scenStart).Milliseconds(),
-			)
-		} else if scenErr != nil {
-			log.Warnw("worker.scenarios_failed",
-				"repo", task.RepoName,
-				"err", scenErr.Error(),
-			)
-		}
+		workerResult.EntryScenarios = w.runScenarioAnalysis(
+			ctx, taskID, result.Content, task.ChangedFunctions, workerResult.EntryPoints,
+		)
+		log.Infow("worker.scenarios_done",
+			"repo", task.RepoName,
+			"entry_points", len(workerResult.EntryPoints),
+			"scenarios", len(workerResult.EntryScenarios),
+		)
 	}
 
 	// UT follow-up: for each diff-changed function this Worker handled,
@@ -519,6 +530,95 @@ func (w *WorkerAgent) Analyse(ctx context.Context, task WorkerTask) (*WorkerResu
 	}
 
 	return workerResult, nil
+}
+
+// runScenarioAnalysis generates per-entry-point test scenarios for the given entry points.
+//
+// Resilience strategy (mirrors runUTAnalysis):
+//  1. Split entry points into chunks of maxScenarioChunkSize (5) — 18 entry points at once
+//     caused JSON truncation in shadow-v1 run (worker.scenarios_done scenarios=0).
+//  2. Run each chunk via a no-tools follow-up.
+//  3. Retry once per chunk if the chunk returned 0 scenarios (JSON parse failure).
+//  4. Deduplicate by (entry_function, entry_file) across all chunks.
+func (w *WorkerAgent) runScenarioAnalysis(
+	ctx context.Context,
+	taskID string,
+	priorContent string,
+	changedFunctions []string,
+	entryPoints []CallNode,
+) []EntryPointScenario {
+	log := logger.S()
+	const maxScenarioChunkSize = 5
+
+	// Split entry points into chunks.
+	chunks := make([][]CallNode, 0, (len(entryPoints)+maxScenarioChunkSize-1)/maxScenarioChunkSize)
+	for i := 0; i < len(entryPoints); i += maxScenarioChunkSize {
+		end := i + maxScenarioChunkSize
+		if end > len(entryPoints) {
+			end = len(entryPoints)
+		}
+		chunks = append(chunks, entryPoints[i:end])
+	}
+
+	allResults := make([]EntryPointScenario, 0, len(entryPoints))
+	// Track by (function, file) to deduplicate across chunks.
+	type epKey struct{ fn, file string }
+	seen := make(map[epKey]bool)
+
+	for idx, chunk := range chunks {
+		chunkStart := time.Now()
+		prompt := buildScenarioFollowUp(changedFunctions, chunk)
+		resp, err := w.loop.RunFollowUpNoTools(ctx, taskID, priorContent, prompt)
+		if err != nil {
+			log.Warnw("worker.scenario_chunk_failed",
+				"repo", taskID,
+				"chunk", idx,
+				"err", err.Error(),
+			)
+			continue
+		}
+
+		parsed := parseEntryScenarios(resp.Content)
+
+		// Retry once if chunk returned nothing.
+		if len(parsed) == 0 {
+			retryPrompt := prompt + "\n\nIMPORTANT: Your previous response was not valid JSON. " +
+				"Output ONLY a JSON object in a ```json fenced block. No prose. " +
+				fmt.Sprintf("Cover ALL %d entry points listed above.", len(chunk))
+			retryResp, retryErr := w.loop.RunFollowUpNoTools(ctx, taskID, priorContent, retryPrompt)
+			if retryErr == nil && retryResp != nil {
+				parsed = parseEntryScenarios(retryResp.Content)
+				log.Infow("worker.scenario_chunk_retried",
+					"repo", taskID,
+					"chunk", idx,
+					"recovered", len(parsed),
+				)
+			}
+		}
+
+		for _, s := range parsed {
+			k := epKey{s.EntryFunction, s.EntryFile}
+			if seen[k] {
+				continue
+			}
+			seen[k] = true
+			allResults = append(allResults, s)
+		}
+
+		log.Infow("worker.scenario_chunk_done",
+			"chunk", idx,
+			"entry_points", len(chunk),
+			"returned", len(parsed),
+			"duration_ms", time.Since(chunkStart).Milliseconds(),
+		)
+	}
+
+	log.Infow("worker.scenario_analysis_done",
+		"total_entry_points", len(entryPoints),
+		"total_scenarios", len(allResults),
+		"chunks", len(chunks),
+	)
+	return allResults
 }
 
 // runUTAnalysis generates UT suggestions for the given changed functions.
@@ -552,7 +652,27 @@ func (w *WorkerAgent) runUTAnalysis(
 	}
 
 	allResults := make([]UTAnalysis, 0)
+	// seenFuncs keys on the QUALIFIED function name (full entry from realFuncs,
+	// e.g. "vstation_compute/compute/service/dispatch.py::handler") rather than
+	// just the base name.  This prevents false dedup when two different repos both
+	// export a function with the same short name (e.g. "handler", "init", "next").
 	seenFuncs := make(map[string]bool)
+	// baseToQualified maps the base function name back to its full qualified form
+	// so that LLM-returned UTAnalysis (which carries only the short name) can be
+	// matched back to the right qualified key.
+	baseToQualified := make(map[string]string)
+	for _, fn := range realFuncs {
+		base := fn
+		if i := strings.LastIndex(fn, "::"); i >= 0 {
+			base = fn[i+2:]
+		}
+		// If two repos have the same base name, prefer the first (arbitrary but
+		// deterministic). The sweep below uses the qualified key; duplicates are
+		// tolerated because both will be emitted.
+		if _, exists := baseToQualified[base]; !exists {
+			baseToQualified[base] = fn
+		}
+	}
 
 	for idx, chunk := range chunks {
 		chunkStart := time.Now()
@@ -586,10 +706,16 @@ func (w *WorkerAgent) runUTAnalysis(
 		}
 
 		for _, a := range parsed {
-			if seenFuncs[a.FuncName] {
+			// Resolve the qualified key for this result: prefer the full qualified
+			// form from realFuncs to avoid collisions between repos sharing base names.
+			qualKey := a.FuncName
+			if q, ok := baseToQualified[a.FuncName]; ok {
+				qualKey = q
+			}
+			if seenFuncs[qualKey] {
 				continue
 			}
-			seenFuncs[a.FuncName] = true
+			seenFuncs[qualKey] = true
 			allResults = append(allResults, a)
 		}
 
@@ -604,12 +730,8 @@ func (w *WorkerAgent) runUTAnalysis(
 	// Final sweep: any requested func without analysis → one last targeted call.
 	var missing []string
 	for _, fn := range realFuncs {
-		// Match by last segment of function name (fn may be "repo/file::Func").
-		name := fn
-		if idx := strings.LastIndex(fn, "::"); idx >= 0 {
-			name = fn[idx+2:]
-		}
-		if !seenFuncs[name] && !seenFuncs[fn] {
+		// Use the qualified key directly — seenFuncs is now keyed on qualified names.
+		if !seenFuncs[fn] {
 			missing = append(missing, fn)
 		}
 	}
@@ -620,10 +742,14 @@ func (w *WorkerAgent) runUTAnalysis(
 		if err == nil && resp != nil {
 			parsed := parseUTAnalyses(resp.Content)
 			for _, a := range parsed {
-				if seenFuncs[a.FuncName] {
+				qualKey := a.FuncName
+				if q, ok := baseToQualified[a.FuncName]; ok {
+					qualKey = q
+				}
+				if seenFuncs[qualKey] {
 					continue
 				}
-				seenFuncs[a.FuncName] = true
+				seenFuncs[qualKey] = true
 				allResults = append(allResults, a)
 			}
 			log.Infow("worker.ut_sweep_done",
@@ -809,23 +935,71 @@ func parseWorkerOutput(repoName, content string) *WorkerResult {
 
 // extractJSON finds a JSON object in LLM output.
 // First tries ```json ... ``` fenced blocks, then bare { ... }.
+//
+// Both strategies use brace-depth counting rather than greedy regex / LastIndex
+// so that multiple JSON blocks in one response are not merged into invalid JSON.
 func extractJSON(content string) string {
-	// Strategy 1: fenced code block.
-	if m := jsonBlockRe.FindStringSubmatch(content); len(m) >= 2 {
-		return strings.TrimSpace(m[1])
-	}
-
-	// Strategy 2: find the first { and last } in the content.
-	start := strings.Index(content, "{")
-	end := strings.LastIndex(content, "}")
-	if start >= 0 && end > start {
-		candidate := content[start : end+1]
-		var tmp map[string]interface{}
-		if json.Unmarshal([]byte(candidate), &tmp) == nil {
-			return candidate
+	// Strategy 1: fenced code block — anchor on the opening { right after ```json.
+	if m := fencedJSONStartRe.FindStringSubmatchIndex(content); len(m) >= 4 {
+		braceStart := m[2] // index of the '{' captured by group 1
+		if obj := extractBalancedJSON(content, braceStart); obj != "" {
+			return obj
 		}
 	}
 
+	// Strategy 2: bare JSON — first { to its matching }.
+	start := strings.Index(content, "{")
+	if start >= 0 {
+		if obj := extractBalancedJSON(content, start); obj != "" {
+			return obj
+		}
+	}
+
+	return ""
+}
+
+// extractBalancedJSON returns the JSON object starting at content[startIdx]
+// (which must be '{') by counting brace depth until the matching '}' is found.
+// Returns "" if no valid JSON object is found or if the extracted string
+// fails json.Unmarshal.
+func extractBalancedJSON(content string, startIdx int) string {
+	if startIdx < 0 || startIdx >= len(content) || content[startIdx] != '{' {
+		return ""
+	}
+	depth := 0
+	inStr := false
+	escaped := false
+	for i := startIdx; i < len(content); i++ {
+		c := content[i]
+		if escaped {
+			escaped = false
+			continue
+		}
+		if c == '\\' && inStr {
+			escaped = true
+			continue
+		}
+		if c == '"' {
+			inStr = !inStr
+			continue
+		}
+		if inStr {
+			continue
+		}
+		if c == '{' {
+			depth++
+		} else if c == '}' {
+			depth--
+			if depth == 0 {
+				candidate := content[startIdx : i+1]
+				var tmp map[string]interface{}
+				if json.Unmarshal([]byte(candidate), &tmp) == nil {
+					return candidate
+				}
+				return ""
+			}
+		}
+	}
 	return ""
 }
 
