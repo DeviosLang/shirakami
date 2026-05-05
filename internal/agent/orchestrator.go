@@ -51,6 +51,20 @@ type AnalysisOutput struct {
 	FunctionAnalyses []FunctionAnalysis
 	// WorkerOutputs holds per-repo raw results for debugging.
 	WorkerOutputs map[string]*WorkerResult
+	// ShadowReport is the parity comparison between LLM and graph results.
+	// Only populated when --index-mode=shadow.
+	ShadowReport *ShadowParityReport
+}
+
+// ShadowParityReport holds the shadow mode comparison result (embedded in AnalysisOutput).
+type ShadowParityReport struct {
+	MatchCount        int     `json:"match_count"`
+	MissCount         int     `json:"miss_count"`
+	ExtraPendingCount int     `json:"extra_pending_count"`
+	MissRate          float64 `json:"miss_rate"`
+	EntryPointMatch   int     `json:"entry_point_match"`
+	EntryPointMiss    int     `json:"entry_point_miss"`
+	Details           string  `json:"details"` // terminal-formatted report
 }
 
 // Orchestrator coordinates multi-repo call-chain analysis.
@@ -255,6 +269,18 @@ func (o *Orchestrator) Run(ctx context.Context, input AnalysisInput) (*AnalysisO
 		)
 	}
 
+	// Shadow mode: run graph analysis but don't use the results for output.
+	// The LLM path runs as primary; graph result is compared afterward.
+	var shadowGraphResult *graphAnalysisResult
+	if o.indexGraph != nil && o.indexGraph.NodeCount() > 0 && o.indexMode == "shadow" {
+		shadowGraphResult = o.runGraphAnalysis(output.ChangedFunctions, input.SourceRepo)
+		log.Infow("shadow.graph_done",
+			"graph_nodes", len(shadowGraphResult.nodes),
+			"graph_entries", len(shadowGraphResult.entryPoints),
+			"uncovered", len(shadowGraphResult.uncovered),
+		)
+	}
+
 	// Step 2 – group changed functions by repo, then by file within each repo.
 	pending := o.groupByRepoAndFile(changed, input.SourceRepo)
 	log.Infow("group.done", "batches", len(pending))
@@ -451,6 +477,20 @@ func (o *Orchestrator) Run(ctx context.Context, input AnalysisInput) (*AnalysisO
 		"max_rounds", maxRounds,
 		"duration_ms", time.Since(runStart).Milliseconds(),
 	)
+
+	// Shadow mode: compare LLM results (primary) with graph results (shadow).
+	if shadowGraphResult != nil {
+		shadowReport := o.buildShadowReport(output, shadowGraphResult, input)
+		output.ShadowReport = shadowReport
+		log.Infow("shadow.parity",
+			"match", shadowReport.MatchCount,
+			"miss", shadowReport.MissCount,
+			"extra_pending", shadowReport.ExtraPendingCount,
+			"miss_rate", fmt.Sprintf("%.2f", shadowReport.MissRate),
+			"ep_match", shadowReport.EntryPointMatch,
+			"ep_miss", shadowReport.EntryPointMiss,
+		)
+	}
 
 	return output, nil
 }
@@ -1409,4 +1449,91 @@ func (o *Orchestrator) runGraphAnalysis(changedFunctions []string, sourceRepo st
 	)
 
 	return result
+}
+
+// buildShadowReport compares the LLM-based analysis output (primary) with
+// the graph-based analysis (shadow) and produces a parity report.
+func (o *Orchestrator) buildShadowReport(llmOutput *AnalysisOutput, graphResult *graphAnalysisResult, input AnalysisInput) *ShadowParityReport {
+	report := &ShadowParityReport{}
+
+	// Build set of LLM-discovered edges (consecutive nodes form a call chain).
+	llmEdges := make(map[string]bool)
+	for _, wr := range llmOutput.WorkerOutputs {
+		if wr == nil {
+			continue
+		}
+		for i := 0; i < len(wr.Nodes)-1; i++ {
+			src := wr.Nodes[i]
+			tgt := wr.Nodes[i+1]
+			key := fmt.Sprintf("%s:%s→%s:%s",
+				src.Repo, src.Function, tgt.Repo, tgt.Function)
+			llmEdges[key] = true
+		}
+		for _, cross := range wr.CrossRepoCalls {
+			key := fmt.Sprintf("%s:%s→%s:%s",
+				cross.CallerNode.Repo, cross.CallerNode.Function,
+				cross.TargetRepo, cross.TargetFunction)
+			llmEdges[key] = true
+		}
+	}
+
+	// Build set of graph-discovered edges.
+	graphEdges := make(map[string]bool)
+	for i := 0; i < len(graphResult.nodes)-1; i++ {
+		src := graphResult.nodes[i]
+		tgt := graphResult.nodes[i+1]
+		key := fmt.Sprintf("%s:%s→%s:%s",
+			src.Repo, src.Function, tgt.Repo, tgt.Function)
+		graphEdges[key] = true
+	}
+
+	// Compare: match, miss, extra
+	for key := range llmEdges {
+		if graphEdges[key] {
+			report.MatchCount++
+		}
+	}
+	report.MissCount = len(llmEdges) - report.MatchCount // edges LLM found but graph missed
+	report.ExtraPendingCount = 0
+	for key := range graphEdges {
+		if !llmEdges[key] {
+			report.ExtraPendingCount++ // edges graph found but LLM missed — pending judgment
+		}
+	}
+
+	// Miss rate
+	denom := report.MatchCount + report.MissCount
+	if denom > 0 {
+		report.MissRate = float64(report.MissCount) / float64(denom)
+	}
+
+	// Entry point comparison
+	llmEP := make(map[string]bool)
+	for _, ep := range llmOutput.EntryPoints {
+		llmEP[fmt.Sprintf("%s:%s", ep.Repo, ep.Function)] = true
+	}
+	graphEP := make(map[string]bool)
+	for _, ep := range graphResult.entryPoints {
+		graphEP[fmt.Sprintf("%s:%s", ep.Repo, ep.Function)] = true
+	}
+	for key := range llmEP {
+		if graphEP[key] {
+			report.EntryPointMatch++
+		} else {
+			report.EntryPointMiss++
+		}
+	}
+
+	// Build terminal summary
+	report.Details = fmt.Sprintf(
+		"[Shadow] LLM edges=%d  Graph edges=%d  Match=%d  Miss=%d (%.1f%%)  Extra=%d (pending)\n"+
+			"         Entry Points: LLM=%d  Graph=%d  Match=%d  Miss=%d",
+		len(llmEdges), len(graphEdges),
+		report.MatchCount, report.MissCount, report.MissRate*100,
+		report.ExtraPendingCount,
+		len(llmEP), len(graphEP),
+		report.EntryPointMatch, report.EntryPointMiss,
+	)
+
+	return report
 }

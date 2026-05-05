@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"time"
@@ -425,6 +426,20 @@ func buildAnalyzeCmd() *cobra.Command {
 				return fmt.Errorf("render output: %w", err)
 			}
 			fmt.Print(rendered)
+
+			// Print shadow parity report if available.
+			if output.ShadowReport != nil && output.ShadowReport.Details != "" {
+				fmt.Printf("\n%s\n", output.ShadowReport.Details)
+
+				// Persist shadow report to reports/shadow-parity/ directory.
+				shadowDir := filepath.Join(workspaceDir, "reports", "shadow-parity")
+				_ = os.MkdirAll(shadowDir, 0755)
+				shadowFile := filepath.Join(shadowDir, fmt.Sprintf("%s.json", time.Now().Format("2006-01-02T15-04-05")))
+				if sjb, serr := json.MarshalIndent(output.ShadowReport, "", "  "); serr == nil {
+					_ = os.WriteFile(shadowFile, sjb, 0644)
+				}
+			}
+
 			return nil
 		},
 	}
