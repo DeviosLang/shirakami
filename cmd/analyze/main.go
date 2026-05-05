@@ -56,6 +56,7 @@ func buildRoot() *cobra.Command {
 		buildWorkspaceCmd(),
 		buildIndexCmd(),
 		buildBenchmarkCmd(),
+		buildContractCmd(),
 	)
 	return root
 }
@@ -297,13 +298,7 @@ func buildAnalyzeCmd() *cobra.Command {
 
 			// Inject declared contract hints from config into Worker prompts.
 			if len(cfg.Contracts) > 0 {
-				hints := make([]string, 0, len(cfg.Contracts))
-				for _, c := range cfg.Contracts {
-					hint := fmt.Sprintf("%s (%s) → %s (%s)",
-						c.Provider.Repo, c.Provider.Path,
-						c.Consumer.Repo, c.Consumer.Func)
-					hints = append(hints, hint)
-				}
+				hints := FormatContractHints(cfg.Contracts)
 				orch.SetContractHints(hints)
 				log.Sugar().Infow("contracts.loaded", "count", len(hints))
 			}
