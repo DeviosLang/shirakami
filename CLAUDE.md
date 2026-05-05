@@ -33,6 +33,22 @@ make test-integration         # or: go test ./tests/e2e/... -v -count=1 -timeout
 # Lint
 make lint                     # or: go vet ./...
 
+# ── 容器内编译验证（本地无 Go 工具链时使用）──────────────────────────────
+# 本机没有安装 Go 时，用 Docker 挂载源码目录来验证编译和 lint。
+# 这是该项目的标准 P0 验证方式。
+
+# 编译所有包（等价于 go build ./...）
+docker run --rm -v /mnt/shirakami:/src -w /src golang:1.25-alpine go build ./...
+
+# 静态检查（等价于 go vet ./...）
+docker run --rm -v /mnt/shirakami:/src -w /src golang:1.25-alpine go vet ./...
+
+# 运行单元测试（等价于 go test ./...）
+docker run --rm -v /mnt/shirakami:/src -w /src golang:1.25-alpine go test ./...
+
+# 注意：首次运行会拉取镜像并下载依赖（go mod download），之后有层缓存会快很多。
+# 如需加速，可先手动 pull：docker pull golang:1.25-alpine
+
 # Start dependencies
 docker compose up -d
 

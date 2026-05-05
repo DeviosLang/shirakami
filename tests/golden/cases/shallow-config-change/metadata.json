@@ -1,8 +1,0 @@
-{
-  "case_id": "shallow-config-change",
-  "description": "health_check 浅层修改，变更函数本身就是入口点，无深层调用链",
-  "created_at": "2026-05-05",
-  "source": "手工构造",
-  "difficulty": "easy",
-  "tags": ["single-repo", "shallow", "entry-point-is-change", "python"]
-}

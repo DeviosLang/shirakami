@@ -1,0 +1,52 @@
+{
+  "changed_functions": [
+    {
+      "name": "checkoutService.PlaceOrder",
+      "repo": "checkoutservice",
+      "file": "src/checkoutservice/main.go",
+      "start_line": 178
+    },
+    {
+      "name": "checkoutService.convertCurrency",
+      "repo": "checkoutservice",
+      "file": "src/checkoutservice/main.go",
+      "start_line": 244
+    },
+    {
+      "name": "checkoutService.getCurrencySvcClient",
+      "repo": "checkoutservice",
+      "file": "src/checkoutservice/main.go",
+      "start_line": 258
+    }
+  ],
+  "call_chain": [
+    {
+      "source": "checkoutService.PlaceOrder",
+      "target": "checkoutService.convertCurrency",
+      "type": "CALLS",
+      "depth": 1
+    },
+    {
+      "source": "checkoutService.convertCurrency",
+      "target": "checkoutService.getCurrencySvcClient",
+      "type": "CALLS",
+      "depth": 1
+    }
+  ],
+  "entry_points": [
+    {
+      "function": "checkoutService.PlaceOrder",
+      "repo": "checkoutservice",
+      "file": "src/checkoutservice/main.go",
+      "protocol": "gRPC"
+    }
+  ],
+  "cross_repo_calls": [
+    {
+      "from_repo": "checkoutservice",
+      "to_repo": "currencyservice",
+      "function": "CurrencyService.Convert",
+      "confidence": 0.95
+    }
+  ]
+}

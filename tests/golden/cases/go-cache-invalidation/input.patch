@@ -1,0 +1,41 @@
+diff --git a/internal/cache/cache.go b/internal/cache/cache.go
+index abc1234..def5678 100644
+--- a/internal/cache/cache.go
++++ b/internal/cache/cache.go
+@@ -38,12 +38,25 @@ func New(rdb *redis.Client) *Cache {
+ 	return &Cache{rdb: rdb, ttl: defaultTTL}
+ }
+
+-// Get retrieves a cached AnalysisResult by key.
+-// Returns (nil, false) on miss or error.
+-func (c *Cache) Get(ctx context.Context, key string) (*AnalysisResult, bool) {
++// Get retrieves a cached AnalysisResult by key with optional TTL refresh.
++// Returns (nil, false) on miss or error. On hit, if refreshTTL is true,
++// the entry's TTL is extended to the default TTL.
++func (c *Cache) Get(ctx context.Context, key string, refreshTTL bool) (*AnalysisResult, bool) {
+ 	data, err := c.rdb.Get(ctx, cacheKeyPrefix(key)).Bytes()
+ 	if err != nil {
+ 		return nil, false
+ 	}
+ 	var result AnalysisResult
+ 	if err := json.Unmarshal(data, &result); err != nil {
+ 		return nil, false
+ 	}
++	if refreshTTL {
++		_ = c.rdb.Expire(ctx, cacheKeyPrefix(key), c.ttl)
++	}
+ 	return &result, true
+ }
+
++// Invalidate removes a single cache entry by key.
++// Returns true if the key existed and was deleted, false if it was not found.
++func (c *Cache) Invalidate(ctx context.Context, key string) (bool, error) {
++	n, err := c.rdb.Del(ctx, cacheKeyPrefix(key)).Result()
++	if err != nil {
++		return false, fmt.Errorf("cache invalidate %s: %w", key, err)
++	}
++	return n > 0, nil
++}
++
+ // Set stores an AnalysisResult under the given key with the default TTL.
+ func (c *Cache) Set(ctx context.Context, key string, result *AnalysisResult, ttl time.Duration) error {

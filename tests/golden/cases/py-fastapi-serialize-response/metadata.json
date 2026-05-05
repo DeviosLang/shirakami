@@ -1,0 +1,10 @@
+{
+  "case_id": "py-fastapi-serialize-response",
+  "description": "fastapi 0.95→0.100: serialize_response() 加入 response_model_include/exclude 参数，run_endpoint_function() 加 dependant 校验。验证 Python HTTP entry point 检测 + async 函数调用链。",
+  "created_at": "2026-05-05",
+  "source": "upstream — tiangolo/fastapi 0.95.0 → 0.100.1",
+  "upstream_url": "https://github.com/tiangolo/fastapi",
+  "upstream_commit": "0.100.1",
+  "difficulty": "medium",
+  "tags": ["python", "single-repo", "http-entry-point", "async", "parameter-change"]
+}

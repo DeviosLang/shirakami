@@ -1,0 +1,39 @@
+{
+  "changed_functions": [
+    {
+      "name": "Task.retry",
+      "repo": "celery",
+      "file": "celery/app/task.py",
+      "start_line": 648
+    }
+  ],
+  "call_chain": [
+    {
+      "source": "Task.retry",
+      "target": "Task.signature_from_request",
+      "type": "CALLS",
+      "depth": 1
+    },
+    {
+      "source": "Task.retry",
+      "target": "Task.apply_async",
+      "type": "CALLS",
+      "depth": 1
+    },
+    {
+      "source": "Task.apply_async",
+      "target": "Task._apply_async_impl",
+      "type": "CALLS",
+      "depth": 1
+    }
+  ],
+  "entry_points": [
+    {
+      "function": "Task.__call__",
+      "repo": "celery",
+      "file": "celery/app/task.py",
+      "protocol": "MQ"
+    }
+  ],
+  "cross_repo_calls": []
+}

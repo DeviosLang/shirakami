@@ -1,0 +1,72 @@
+name: CI
+
+on:
+  push:
+    branches: ["main", "master"]
+  pull_request:
+    branches: ["main", "master"]
+
+jobs:
+  # ──────────────────────────────────────────────────────────────
+  # Job 1: 编译 + 单元测试
+  # ──────────────────────────────────────────────────────────────
+  test:
+    name: Build & Unit Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Build
+        run: go build ./...
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Unit tests
+        run: go test ./... -short -count=1 -timeout=5m
+
+  # ──────────────────────────────────────────────────────────────
+  # Job 2: Golden Benchmark 门禁（Layer A recall ≥ 0.90）
+  # ──────────────────────────────────────────────────────────────
+  benchmark:
+    name: Golden Benchmark (Layer A)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Build shirakami CLI
+        run: go build -o bin/shirakami ./cmd/analyze/
+
+      - name: Run golden benchmark
+        run: |
+          ./bin/shirakami benchmark run \
+            --golden-dir tests/golden/cases \
+            --fail-below 0.90 \
+            --format terminal
+
+      - name: Upload benchmark results (JSON)
+        if: always()
+        run: |
+          ./bin/shirakami benchmark run \
+            --golden-dir tests/golden/cases \
+            --format json > benchmark-results.json || true
+
+      - name: Upload benchmark artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-results
+          path: benchmark-results.json
+          retention-days: 30

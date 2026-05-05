@@ -1,0 +1,63 @@
+diff --git a/src/checkoutservice/main.go b/src/checkoutservice/main.go
+index 7c3a102..a9f4e31 100644
+--- a/src/checkoutservice/main.go
++++ b/src/checkoutservice/main.go
+@@ -178,6 +178,7 @@ func (cs *checkoutService) PlaceOrder(ctx context.Context, req *pb.PlaceOrderReq
+ 	log.Infof("[PlaceOrder] user_id=%q user_currency=%q", req.UserId, req.UserCurrency)
+
+ 	orderID, err := uuid.NewUUID()
++	// Validate currency via currencyservice before proceeding
+ 	if err != nil {
+ 		return nil, status.Errorf(codes.Internal, "failed to generate order uuid")
+ 	}
+@@ -189,6 +190,24 @@ func (cs *checkoutService) PlaceOrder(ctx context.Context, req *pb.PlaceOrderReq
+ 		return nil, err
+ 	}
+
++	// Convert all item prices to the user's currency
++	for i, item := range prep.orderItems {
++		convertedPrice, err := cs.convertCurrency(ctx, item.GetCost(), req.UserCurrency)
++		if err != nil {
++			return nil, status.Errorf(codes.Internal,
++				"failed to convert price for item %d: %v", i, err)
++		}
++		prep.orderItems[i].Cost = convertedPrice
++	}
++
+ 	txID, err := cs.chargeCard(ctx, &money.Money{
+ 		CurrencyCode: req.UserCurrency,
+ 		Units:        totalPrice.Units,
+@@ -224,6 +244,28 @@ func (cs *checkoutService) PlaceOrder(ctx context.Context, req *pb.PlaceOrderReq
+ 	return &pb.PlaceOrderResponse{Order: shippingTrackingID}, nil
+ }
+
++// convertCurrency calls currencyservice.Convert() to convert a Money value
++// from its current currency to the target currency.
++func (cs *checkoutService) convertCurrency(ctx context.Context, from *money.Money, toCurrency string) (*money.Money, error) {
++	svc, err := cs.getCurrencySvcClient()
++	if err != nil {
++		return nil, err
++	}
++	result, err := svc.Convert(ctx, &pb.CurrencyConversionRequest{
++		From:   from,
++		ToCode: toCurrency,
++	})
++	if err != nil {
++		return nil, fmt.Errorf("failed to convert currency: %w", err)
++	}
++	return result, nil
++}
++
++// getCurrencySvcClient returns a cached or new currencyservice gRPC client.
++func (cs *checkoutService) getCurrencySvcClient() (pb.CurrencyServiceClient, error) {
++	conn, err := grpc.Dial(cs.currencySvcAddr,
++		grpc.WithTransportCredentials(insecure.NewCredentials()),
++		grpc.WithUnaryInterceptor(grpc_middleware.ChainUnaryClient(
++			grpc_opentracing.UnaryClientInterceptor(grpc_opentracing.WithTracer(opentracing.GlobalTracer())),
++		)),
++	)
++	if err != nil {
++		return nil, fmt.Errorf("could not connect currency service at %s: %v", cs.currencySvcAddr, err)
++	}
++	return pb.NewCurrencyServiceClient(conn), nil
++}

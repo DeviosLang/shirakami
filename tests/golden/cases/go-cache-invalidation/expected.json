@@ -1,0 +1,19 @@
+{
+  "changed_functions": [
+    {
+      "name": "Get",
+      "repo": "shirakami",
+      "file": "internal/cache/cache.go",
+      "start_line": 49
+    },
+    {
+      "name": "Invalidate",
+      "repo": "shirakami",
+      "file": "internal/cache/cache.go",
+      "start_line": 62
+    }
+  ],
+  "call_chain": [],
+  "entry_points": [],
+  "cross_repo_calls": []
+}

@@ -1,0 +1,56 @@
+diff --git a/context.go b/context.go
+index 8a89e4c..d4b45d9 100644
+--- a/context.go
++++ b/context.go
+@@ -924,18 +924,24 @@ func (c *Context) Negotiate(code int, config Negotiate) {
+ // NegotiateFormat returns an acceptable Accept format.
+ func (c *Context) NegotiateFormat(offered ...string) string {
+
++// Render writes the response headers and calls render.Render to write the
++// response body. If render.Render fails, c.Abort() is called.
+ func (c *Context) Render(code int, r render.Render) {
+ 	c.Status(code)
+
+ 	if !bodyAllowedForStatus(code) {
+ 		r.WriteContentType(c.Writer)
+ 		c.Writer.WriteHeaderNow()
+ 		return
+ 	}
+
+ 	if err := r.Render(c.Writer); err != nil {
+-		// Pushing error to logs
+-		debugPrint("error on render: %v\n", err)
++		// If the response has not been committed, abort to prevent partial writes.
++		c.Abort()
++		panic(err)
+ 	}
+ }
+
+@@ -970,8 +976,12 @@ func (c *Context) HTML(code int, name string, obj any) {
+ // JSON serializes the given struct as JSON into the response body.
+ // It also sets the Content-Type as "application/json".
+ func (c *Context) JSON(code int, obj any) {
++	// Ensure headers are flushed before the body is written.
++	c.Writer.WriteHeaderNow()
+ 	c.Render(code, render.JSON{Data: obj})
+ }
+
+ // IndentedJSON serializes the given struct as pretty JSON (indented by two spaces)
+ // into the response body and sets the Content-Type as "application/json".
+ func (c *Context) IndentedJSON(code int, obj any) {
++	c.Writer.WriteHeaderNow()
+ 	c.Render(code, render.IndentedJSON{Data: obj})
+ }
+diff --git a/gin.go b/gin.go
+index 2c8b914..9d1e253 100644
+--- a/gin.go
++++ b/gin.go
+@@ -348,7 +348,7 @@ func (engine *Engine) ServeHTTP(w http.ResponseWriter, req *http.Request) {
+ 	c := engine.pool.Get().(*Context)
+ 	c.writermem.reset(w)
+ 	c.Request = req
+-	c.reset()
++	c.reset(req)
+
+ 	engine.handleHTTPRequest(c)
+

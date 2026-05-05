@@ -1,0 +1,81 @@
+diff --git a/celery/app/task.py b/celery/app/task.py
+index 4a1b234..8c9d012 100644
+--- a/celery/app/task.py
++++ b/celery/app/task.py
+@@ -648,18 +648,32 @@ class Task:
+         """
+         request = self.request
+         retries = request.retries + 1
+-        max_retries = self.max_retries if max_retries is None else max_retries
++        if max_retries is None:
++            max_retries = self.max_retries
++        # max_retries=0 means unlimited retries (celery convention)
++        if max_retries is not None and max_retries == 0:
++            max_retries = None
+
+         if not eta and countdown is None:
+             countdown = self.default_retry_delay
+
+         is_eager = self.request.is_eager
+-        S = current_app._get_backend()
+-
+-        options['retries'] = retries
+-        options['max_retries'] = max_retries
++        S = self.signature_from_request(
++            request, args, kwargs,
++            countdown=countdown, eta=eta, retries=retries,
++            **options
++        )
+
+-        if max_retries is not None and retries > max_retries:
++        if not self.request.called_directly:
++            result = S.apply_async(countdown=countdown, eta=eta)
++            if is_eager:
++                return result.get()
++            raise self.retry_with_siginfo(exc, retries, max_retries)
++
++        if max_retries is not None and retries > max_retries:
+             if exc:
+                 try:
+                     raise exc
+@@ -668,11 +682,6 @@ class Task:
+             raise MaxRetriesExceededError(
+                 "Can't retry {0}[{1}] args:{2} kwargs:{3}".format(
+                     self.name, request.id, S.args, S.kwargs))
+-
+-        ret = self.apply_async(args, kwargs, countdown=countdown, eta=eta, retries=retries)
+-
+-        if is_eager:
+-            return ret.get()
+-        raise self.retry_with_siginfo(exc, retries, max_retries)
+
+
+ class BaseTask(Task):
+@@ -705,12 +714,24 @@ class Task:
+     def apply_async(self, args=None, kwargs=None, task_id=None, producer=None,
+                     link=None, link_error=None, shadow=None, **options):
+         """Apply tasks asynchronously by sending a message."""
+-
++        # Propagate countdown from retry if present
++        countdown = options.pop('countdown', None)
++        eta = options.pop('eta', None)
+         args = args or ()
+         kwargs = kwargs or {}
+         task_id = task_id or uuid()
+         producer = producer or self.app.amqp.default_producer()
+
++        if countdown is not None:
++            from kombu.utils.time import remaining
++            eta = datetime.utcnow() + timedelta(seconds=countdown)
++            options['eta'] = eta
++
+         if self.typing:
+             try:
+                 self.run(*args, **kwargs)
+             except TypeError as exc:
+                 raise TypeError(str(exc))
+
++        return self._apply_async_impl(
++            args, kwargs, task_id=task_id, producer=producer,
++            link=link, link_error=link_error, shadow=shadow, **options
++        )

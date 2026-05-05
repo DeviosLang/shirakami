@@ -1,0 +1,96 @@
+diff --git a/prometheus/counter.go b/prometheus/counter.go
+index 5a2c031..b9e7f12 100644
+--- a/prometheus/counter.go
++++ b/prometheus/counter.go
+@@ -44,6 +44,23 @@ type Counter interface {
+ 	Write(*dto.Metric) error
+ }
+
++// CounterVecOpts bundles the options for creating a CounterVec with the v2 API.
++// It is essentially a superset of CounterOpts.
++type CounterVecOpts struct {
++	CounterOpts
++
++	// VariableLabels defines the partitioning of the counter vec by labels.
++	VariableLabels ConstrainedLabels
++}
++
++// NewCounterVec creates a new CounterVec based on the provided CounterVecOpts.
++// Note that variable labels can be constrained via ConstrainedLabels, and the
++// label values are then automatically validated.
++func NewCounterVec(opts CounterVecOpts) *CounterVec {
++	desc := NewDesc(
++		BuildFQName(opts.Namespace, opts.Subsystem, opts.Name),
++		opts.Help,
++		VariableLabelsFromConstrained(opts.VariableLabels),
++		opts.ConstLabels,
++	)
++	return &CounterVec{
++		MetricVec: NewMetricVec(desc, func(lvs ...string) Metric {
++			if len(lvs) != len(desc.variableLabels) {
++				panic(makeInconsistentCardinalityError(desc.fqName, desc.variableLabels, lvs))
++			}
++			result := &counter{desc: desc, labelPairs: MakeLabelPairs(desc, lvs), createdTs: time.Now()}
++			result.init(result)
++			return result
++		}),
++	}
++}
++
+ type counter struct {
+ 	// valInt and valBits are both used to track the counter's value. Both
+ 	// fields must be first in the struct to guarantee 64-bit alignment on
+@@ -55,6 +72,7 @@ type counter struct {
+ 	desc       *Desc
+ 	labelPairs []*dto.LabelPair
+ 	exemplar   atomic.Value
++	createdTs  time.Time
+
+ 	selfCollector
+ }
+@@ -92,10 +110,18 @@ func (c *counter) Add(v float64) {
+ 	}
+ }
+
+-func (c *counter) Write(out *dto.Metric) error {
++func (c *counter) Write(out *dto.Metric, createdTs *timestamppb.Timestamp) error {
+ 	val := math.Float64frombits(atomic.LoadUint64(&c.valBits))
+ 	var exemplar *dto.Exemplar
+ 	if e := c.exemplar.Load(); e != nil {
+ 		exemplar = e.(*dto.Exemplar)
+ 	}
+-	return writeCounter(out, val, exemplar)
++	return writeCounter(out, val, exemplar, createdTs)
++}
++
++func (c *counter) createdTimestamp() *timestamppb.Timestamp {
++	if c.createdTs.IsZero() {
++		return nil
++	}
++	return timestamppb.New(c.createdTs)
+ }
+diff --git a/prometheus/vec.go b/prometheus/vec.go
+index 7c8d432..e9f2341 100644
+--- a/prometheus/vec.go
++++ b/prometheus/vec.go
+@@ -156,6 +156,14 @@ func (v *MetricVec) DeletePartialMatch(labels Labels) int {
+ 	return v.metricMap.deleteByLabels(labels, v.curry)
+ }
+
++// ConstrainedLabels holds a list of labels and their optional value constraints.
++type ConstrainedLabel struct {
++	Name      string
++	Constraint func(string) string
++}
++
++// ConstrainedLabels is a slice of ConstrainedLabel.
++type ConstrainedLabels []ConstrainedLabel
++
++// VariableLabelsFromConstrained extracts just the label names from ConstrainedLabels.
++func VariableLabelsFromConstrained(cl ConstrainedLabels) []string {
++	names := make([]string, len(cl))
++	for i, c := range cl {
++		names[i] = c.Name
++	}
++	return names
++}

@@ -1,0 +1,2 @@
+source_repo: celery
+description: "celery/app/task.py: Task.retry() 新增 max_retries 默认值处理 + apply_async() 传递 countdown"

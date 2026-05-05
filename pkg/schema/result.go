@@ -163,6 +163,18 @@ type UTScenario struct {
 	Assertions  string `json:"assertions,omitempty"` // what to verify (return value, side effects, error raised)
 }
 
+// CrossRepoHop records a single cross-repository call edge found during
+// deterministic graph traversal. Each hop represents a boundary crossing
+// from one repository to another in the BFS traversal.
+type CrossRepoHop struct {
+	FromRepo string `json:"from_repo"`
+	FromFunc string `json:"from_func,omitempty"`
+	ToRepo   string `json:"to_repo"`
+	ToFunc   string `json:"to_func"`
+	Depth    int    `json:"depth"`
+	EdgeType string `json:"edge_type,omitempty"`
+}
+
 // AnalysisResult is the top-level output of a Shirakami analysis run.
 type AnalysisResult struct {
 	TaskID           string             `json:"task_id"`
@@ -177,4 +189,18 @@ type AnalysisResult struct {
 	// UTSuggestions holds unit-test suggestions per changed function.
 	UTSuggestions    []UTSuggestion     `json:"ut_suggestions,omitempty"`
 	SelfCheckReport  string             `json:"self_check_report"`
+
+	// Risk is the overall blast-radius classification for the change.
+	// Set by the deterministic graph path (resolve.Resolver).
+	// Values: "LOW", "MEDIUM", "HIGH", "CRITICAL". Empty when index is not active.
+	Risk string `json:"risk,omitempty"`
+
+	// IndexCoverage is the fraction of changed functions that were resolved
+	// by the deterministic index (0.0–1.0). Only set in hybrid/deterministic mode.
+	IndexCoverage float64 `json:"index_coverage,omitempty"`
+
+	// CrossRepoHops records repository-boundary edges found during graph traversal.
+	// Each hop represents a CALLS/IMPORTS edge that crosses a repo boundary.
+	// Only populated in hybrid/deterministic mode; empty in pure-LLM mode.
+	CrossRepoHops []CrossRepoHop `json:"cross_repo_hops,omitempty"`
 }

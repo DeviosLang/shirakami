@@ -1,0 +1,8 @@
+{
+  "case_id": "go-cache-invalidation",
+  "description": "shirakami 自身 cache.go: Get() 增加 refreshTTL 参数 + 新增 Invalidate() 方法。用于验证 Go 函数名正则对方法签名变更的检测。",
+  "created_at": "2026-05-05",
+  "source": "synthetic — based on actual cache.go in this repo",
+  "difficulty": "easy",
+  "tags": ["go", "single-repo", "method-signature-change", "new-method"]
+}

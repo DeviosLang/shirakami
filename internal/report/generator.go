@@ -111,6 +111,29 @@ func generateTerminal(result *schema.AnalysisResult) string {
 		fmt.Fprintf(&b, "  跨仓影响: %s%s%s\n",
 			ansiRed, strings.Join(result.ImpactSummary.CrossRepoImpact, "、"), ansiReset)
 	}
+	if result.Risk != "" {
+		riskColor := ansiYellow
+		switch result.Risk {
+		case "CRITICAL":
+			riskColor = ansiRed
+		case "HIGH":
+			riskColor = ansiRed
+		case "LOW":
+			riskColor = ansiGray
+		}
+		fmt.Fprintf(&b, "  风险等级: %s%s%s", riskColor, result.Risk, ansiReset)
+		if result.IndexCoverage > 0 {
+			fmt.Fprintf(&b, " %s(索引覆盖率 %.0f%%)%s", ansiGray, result.IndexCoverage*100, ansiReset)
+		}
+		fmt.Fprintf(&b, "\n")
+	}
+	if len(result.CrossRepoHops) > 0 {
+		fmt.Fprintf(&b, "  跨仓调用:\n")
+		for _, hop := range result.CrossRepoHops {
+			fmt.Fprintf(&b, "    %s%s → %s%s (%s)\n",
+				ansiYellow, hop.FromRepo, hop.ToRepo, ansiReset, hop.ToFunc)
+		}
+	}
 
 	// Self-check
 	if result.SelfCheckReport != "" {
@@ -349,6 +372,23 @@ func generateMarkdown(result *schema.AnalysisResult) string {
 		fmt.Fprintf(&b, "- **跨仓影响 (%d):** %s\n",
 			result.ImpactSummary.CrossRepoCount,
 			strings.Join(result.ImpactSummary.CrossRepoImpact, "、"))
+	}
+	if result.Risk != "" {
+		coverageNote := ""
+		if result.IndexCoverage > 0 {
+			coverageNote = fmt.Sprintf("（索引覆盖率 %.0f%%）", result.IndexCoverage*100)
+		}
+		fmt.Fprintf(&b, "- **风险等级:** %s%s\n", result.Risk, coverageNote)
+	}
+	if len(result.CrossRepoHops) > 0 {
+		b.WriteString("\n### 跨仓调用明细\n\n")
+		b.WriteString("| 深度 | 来源仓库 | 目标仓库 | 目标函数 | 边类型 |\n")
+		b.WriteString("|------|----------|----------|----------|--------|\n")
+		for _, hop := range result.CrossRepoHops {
+			fmt.Fprintf(&b, "| %d | `%s` | `%s` | `%s` | %s |\n",
+				hop.Depth, hop.FromRepo, hop.ToRepo, hop.ToFunc, hop.EdgeType)
+		}
+		b.WriteString("\n")
 	}
 	b.WriteString("\n")
 

@@ -4,7 +4,7 @@ VERSION     = 0.1.0
 ANALYZE_PKG = github.com/DeviosLang/shirakami/cmd/analyze
 SERVER_PKG  = github.com/DeviosLang/shirakami/cmd/server
 
-.PHONY: build build-server test lint migrate run run-server clean
+.PHONY: build build-server test lint migrate run run-server clean benchmark
 
 build:
 	mkdir -p bin
@@ -21,6 +21,9 @@ test:
 
 test-integration:
 	go test ./tests/e2e/... -v -count=1 -timeout=5m
+
+benchmark: build
+	./$(BINARY) benchmark run --golden-dir tests/golden/cases --fail-below 0.90
 
 lint:
 	go vet ./...

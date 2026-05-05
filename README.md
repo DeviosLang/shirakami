@@ -1,14 +1,17 @@
 # Shirakami
 
-**跨仓库代码调用链分析系统** — 基于 LLM Agent Loop，分析代码变更影响的完整调用链路，识别集成测试入口，生成测试场景建议。
+**跨仓库代码调用链分析系统** — 基于 LLM Agent Loop + 符号图索引混合架构，分析代码变更影响的完整调用链路，识别集成测试入口，生成测试场景建议。
 
 ## 功能简介
 
 - 输入代码变更（diff / 文字描述 / 两者组合），自动分析影响的完整调用链
 - 双向追踪：向下追踪实现路径 + 向上追踪到业务入口仓库
 - 支持跨多个 Git 仓库的调用链分析
+- **Layer A/B/C 混合分析**：纯文本 diff 解析 → 符号图索引 → LLM 补充，逐层降级，减少 LLM 调用
+- **Contract Bridge**：从代码中自动扫描跨仓库 gRPC/HTTP 调用合约，写入 `contracts` 表
 - 自动识别集成测试入口（HTTP / gRPC / MQ / Cron / CLI），生成测试场景建议
 - 输出格式：终端树状图 / JSON / Markdown
+- **Golden Test 基准框架**：人工标注的 expected.json 覆盖 Go/Python 多种场景，CI 门禁自动校验
 
 ## 系统要求
 
@@ -40,9 +43,17 @@ docker compose up -d
 # 安装 goose
 go install github.com/pressly/goose/v3/cmd/goose@latest
 
-# 执行迁移
+# 执行迁移（含 symbol_nodes/symbol_edges/contracts 等表）
 goose -dir migrations postgres "postgres://shirakami:shirakami@localhost:5432/shirakami?sslmode=disable" up
 ```
+
+迁移文件说明：
+
+| 文件 | 内容 |
+|------|------|
+| `001_init.sql` | tasks / task_results / feedback 基础表 |
+| `002_symbol_graph.sql` | symbol_nodes / symbol_edges 符号图表 |
+| `003_contracts.sql` | contracts / contract_links 跨仓库合约表 |
 
 ### 4. 配置文件
 
@@ -164,28 +175,6 @@ Impact Summary
   Cross-repo: api-gateway (entry point affected)
 ```
 
-### JSON 格式
-
-```bash
-./bin/shirakami analyze --config shirakami.yaml --diff changes.patch --format json
-```
-
-```json
-{
-  "downward_chain": { ... },
-  "upward_chains": [ ... ],
-  "entry_points": [
-    {
-      "node": { "func_name": "PaymentHandler.HandlePayment", "repo": "api-gateway" },
-      "protocol": "HTTP",
-      "path": "POST /api/v1/payments",
-      "test_scenarios": ["正常支付流程", "超时重试", "并发幂等性"]
-    }
-  ],
-  "impact_summary": { ... }
-}
-```
-
 ## HTTP API
 
 启动 API 服务器：
@@ -252,36 +241,92 @@ GET /metrics
 输入（diff / desc）
        │
        ▼
-  Orchestrator
-  ┌────────────────────────────────────────────────┐
-  │  解析变更函数 → 并发启动 WorkerAgent            │
-  │                                                │
-  │  WorkerAgent × N（每个 repo 一个）              │
-  │  ┌──────────────────────────────────────────┐ │
-  │  │  AgentLoop (end_turn 状态机，最大100步)   │ │
-  │  │  Tools:                                  │ │
-  │  │    ripgrep   — 代码符号搜索               │ │
-  │  │    file_read — 分层读取（3级）             │ │
-  │  │    glob      — 文件模式匹配               │ │
-  │  │    lsp       — gopls 调用链查询           │ │
-  │  │    gitdiff   — 变更函数提取               │ │
-  │  └──────────────────────────────────────────┘ │
-  │                                                │
-  │  Memory:                                       │
-  │    Layer1: PostgreSQL 长期知识库               │
-  │    Layer2: Redis 任务状态 + 断点恢复            │
-  │    Layer3: System Prompt 动态注入               │
-  │                                                │
-  │  Token Budget Manager (ABCD 四方案):           │
-  │    60% → 注入精简 reminder                     │
-  │    70% → 限制文件读取级别                       │
-  │    80% → 清空已分析代码块                       │
-  │    92% → LLM 对话历史压缩                       │
-  └────────────────────────────────────────────────┘
+  ┌─────────────────────────────────┐
+  │  DiffToSymbols（Layer A）        │
+  │  ParseDiffHunks → 精确行号定位   │
+  │  纯文本解析，零 LLM 调用          │
+  └──────────────┬──────────────────┘
+                 │ changed_functions
+                 ▼
+  ┌─────────────────────────────────┐
+  │  Symbol Graph（Layer B）         │
+  │  symbol_nodes + symbol_edges     │
+  │  WITH RECURSIVE BFS 调用链遍历   │
+  │  contracts 表 — 跨仓库合约       │
+  │  （Go 仓库：coverage ≥ 90%）     │
+  └──────────────┬──────────────────┘
+                 │ 未命中 → fallback
+                 ▼
+  ┌─────────────────────────────────────────────────────────┐
+  │  Orchestrator + Worker（Layer C — LLM Agent Loop）       │
+  │                                                         │
+  │  WorkerAgent × N（每个 repo 一个）                       │
+  │  ┌────────────────────────────────────────────────────┐ │
+  │  │  AgentLoop (end_turn 状态机，最大 100 步)           │ │
+  │  │  Tools: ripgrep / file_read / glob / lsp / gitdiff │ │
+  │  └────────────────────────────────────────────────────┘ │
+  │                                                         │
+  │  Memory:                                                │
+  │    Layer1: PostgreSQL 长期知识库                         │
+  │    Layer2: Redis 任务状态 + 断点恢复                      │
+  │    Layer3: System Prompt 动态注入                        │
+  │                                                         │
+  │  Token Budget Manager (ABCD 四方案):                    │
+  │    60% → 注入精简 reminder                              │
+  │    70% → 限制文件读取级别                                │
+  │    80% → 清空已分析代码块                                │
+  │    92% → LLM 对话历史压缩                               │
+  └──────────────────────────────────────────────────────────┘
        │
        ▼
   Report Generator
   Terminal / JSON / Markdown
+```
+
+## 测试 & 质量保障
+
+### 单元测试
+
+```bash
+# 不需要 Docker
+go test ./...
+
+# 或通过 Docker（本机无 Go 工具链时）
+docker run --rm -v /mnt/shirakami:/src -w /src golang:1.25-alpine go test ./...
+```
+
+### Golden Test 基准框架
+
+`tests/golden/` 目录维护人工标注的 golden cases，覆盖 Go / Python 多种变更场景：
+
+| case | 难度 | 场景 |
+|------|------|------|
+| `go-grpc-server-worker` | ★★ | Go 新方法 + 重构 |
+| `go-prometheus-counter-vec` | ★★ | 接口签名变更 + 跨文件传播 |
+| `go-gin-context-json` | ★ | 方法体改动（无新函数声明） |
+| `go-cache-invalidation` | ★ | 方法签名变更 + 新方法 |
+| `py-fastapi-serialize-response` | ★★ | Python 函数签名扩展 |
+| `py-celery-task-retry` | ★★ | MQ 任务入口 + 重试链路 |
+| `cross-grpc-microservices` | ★★★ | 跨仓库 gRPC 调用 |
+
+```bash
+# 运行 Layer A 测试（纯文本 diff 解析，无 Docker）
+go test ./tests/golden/... -short -v
+
+# 运行 Layer B 测试（需要 Docker，启动 PostgreSQL 测试实例）
+go test ./tests/golden/... -v -count=1
+
+# 运行单个 case
+go test ./tests/golden/... -short -run TestParseDiffHunks_GoldenCases/go-gin-context-json -v
+```
+
+Golden case 来源与设计思路详见 [`tests/golden/SOURCES.md`](tests/golden/SOURCES.md)。
+
+### 集成测试
+
+```bash
+# 需要 Docker（PostgreSQL + Redis via testcontainers）
+go test ./tests/integration/... -v -count=1 -timeout=5m
 ```
 
 ## 常见问题
@@ -311,18 +356,9 @@ SSH Key 方式：确保运行 Shirakami 的机器有访问目标仓库的 SSH Ke
 
 Token 方式：将 URL 中的 `git@github.com:org/repo.git` 改为 `https://TOKEN@github.com/org/repo.git`。
 
-## 开发
+**Q: Symbol Graph（Layer B）什么时候生效**
 
-```bash
-# 运行单元测试（不需要 Docker）
-go test ./internal/agent/... ./internal/llm/... ./internal/report/... ./internal/workspace/...
-
-# 运行集成测试（需要 Docker）
-go test ./tests/... -v -count=1 -timeout=5m
-
-# 代码检查
-go vet ./...
-```
+Layer B 对 Go 仓库有效（通过 `go/packages` + ripgrep 构建符号边），Python 仓库自动降级到 Layer C（LLM）。`go-cache-invalidation` 私有 case 用于测试 Layer B 自身，不对外提交。
 
 ## License
 

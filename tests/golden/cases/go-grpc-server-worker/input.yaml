@@ -1,0 +1,2 @@
+source_repo: grpc-go
+description: "server.go: serverWorker() 重构为单 channel + 新增 handleSingleStream() + RecvBufferPool() ServerOption"

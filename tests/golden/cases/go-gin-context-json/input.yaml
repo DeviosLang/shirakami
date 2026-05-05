@@ -1,0 +1,2 @@
+source_repo: gin
+description: "context.go: Context.JSON() 加入 header 预写 + Render() 错误后调用 Abort()"

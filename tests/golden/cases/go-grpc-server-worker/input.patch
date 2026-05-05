@@ -1,0 +1,123 @@
+diff --git a/server.go b/server.go
+index 3a8b21c..c7f9d4e 100644
+--- a/server.go
++++ b/server.go
+@@ -88,12 +88,13 @@ const (
+
+ type serverWorkerData struct {
+ 	st *transport.ServerTransport
+-	sr *ServerStream
++	sr ServerStream
+ }
+
+ type Server struct {
+ 	opts serverOptions
+
++	serverWorkerChannel chan serverWorkerData
+ 	mu  sync.Mutex // guards following
+
+ 	lis      map[net.Listener]bool
+@@ -109,8 +110,6 @@ type Server struct {
+ 	channelzID *channelz.Identifier
+ 	czData     *channelzData
+
+-	serverWorkerChannels []chan serverWorkerData
+-
+ 	// cv is closed when cleanup work holding mu is done.
+ 	cv *sync.Cond
+ }
+@@ -197,28 +196,22 @@ var defaultServerOptions = serverOptions{
+ 	connectionTimeout: 120 * time.Second,
+ }
+
++// RecvBufferPool returns a ServerOption that sets the server's buffer pool for
++// receiving messages. If nil, the default buffer pool is used.
++func RecvBufferPool(bufferPool SharedBufferPool) ServerOption {
++	return newFuncServerOption(func(o *serverOptions) {
++		o.recvBufferPool = bufferPool
++	})
++}
++
+ func NewServer(opt ...ServerOption) *Server {
+ 	opts := defaultServerOptions
+ 	for _, o := range opt {
+ 		o.apply(&opts)
+ 	}
+ 	s := &Server{
+-		lis:                  make(map[net.Listener]bool),
+-		opts:                 opts,
+-		conns:                make(map[string]map[transport.ServerTransport]bool),
+-		m:                    make(map[string]*MethodDesc),
+-		quit:                 grpcsync.NewEvent(),
+-		done:                 grpcsync.NewEvent(),
+-		czData:               new(channelzData),
+-		serverWorkerChannels: nil,
++		lis:                 make(map[net.Listener]bool),
++		opts:                opts,
++		conns:               make(map[string]map[transport.ServerTransport]bool),
++		m:                   make(map[string]*MethodDesc),
++		quit:                grpcsync.NewEvent(),
++		done:                grpcsync.NewEvent(),
++		czData:              new(channelzData),
++		serverWorkerChannel: make(chan serverWorkerData),
+ 	}
+ 	chainUnaryServerInterceptors(s)
+ 	chainStreamServerInterceptors(s)
+@@ -235,33 +228,26 @@ func NewServer(opt ...ServerOption) *Server {
+ }
+
+ func (s *Server) serverWorker() {
+-	// To prevent excessive goroutine churn, worker goroutines are re-used for
+-	// up to maxSendRecvPKTSize requests before being restarted.
+-	threshold := 1 << 20
+-	for completed := 0; completed < threshold; completed++ {
+-		data, ok := <-s.serverWorkerChannels[s.workerIndex]
+-		if !ok {
+-			return
+-		}
+-		s.handleSingleStream(data)
++	for data := range s.serverWorkerChannel {
++		s.handleSingleStream(data)
+ 	}
+-	go s.serverWorker()
+ }
+
++// handleSingleStream handles one gRPC stream from a serverWorkerData.
++// It is called from serverWorker goroutines.
++func (s *Server) handleSingleStream(data serverWorkerData) {
++	defer s.removeConn(listenerAddressForConn(data.st), data.st)
++	s.serveStreams(data.st)
++}
++
++// initServerWorkers starts the server worker goroutines.
+ func (s *Server) initServerWorkers() {
+-	s.serverWorkerChannels = make([]chan serverWorkerData, s.opts.numServerWorkers)
+-	for i := uint32(0); i < s.opts.numServerWorkers; i++ {
+-		s.serverWorkerChannels[i] = make(chan serverWorkerData, 1)
+-		go s.serverWorker()
++	s.serverWorkerChannel = make(chan serverWorkerData, s.opts.numServerWorkers)
++	for i := uint32(0); i < s.opts.numServerWorkers; i++ {
++		go s.serverWorker()
+ 	}
+ }
+
+ func (s *Server) stopServerWorkers() {
+-	for i := uint32(0); i < s.opts.numServerWorkers; i++ {
+-		close(s.serverWorkerChannels[i])
+-	}
++	close(s.serverWorkerChannel)
+ }
+
+ // GetServiceInfo returns unary and stream RPC service methods for the given
+diff --git a/server_options.go b/server_options.go
+index 1c3b9a2..8d7c431 100644
+--- a/server_options.go
++++ b/server_options.go
+@@ -56,6 +56,7 @@ type serverOptions struct {
+ 	initialWindowSize        int32
+ 	initialConnWindowSize    int32
+ 	writeBufferSize          int
++	recvBufferPool           SharedBufferPool
+ 	readBufferSize           int
+ 	connectionTimeout        time.Duration
+ 	maxHeaderListSize        *uint32

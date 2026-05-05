@@ -1,0 +1,10 @@
+{
+  "case_id": "go-grpc-server-worker",
+  "description": "grpc-go v1.57: serverWorker() 重构 — 从多 channel 改为单 channel，新增 handleSingleStream() 方法，同时新增 RecvBufferPool() ServerOption。验证 Go 新方法 + 调用链向上追踪到 ServeHTTP/Serve。",
+  "created_at": "2026-05-05",
+  "source": "upstream — grpc/grpc-go v1.54.0 → v1.57.0",
+  "upstream_url": "https://github.com/grpc/grpc-go",
+  "upstream_commit": "v1.57.0",
+  "difficulty": "medium",
+  "tags": ["go", "single-repo", "new-method", "refactor", "grpc-entry-point"]
+}

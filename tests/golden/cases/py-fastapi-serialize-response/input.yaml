@@ -1,0 +1,2 @@
+source_repo: fastapi
+description: "fastapi/routing.py: serialize_response() 加 include/exclude 参数 + run_endpoint_function() 加 dependant 校验"

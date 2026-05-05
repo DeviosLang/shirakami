@@ -8,8 +8,13 @@ import (
 	"sync"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgxpool"
+
 	"github.com/DeviosLang/shirakami/internal/checkpoint"
+	"github.com/DeviosLang/shirakami/internal/index"
 	"github.com/DeviosLang/shirakami/internal/logger"
+	"github.com/DeviosLang/shirakami/internal/resolve"
+	"github.com/DeviosLang/shirakami/internal/tool"
 )
 
 // AnalysisInput is the input to an Orchestrator run.
@@ -54,6 +59,16 @@ type AnalysisOutput struct {
 	// ShadowReport is the parity comparison between LLM and graph results.
 	// Only populated when --index-mode=shadow.
 	ShadowReport *ShadowParityReport
+	// Risk is the blast-radius classification produced by the deterministic graph path.
+	// Values: "LOW", "MEDIUM", "HIGH", "CRITICAL". Empty when index is not active.
+	Risk string
+	// IndexCoverage is the fraction [0.0, 1.0] of changed functions resolved
+	// by the deterministic index. Only set in hybrid/deterministic mode.
+	IndexCoverage float64
+	// CrossRepoHops records repository-boundary edges found during graph traversal.
+	// Each hop represents a call from one repo to another. Only populated in
+	// hybrid/deterministic mode (resolver path); empty when pure LLM or shadow mode.
+	CrossRepoHops []resolve.CrossRepoHop
 }
 
 // ShadowParityReport holds the shadow mode comparison result (embedded in AnalysisOutput).
@@ -98,6 +113,14 @@ type Orchestrator struct {
 	// importContext is a pre-built import graph summary (from Python indexer).
 	// Injected into Worker prompts to reduce LLM search rounds.
 	importContext string
+	// pool is the PostgreSQL connection pool for Layer B DiffToSymbols queries.
+	// When nil, Layer B is skipped and only Layer A + LLM fallback are used.
+	pool *pgxpool.Pool
+	// resolver is the business-level impact analyser built on top of the in-memory
+	// symbol graph. When set it supersedes the raw indexGraph calls inside
+	// runGraphAnalysis with proper symbol disambiguation, risk assessment,
+	// entry-point detection, and cross-repo hop tracking.
+	resolver *resolve.Resolver
 }
 
 // IndexGraph is the interface consumed by Orchestrator for deterministic analysis.
@@ -187,6 +210,24 @@ func (o *Orchestrator) SetImportContext(ctx string) {
 	o.importContext = ctx
 }
 
+// SetPool injects the PostgreSQL connection pool for Layer B DiffToSymbols queries.
+// When set and index mode is not "off", extractChangedFunctions will use
+// DiffToSymbols to map diff hunks to indexed symbols without LLM involvement.
+func (o *Orchestrator) SetPool(pool *pgxpool.Pool) {
+	o.pool = pool
+}
+
+// SetResolver injects the business-level impact resolver for graph-based analysis.
+// When set, runGraphAnalysis uses Resolver.ImpactMany() which provides proper
+// symbol disambiguation, risk assessment, entry-point detection, and cross-repo
+// hop tracking — superseding the raw IndexGraph calls.
+//
+// Typically constructed as: resolve.New(graph) where graph is the *index.InMemoryGraph
+// already loaded from the symbol DB.
+func (o *Orchestrator) SetResolver(r *resolve.Resolver) {
+	o.resolver = r
+}
+
 // Run analyses the provided diff and returns the complete call-chain graph.
 func (o *Orchestrator) Run(ctx context.Context, input AnalysisInput) (*AnalysisOutput, error) {
 	log := logger.S()
@@ -248,6 +289,15 @@ func (o *Orchestrator) Run(ctx context.Context, input AnalysisInput) (*AnalysisO
 			)
 			output.CallGraph = graphResult.nodes
 			output.EntryPoints = graphResult.entryPoints
+			output.Risk = graphResult.risk
+			output.CrossRepoHops = graphResult.crossRepoHops
+			if len(changed) > 0 {
+				covered := len(changed) - len(graphResult.uncovered)
+				if covered < 0 {
+					covered = 0
+				}
+				output.IndexCoverage = float64(covered) / float64(len(changed))
+			}
 			// In deterministic mode, skip LLM Workers entirely
 			if o.indexMode == "deterministic" {
 				return output, nil
@@ -259,6 +309,15 @@ func (o *Orchestrator) Run(ctx context.Context, input AnalysisInput) (*AnalysisO
 		// Hybrid mode with partial coverage: merge graph results + continue with LLM for uncovered
 		output.CallGraph = append(output.CallGraph, graphResult.nodes...)
 		output.EntryPoints = append(output.EntryPoints, graphResult.entryPoints...)
+		output.Risk = graphResult.risk
+		output.CrossRepoHops = graphResult.crossRepoHops
+		if len(changed) > 0 {
+			covered := len(changed) - len(graphResult.uncovered)
+			if covered < 0 {
+				covered = 0
+			}
+			output.IndexCoverage = float64(covered) / float64(len(changed))
+		}
 		// Override changed to only include uncovered functions (LLM handles only what graph missed)
 		changed = graphResult.uncovered
 		log.Infow("analyse.graph_partial",
@@ -382,7 +441,7 @@ func (o *Orchestrator) Run(ctx context.Context, input AnalysisInput) (*AnalysisO
 				// ScopeOnlyRepos filter: when set, skip repos not in the explicit scope list.
 				// This lets callers restrict cross-repo tracing to a subset of repos
 				// (e.g. only trace into vstation_dispatcher and cvm_api, skip all others).
-				if len(o.input.ScopeOnlyRepos) > 0 && !scopeContains(o.input.ScopeOnlyRepos, cross.TargetRepo) {
+				if len(input.ScopeOnlyRepos) > 0 && !scopeContains(input.ScopeOnlyRepos, cross.TargetRepo) {
 					skipped++
 					continue
 				}
@@ -523,12 +582,118 @@ func (o *Orchestrator) Run(ctx context.Context, input AnalysisInput) (*AnalysisO
 	return output, nil
 }
 
-// extractChangedFunctions uses an AgentLoop to ask the LLM to parse the diff
-// and return a list of changed function names with their file paths.
-// Uses a minimal prompt focused ONLY on diff parsing — no call chain or constraint steps.
+// extractChangedFunctions uses a three-layer approach to determine which
+// production functions were modified by the diff:
+//
+//   - Layer A (always): pure diff parsing via tool.ParseDiffHunks — zero deps,
+//     returns file+line-range hunks without any LLM or DB involvement.
+//
+//   - Layer B (when pool != nil and index mode != "off"): DiffToSymbols
+//     queries the symbol_nodes table to map hunks to named symbols.
+//     Returns fully-qualified FILE_PATH::FUNCTION_NAME strings for matched hunks.
+//     Uncovered hunks (not yet indexed) fall through to the LLM fallback.
+//
+//   - LLM fallback (for uncovered hunks or when pool is nil / mode is off):
+//     Sends the relevant diff sections to a minimal LLM prompt that ONLY
+//     extracts function names — no call chain analysis, no tool calls.
+//
+// The combined output is deduped and filtered to remove test functions.
 func (o *Orchestrator) extractChangedFunctions(ctx context.Context, input AnalysisInput) ([]string, error) {
-	// Minimal system prompt for diff parsing only.
-	// No hardcoded repo names, function names, or examples.
+	log := logger.S()
+
+	// -----------------------------------------------------------------------
+	// Layer A: parse diff hunks (pure text, no deps)
+	// -----------------------------------------------------------------------
+	hunks := tool.ParseDiffHunks(input.Diff)
+	log.Debugw("extract.layerA", "hunks", len(hunks))
+
+	// If there's no diff at all, nothing to extract.
+	if len(hunks) == 0 && strings.TrimSpace(input.Diff) == "" {
+		return nil, nil
+	}
+
+	// -----------------------------------------------------------------------
+	// Layer B: DiffToSymbols via index (requires pool + active index mode)
+	// -----------------------------------------------------------------------
+	// NOTE: DiffToSymbols stores file_path in repo-relative form (without repo
+	// prefix), so we pass the raw hunk paths here. Repo prefixing is applied
+	// only when building the final qualified function names.
+	var symbolFunctions []string
+	var uncoveredHunks []tool.DiffHunk
+
+	if o.pool != nil && o.indexMode != "" && o.indexMode != "off" {
+		// Convert tool.DiffHunk → index.DiffHunk (same structure, separate types).
+		idxHunks := make([]index.DiffHunk, len(hunks))
+		for i, h := range hunks {
+			idxHunks[i] = index.DiffHunk{
+				File:      h.File, // repo-relative path, as stored in symbol_nodes.file_path
+				StartLine: h.StartLine,
+				EndLine:   h.EndLine,
+			}
+		}
+
+		d2s, err := index.DiffToSymbols(ctx, o.pool, input.SourceRepo, idxHunks)
+		if err != nil {
+			// Layer B failure is non-fatal: fall through to LLM for everything.
+			log.Warnw("extract.layerB.failed", "err", err.Error())
+			uncoveredHunks = hunks
+		} else {
+			// Build qualified names from matched symbols.
+			// Prefix file path with source repo to match the FILE_PATH::FUNC_NAME convention.
+			seenSym := make(map[string]bool)
+			for _, m := range d2s.Matched {
+				filePath := m.Symbol.FilePath
+				if input.SourceRepo != "" && !strings.HasPrefix(filePath, input.SourceRepo+"/") {
+					filePath = input.SourceRepo + "/" + filePath
+				}
+				qualified := filePath + "::" + m.Symbol.Name
+				if !seenSym[qualified] {
+					seenSym[qualified] = true
+					symbolFunctions = append(symbolFunctions, qualified)
+				}
+			}
+
+			// Convert uncovered index.DiffHunk back to tool.DiffHunk.
+			for _, h := range d2s.Uncovered {
+				uncoveredHunks = append(uncoveredHunks, tool.DiffHunk{
+					File:      h.File,
+					StartLine: h.StartLine,
+					EndLine:   h.EndLine,
+				})
+			}
+
+			log.Debugw("extract.layerB",
+				"matched_symbols", len(symbolFunctions),
+				"uncovered_hunks", len(uncoveredHunks),
+			)
+		}
+	} else {
+		// No pool or index off: all hunks need LLM fallback.
+		uncoveredHunks = hunks
+	}
+
+	// If Layer B covered everything, skip the LLM entirely.
+	if len(uncoveredHunks) == 0 && len(symbolFunctions) > 0 {
+		log.Infow("extract.complete", "source", "index", "count", len(symbolFunctions))
+		return filterTestFunctions(symbolFunctions), nil
+	}
+
+	// -----------------------------------------------------------------------
+	// LLM fallback: only for uncovered hunks (or full diff if no index)
+	// -----------------------------------------------------------------------
+	// Build the diff snippet the LLM needs to parse — either the full diff
+	// (no index) or only the sections touching uncovered hunks.
+	diffForLLM := input.Diff
+	if len(uncoveredHunks) < len(hunks) && len(hunks) > 0 {
+		// We have partial index coverage; only send uncovered file paths to LLM.
+		// Hunk file paths are repo-relative (same as the paths in the diff +++ lines).
+		uncoveredFiles := make(map[string]bool)
+		for _, h := range uncoveredHunks {
+			uncoveredFiles[h.File] = true
+		}
+		diffForLLM = filterDiffToFiles(input.Diff, uncoveredFiles)
+	}
+
 	sysPrompt := fmt.Sprintf(`You are a code diff parser. Your ONLY job is to extract changed production function names.
 
 Workspace: %s
@@ -544,12 +709,10 @@ Rules:
 - Do NOT call any tools, do NOT analyse call chains, do NOT add explanations
 - Just the list`, o.workspaceDir, input.SourceRepo, input.SourceRepo)
 
-	// Use an agent loop with NO tools — pure text generation.
 	loop := NewAgentLoop(o.llmClient, nil, 0, o.cp, sysPrompt)
-
 	task := fmt.Sprintf(
 		"Extract changed production functions from the following diff.\n\nDescription: %s\n\nDiff:\n%s",
-		input.Description, input.Diff,
+		input.Description, diffForLLM,
 	)
 
 	result, err := loop.Run(ctx, "orchestrator-extract", task)
@@ -557,10 +720,61 @@ Rules:
 		return nil, err
 	}
 
-	fns := parseFileFunctionList(result.Content)
-	// Go-level safety filter: drop any remaining test functions the LLM may have included.
-	fns = filterTestFunctions(fns)
-	return fns, nil
+	llmFunctions := parseFileFunctionList(result.Content)
+	llmFunctions = filterTestFunctions(llmFunctions)
+
+	// Merge: index results take precedence; LLM fills the gaps.
+	merged := append(symbolFunctions, llmFunctions...)
+	merged = dedupeStrings(merged)
+
+	log.Infow("extract.complete",
+		"source", "hybrid",
+		"from_index", len(symbolFunctions),
+		"from_llm", len(llmFunctions),
+		"total", len(merged),
+	)
+	return merged, nil
+}
+
+// filterDiffToFiles returns the lines of diff that pertain to any of the given file paths.
+// Used to send only uncovered sections to the LLM, reducing token cost.
+func filterDiffToFiles(diff string, files map[string]bool) string {
+	if len(files) == 0 {
+		return diff
+	}
+	var sb strings.Builder
+	inWantedFile := false
+	for _, line := range strings.Split(diff, "\n") {
+		if strings.HasPrefix(line, "+++ ") {
+			path := strings.TrimPrefix(line, "+++ ")
+			path = strings.TrimPrefix(path, "b/")
+			inWantedFile = files[path]
+		}
+		if strings.HasPrefix(line, "diff ") || strings.HasPrefix(line, "--- ") {
+			// Always include file header lines; inWantedFile is set on the +++ line.
+			sb.WriteString(line)
+			sb.WriteByte('\n')
+			continue
+		}
+		if inWantedFile {
+			sb.WriteString(line)
+			sb.WriteByte('\n')
+		}
+	}
+	return sb.String()
+}
+
+// dedupeStrings removes duplicate strings from a slice, preserving order.
+func dedupeStrings(ss []string) []string {
+	seen := make(map[string]bool, len(ss))
+	out := make([]string, 0, len(ss))
+	for _, s := range ss {
+		if !seen[s] {
+			seen[s] = true
+			out = append(out, s)
+		}
+	}
+	return out
 }
 
 // maxWorkerConcurrency limits how many Worker goroutines run in parallel.
@@ -1405,35 +1619,52 @@ type graphAnalysisResult struct {
 	nodes       []CallNode
 	entryPoints []CallNode
 	uncovered   []string // function names not found in the index (need LLM)
+	// risk is the blast-radius classification from resolve.Resolver.
+	// Empty string when using the legacy IndexGraph path.
+	risk string
+	// crossRepoHops records edges that cross repository boundaries during BFS.
+	// Only populated by the resolver path; empty for the legacy IndexGraph path.
+	crossRepoHops []resolve.CrossRepoHop
 }
 
 // runGraphAnalysis performs deterministic call chain analysis using the index graph.
-// For each changed function, it resolves the symbol in the graph and runs BFS
-// to find all upstream callers (up to depth 3).
+//
+// When o.resolver is set (preferred path), it delegates to resolve.Resolver.ImpactMany()
+// which provides:
+//   - Proper symbol disambiguation by repo + file path (resolves the former TODO)
+//   - Risk assessment (LOW / MEDIUM / HIGH / CRITICAL)
+//   - Entry-point detection using configured entry-role repos
+//   - Cross-repo hop tracking
+//
+// When o.resolver is nil, it falls back to the raw IndexGraph calls (legacy path,
+// kept for backwards-compatibility when SetResolver has not been called).
 func (o *Orchestrator) runGraphAnalysis(changedFunctions []string, sourceRepo string) *graphAnalysisResult {
 	log := logger.S()
+
+	// ------------------------------------------------------------------
+	// Preferred path: use resolve.Resolver for rich analysis.
+	// ------------------------------------------------------------------
+	if o.resolver != nil {
+		return o.runGraphAnalysisViaResolver(changedFunctions, sourceRepo)
+	}
+
+	// ------------------------------------------------------------------
+	// Legacy path: raw IndexGraph calls (no resolver injected).
+	// ------------------------------------------------------------------
 	result := &graphAnalysisResult{}
 
 	var startIDs []string
 
 	for _, fn := range changedFunctions {
-		// Try to resolve function name to a graph node
-		// Extract the function name part (after :: if present)
+		// Extract the function name part (after :: if present).
 		funcName := fn
 		if idx := strings.LastIndex(fn, "::"); idx >= 0 {
 			funcName = fn[idx+2:]
 		}
-		// Strip repo prefix if present (e.g. "vstation_compute/compute/disk/encrypt_disk.py::func")
-		if idx := strings.Index(funcName, "/"); idx >= 0 {
-			parts := strings.SplitN(fn, "/", 2)
-			if len(parts) == 2 && o.repoExists(parts[0]) {
-				// Already handled by funcName extraction above
-			}
-		}
 
 		nodes := o.indexGraph.FindNodesByName(funcName)
 		if len(nodes) == 0 {
-			// Try with simple name (last segment after .)
+			// Try simple name (last segment after .) for qualified names like "Class.method".
 			if dotIdx := strings.LastIndex(funcName, "."); dotIdx >= 0 {
 				simpleName := funcName[dotIdx+1:]
 				nodes = o.indexGraph.FindNodesByName(simpleName)
@@ -1445,7 +1676,6 @@ func (o *Orchestrator) runGraphAnalysis(changedFunctions []string, sourceRepo st
 			continue
 		}
 
-		// Use first matching node (TODO: disambiguate by file path)
 		for _, n := range nodes {
 			startIDs = append(startIDs, n.ID)
 		}
@@ -1459,12 +1689,13 @@ func (o *Orchestrator) runGraphAnalysis(changedFunctions []string, sourceRepo st
 	log.Infow("graph.analysis_start",
 		"start_symbols", len(startIDs),
 		"uncovered", len(result.uncovered),
+		"path", "legacy",
 	)
 
-	// BFS upstream (find callers)
+	// BFS upstream (find callers).
 	affected := o.indexGraph.Impact(startIDs, "upstream", 3, 0.0)
 
-	// Convert to CallNodes
+	// Convert to CallNodes.
 	for _, a := range affected {
 		node := CallNode{
 			Repo:     a.Repo,
@@ -1473,7 +1704,7 @@ func (o *Orchestrator) runGraphAnalysis(changedFunctions []string, sourceRepo st
 		}
 		result.nodes = append(result.nodes, node)
 
-		// Check if this node is in an entry-role repo
+		// Check if this node is in an entry-role repo.
 		for _, r := range o.repos {
 			if strings.EqualFold(r.Role, "entry") && r.Name == a.Repo {
 				result.entryPoints = append(result.entryPoints, node)
@@ -1486,6 +1717,106 @@ func (o *Orchestrator) runGraphAnalysis(changedFunctions []string, sourceRepo st
 		"affected_symbols", len(affected),
 		"entry_points", len(result.entryPoints),
 		"uncovered", len(result.uncovered),
+		"path", "legacy",
+	)
+
+	return result
+}
+
+// runGraphAnalysisViaResolver performs graph analysis using the richer resolve.Resolver
+// instead of raw IndexGraph calls. Provides symbol disambiguation, risk assessment,
+// entry-point detection, and cross-repo hop tracking.
+func (o *Orchestrator) runGraphAnalysisViaResolver(changedFunctions []string, sourceRepo string) *graphAnalysisResult {
+	log := logger.S()
+	result := &graphAnalysisResult{}
+
+	// Collect entry-role repo names for entry-point detection.
+	var entryRoleRepos []string
+	for _, r := range o.repos {
+		if strings.EqualFold(r.Role, "entry") {
+			entryRoleRepos = append(entryRoleRepos, r.Name)
+		}
+	}
+
+	// Build an ImpactOptions slice — one per changed function.
+	opts := make([]resolve.ImpactOptions, 0, len(changedFunctions))
+	for _, fn := range changedFunctions {
+		// Resolve repo and file from the "repo/path/to/file.go::FuncName" or
+		// "path/to/file.go::FuncName" format produced by extractChangedFunctions.
+		repo := sourceRepo
+		target := fn
+
+		// Strip leading "repo/" prefix if present and the repo is known.
+		if idx := strings.Index(fn, "/"); idx > 0 {
+			candidate := fn[:idx]
+			if o.repoExists(candidate) {
+				repo = candidate
+				target = fn[idx+1:] // remainder: "path/to/file.go::FuncName"
+			}
+		}
+
+		opts = append(opts, resolve.ImpactOptions{
+			Target:         target,
+			Repo:           repo,
+			Direction:      "upstream",
+			MaxDepth:       3,
+			EntryRoleRepos: entryRoleRepos,
+		})
+	}
+
+	if len(opts) == 0 {
+		result.uncovered = changedFunctions
+		return result
+	}
+
+	log.Infow("graph.analysis_start",
+		"targets", len(opts),
+		"entry_role_repos", len(entryRoleRepos),
+		"path", "resolver",
+	)
+
+	// Batch impact analysis with deduplication across targets.
+	impactResult := o.resolver.ImpactMany(opts)
+
+	// Translate ImpactResult → graphAnalysisResult.
+	result.uncovered = impactResult.Uncovered
+	result.risk = string(impactResult.Risk)
+	result.crossRepoHops = impactResult.CrossRepoHops
+
+	// Flatten ByDepth into nodes slice (ordered by depth for call chain readability).
+	seen := make(map[string]bool)
+	for depth := 1; depth <= 3; depth++ {
+		for _, sym := range impactResult.ByDepth[depth] {
+			if seen[sym.ID] {
+				continue
+			}
+			seen[sym.ID] = true
+			node := CallNode{
+				Repo:     sym.Repo,
+				File:     sym.FilePath,
+				Function: sym.Name,
+			}
+			result.nodes = append(result.nodes, node)
+		}
+	}
+
+	// Translate detected entry points.
+	for _, ep := range impactResult.EntryPoints {
+		result.entryPoints = append(result.entryPoints, CallNode{
+			Repo:     ep.Symbol.Repo,
+			File:     ep.Symbol.FilePath,
+			Function: ep.Symbol.Name,
+		})
+	}
+
+	log.Infow("graph.analysis_done",
+		"affected_symbols", impactResult.TotalAffected,
+		"direct_callers", impactResult.DirectCount,
+		"entry_points", len(impactResult.EntryPoints),
+		"cross_repo_hops", len(impactResult.CrossRepoHops),
+		"uncovered", len(impactResult.Uncovered),
+		"risk", string(impactResult.Risk),
+		"path", "resolver",
 	)
 
 	return result

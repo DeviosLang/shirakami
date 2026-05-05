@@ -119,10 +119,18 @@ func ParseDiffHunks(diff string) []DiffHunk {
 
 // ChangedFunction represents a function that was added or modified in a diff.
 type ChangedFunction struct {
-	File     string `json:"file"`
-	Line     int    `json:"line"`
-	FuncName string `json:"func_name"`
+	File       string `json:"file"`
+	Line       int    `json:"line"`
+	FuncName   string `json:"func_name"`
 	ChangeType string `json:"change_type"` // "added" or "modified"
+}
+
+// ParseDiffFunctions extracts changed function names from a unified diff.
+// Unlike ParseDiffHunks (Layer A, line ranges only), this function also
+// detects function declarations in added lines using language-specific regex.
+// Used by golden tests for function-name recall validation.
+func ParseDiffFunctions(diff string) []ChangedFunction {
+	return parseDiff(diff)
 }
 
 // GitDiffTool parses unified diff format and extracts changed function information.

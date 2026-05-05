@@ -1,0 +1,63 @@
+{
+  "changed_functions": [
+    {
+      "name": "serverWorker",
+      "repo": "grpc-go",
+      "file": "server.go",
+      "start_line": 228
+    },
+    {
+      "name": "handleSingleStream",
+      "repo": "grpc-go",
+      "file": "server.go",
+      "start_line": 235
+    },
+    {
+      "name": "initServerWorkers",
+      "repo": "grpc-go",
+      "file": "server.go",
+      "start_line": 241
+    },
+    {
+      "name": "stopServerWorkers",
+      "repo": "grpc-go",
+      "file": "server.go",
+      "start_line": 249
+    },
+    {
+      "name": "RecvBufferPool",
+      "repo": "grpc-go",
+      "file": "server.go",
+      "start_line": 199
+    }
+  ],
+  "call_chain": [
+    {
+      "source": "Serve",
+      "target": "initServerWorkers",
+      "type": "CALLS",
+      "depth": 1
+    },
+    {
+      "source": "serverWorker",
+      "target": "handleSingleStream",
+      "type": "CALLS",
+      "depth": 1
+    },
+    {
+      "source": "handleSingleStream",
+      "target": "serveStreams",
+      "type": "CALLS",
+      "depth": 1
+    }
+  ],
+  "entry_points": [
+    {
+      "function": "Serve",
+      "repo": "grpc-go",
+      "file": "server.go",
+      "protocol": "gRPC"
+    }
+  ],
+  "cross_repo_calls": []
+}

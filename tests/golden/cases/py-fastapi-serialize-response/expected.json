@@ -1,0 +1,51 @@
+{
+  "changed_functions": [
+    {
+      "name": "serialize_response",
+      "repo": "fastapi",
+      "file": "fastapi/routing.py",
+      "start_line": 58
+    },
+    {
+      "name": "run_endpoint_function",
+      "repo": "fastapi",
+      "file": "fastapi/routing.py",
+      "start_line": 122
+    }
+  ],
+  "call_chain": [
+    {
+      "source": "get_request_handler",
+      "target": "run_endpoint_function",
+      "type": "CALLS",
+      "depth": 1
+    },
+    {
+      "source": "get_request_handler",
+      "target": "serialize_response",
+      "type": "CALLS",
+      "depth": 1
+    },
+    {
+      "source": "serialize_response",
+      "target": "_prepare_response_content",
+      "type": "CALLS",
+      "depth": 1
+    },
+    {
+      "source": "serialize_response",
+      "target": "jsonable_encoder",
+      "type": "CALLS",
+      "depth": 1
+    }
+  ],
+  "entry_points": [
+    {
+      "function": "get_request_handler",
+      "repo": "fastapi",
+      "file": "fastapi/routing.py",
+      "protocol": "HTTP"
+    }
+  ],
+  "cross_repo_calls": []
+}

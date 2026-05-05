@@ -1,0 +1,2 @@
+source_repo: checkoutservice
+description: "checkout_service.go: PlaceOrder() 新增对 currencyservice 的 Convert() gRPC 调用"

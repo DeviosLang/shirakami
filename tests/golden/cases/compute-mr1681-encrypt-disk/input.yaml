@@ -1,3 +1,0 @@
-# source_repo is the repository where the diff originates
-source_repo: vstation_compute
-description: "MR1681: 加密磁盘块设备大小检测改进 + Python 2/3 兼容"

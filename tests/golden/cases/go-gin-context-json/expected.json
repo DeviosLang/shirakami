@@ -1,0 +1,51 @@
+{
+  "changed_functions": [
+    {
+      "name": "Context.Render",
+      "repo": "gin",
+      "file": "context.go",
+      "start_line": 927
+    },
+    {
+      "name": "Context.JSON",
+      "repo": "gin",
+      "file": "context.go",
+      "start_line": 979
+    },
+    {
+      "name": "Context.IndentedJSON",
+      "repo": "gin",
+      "file": "context.go",
+      "start_line": 987
+    }
+  ],
+  "call_chain": [
+    {
+      "source": "Engine.ServeHTTP",
+      "target": "Engine.handleHTTPRequest",
+      "type": "CALLS",
+      "depth": 1
+    },
+    {
+      "source": "Context.JSON",
+      "target": "Context.Render",
+      "type": "CALLS",
+      "depth": 1
+    },
+    {
+      "source": "Context.Render",
+      "target": "Context.Abort",
+      "type": "CALLS",
+      "depth": 1
+    }
+  ],
+  "entry_points": [
+    {
+      "function": "Engine.ServeHTTP",
+      "repo": "gin",
+      "file": "gin.go",
+      "protocol": "HTTP"
+    }
+  ],
+  "cross_repo_calls": []
+}

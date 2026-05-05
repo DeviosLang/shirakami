@@ -1,0 +1,10 @@
+{
+  "case_id": "py-celery-task-retry",
+  "description": "celery v5.3: Task.retry() 新增 max_retries 关键字参数默认值处理，同时 Task.apply_async() 传递 countdown。验证 Python MQ 任务 entry point 检测 + 调用链。",
+  "created_at": "2026-05-05",
+  "source": "upstream — celery/celery v5.3.1 (synthetic patch based on real code)",
+  "upstream_url": "https://github.com/celery/celery",
+  "upstream_commit": "v5.3.1",
+  "difficulty": "medium",
+  "tags": ["python", "single-repo", "mq-entry-point", "method-signature-change"]
+}

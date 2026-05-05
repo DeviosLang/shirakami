@@ -1,0 +1,10 @@
+{
+  "case_id": "go-prometheus-counter-vec",
+  "description": "prometheus/client_golang v1.14→v1.17: NewCounterVec() 拆分为 v2.NewCounterVec(CounterVecOpts)，counter.Write() 签名改变（加 createdTs 参数）。验证 Go 接口实现者传播（Counter interface）。",
+  "created_at": "2026-05-05",
+  "source": "upstream — prometheus/client_golang v1.14.0 → v1.17.0",
+  "upstream_url": "https://github.com/prometheus/client_golang",
+  "upstream_commit": "v1.17.0",
+  "difficulty": "medium",
+  "tags": ["go", "single-repo", "interface-change", "new-function", "counter"]
+}

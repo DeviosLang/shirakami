@@ -30,8 +30,18 @@ MULTI_REPO_ANALYSIS.md
 extract_repos.py
 k8s/
 
-# Diff / patch files
-*.patch
+# Diff / patch files (loose patches in repo root; golden case patches are tracked separately)
+/diffs/*.patch
+/reports/*.patch
+
+# Golden test cases — private cases (based on internal repos) are NOT committed.
+# Only open-source cases (go-*, py-*, cross-grpc-*) are tracked.
+# Add private case dirs below to prevent accidental commit:
+tests/golden/cases/compute-*/
+tests/golden/cases/cross-repo-dispatch/
+tests/golden/cases/vstation-*/
+tests/golden/cases/cvm-*/
+tests/golden/cases/vsresource-*/
 
 # Coverage
 coverage.out

@@ -1,0 +1,56 @@
+{
+  "changed_functions": [
+    {
+      "name": "NewCounterVec",
+      "repo": "client_golang",
+      "file": "prometheus/counter.go",
+      "start_line": 57
+    },
+    {
+      "name": "counter.Write",
+      "repo": "client_golang",
+      "file": "prometheus/counter.go",
+      "start_line": 110
+    },
+    {
+      "name": "counter.createdTimestamp",
+      "repo": "client_golang",
+      "file": "prometheus/counter.go",
+      "start_line": 118
+    },
+    {
+      "name": "VariableLabelsFromConstrained",
+      "repo": "client_golang",
+      "file": "prometheus/vec.go",
+      "start_line": 166
+    }
+  ],
+  "call_chain": [
+    {
+      "source": "NewCounterVec",
+      "target": "NewMetricVec",
+      "type": "CALLS",
+      "depth": 1
+    },
+    {
+      "source": "NewCounterVec",
+      "target": "NewDesc",
+      "type": "CALLS",
+      "depth": 1
+    },
+    {
+      "source": "NewCounterVec",
+      "target": "VariableLabelsFromConstrained",
+      "type": "CALLS",
+      "depth": 1
+    },
+    {
+      "source": "counter.Write",
+      "target": "writeCounter",
+      "type": "CALLS",
+      "depth": 1
+    }
+  ],
+  "entry_points": [],
+  "cross_repo_calls": []
+}

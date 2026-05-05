@@ -22,6 +22,7 @@ import (
 	"github.com/DeviosLang/shirakami/internal/llm"
 	"github.com/DeviosLang/shirakami/internal/logger"
 	"github.com/DeviosLang/shirakami/internal/report"
+	"github.com/DeviosLang/shirakami/internal/resolve"
 	"github.com/DeviosLang/shirakami/internal/storage"
 	itool "github.com/DeviosLang/shirakami/internal/tool"
 	"github.com/DeviosLang/shirakami/internal/workspace"
@@ -310,6 +311,13 @@ func buildAnalyzeCmd() *cobra.Command {
 			}
 			orch.SetIndexMode(indexMode)
 
+			// Provide the DB pool so extractChangedFunctions can use Layer B
+			// (DiffToSymbols) when index mode is active, without requiring the
+			// full in-memory graph to be loaded first.
+			if pool != nil {
+				orch.SetPool(pool)
+			}
+
 			if indexMode != "off" && pool != nil {
 				// Try to load index graph from DB
 				idxStore := index.NewStore(pool)
@@ -323,6 +331,10 @@ func buildAnalyzeCmd() *cobra.Command {
 					graph := index.NewInMemoryGraph()
 					graph.Load(nodes, edges)
 					orch.SetIndexGraph(&graphAdapter{graph: graph})
+					// Wire the resolve.Resolver so runGraphAnalysis uses the richer
+					// path: symbol disambiguation, risk assessment, entry-point
+					// detection, and cross-repo hop tracking.
+					orch.SetResolver(resolve.New(graph))
 					log.Sugar().Infow("index.graph_loaded",
 						"nodes", graph.NodeCount(),
 						"edges", graph.EdgeCount(),
@@ -882,7 +894,30 @@ func buildSchemaResult(taskID string, output *agent.AnalysisOutput, input agent.
 	for repo := range crossRepoSet {
 		crossRepoImpact = append(crossRepoImpact, repo)
 	}
+	// Also surface repos discovered via deterministic cross-repo hop tracking.
+	// These may not appear in CallGraph nodes if the graph path returned before
+	// LLM Workers ran (e.g. deterministic mode), but they should still appear
+	// in the ImpactSummary.
+	for _, hop := range output.CrossRepoHops {
+		if hop.ToRepo != "" && hop.ToRepo != input.SourceRepo && !crossRepoSet[hop.ToRepo] {
+			crossRepoSet[hop.ToRepo] = true
+			crossRepoImpact = append(crossRepoImpact, hop.ToRepo)
+		}
+	}
 	sort.Strings(crossRepoImpact)
+
+	// Translate deterministic cross-repo hops to schema type.
+	schemaCrossRepoHops := make([]schema.CrossRepoHop, 0, len(output.CrossRepoHops))
+	for _, h := range output.CrossRepoHops {
+		schemaCrossRepoHops = append(schemaCrossRepoHops, schema.CrossRepoHop{
+			FromRepo: h.FromRepo,
+			FromFunc: h.FromFunc,
+			ToRepo:   h.ToRepo,
+			ToFunc:   h.ToFunc,
+			Depth:    h.Depth,
+			EdgeType: h.EdgeType,
+		})
+	}
 
 	// Collect UT suggestions from all Workers, dedupe by (repo, file, func).
 	utSeen := make(map[string]bool)
@@ -935,6 +970,9 @@ func buildSchemaResult(taskID string, output *agent.AnalysisOutput, input agent.
 			CrossRepoCount:  len(crossRepoImpact),
 		},
 		SelfCheckReport: workerRawOutputs.String(),
+		Risk:            output.Risk,
+		IndexCoverage:   output.IndexCoverage,
+		CrossRepoHops:   schemaCrossRepoHops,
 	}
 }
 
