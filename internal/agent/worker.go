@@ -1107,7 +1107,7 @@ Guidelines:
 - preconditions: required system state before calling this entry (e.g. "instance exists", "encryption key valid")
 - typical_inputs: key parameter description for a normal call through this entry
 - scenarios: P0=core flow (must test), P1=boundary/error/null-check, P2=compat/edge
-  Focus on: block device size detection (os.lseek fallback), null-check guards (key_file/license=None), Python 2/3 compatibility
+  Derive scenarios from the actual diff changes above — do NOT invent scenarios unrelated to the changed code.
 
 For EACH scenario, MUST include an "oracles" array listing verification points.
 An oracle tells the test engineer WHERE to verify the expected outcome — not just
@@ -1250,14 +1250,14 @@ CRITICAL REQUIREMENTS:
 
 For EACH function, produce unit-test suggestions that focus on:
 - Branches introduced by the diff (new conditionals, fallback paths)
-- Exception paths the new code handles (OSError, TypeError, None guards, etc.)
-- Compatibility branches (Python 2/3, different OS types, etc.)
-- Boundary values of size/length/count parameters
-- Correct interaction with external boundaries the function touches
-  (os.path.getsize, os.lseek, os.remove, subprocess.run, libvirt, SQL cursor, etc.)
+- Exception paths the new code handles (errors, None/null guards, etc.)
+- Compatibility or platform-specific branches only if they appear in the actual diff
+- Boundary values of relevant parameters (size, length, count, etc.)
+- Correct interaction with external dependencies the function touches
+  (infer from the actual code: DB calls, file I/O, RPC, subprocess, etc.)
 
 UT scenarios should use MOCK setups (not real integration). Show concrete mocks
-where applicable: "mock os.path.getsize to raise OSError; mock os.lseek to return 1073741824".
+based on the actual code — do NOT invent mocks for APIs not present in the diff.
 
 Output ONLY this JSON in a ` + "```json" + ` fenced block — no prose before or after:
 ` + "```json" + `
@@ -1268,28 +1268,22 @@ Output ONLY this JSON in a ` + "```json" + ` fenced block — no prose before or
       "file": "<file path>",
       "summary": "<one-line purpose of the change>",
       "constraints": [
-        "<e.g. fallback to os.lseek when os.path.getsize returns 0>",
-        "<e.g. null-check guard for key_file>"
+        "<key constraint or invariant introduced by the diff>",
+        "<another constraint if applicable>"
       ],
       "existing_tests": ["<existing test locations if any>"],
       "scenarios": [
         {
           "priority":"P0","type":"normal",
-          "description":"regular file: getsize succeeds with positive size",
-          "mock_setup":"mock os.path.getsize(dev) to return 1024",
-          "assertions":"function returns 1024; os.lseek NOT called"
-        },
-        {
-          "priority":"P0","type":"fallback",
-          "description":"block device: getsize returns 0, lseek succeeds",
-          "mock_setup":"mock os.path.getsize=0; mock os.open + os.lseek(SEEK_END)=1073741824",
-          "assertions":"function returns 1073741824; os.close called in finally"
+          "description":"<describe the happy-path scenario for this function>",
+          "mock_setup":"<concrete mock setup derived from the actual code>",
+          "assertions":"<what to assert and where>"
         },
         {
           "priority":"P1","type":"exception",
-          "description":"both getsize and lseek fail",
-          "mock_setup":"mock os.path.getsize to raise OSError; mock os.open to raise OSError",
-          "assertions":"function returns 0; log_error called exactly once with the original error"
+          "description":"<describe the error/edge scenario>",
+          "mock_setup":"<mock setup for error path>",
+          "assertions":"<what to assert>"
         }
       ]
     }
