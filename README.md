@@ -54,6 +54,7 @@ goose -dir migrations postgres "postgres://shirakami:shirakami@localhost:5432/sh
 | `001_init.sql` | tasks / task_results / feedback 基础表 |
 | `002_symbol_graph.sql` | symbol_nodes / symbol_edges 符号图表 |
 | `003_contracts.sql` | contracts / contract_links 跨仓库合约表 |
+| `004_add_result_columns.sql` | analysis_tasks 加 modes/source_repo/queue_position；analysis_results 加 ut_suggestions/function_analyses/impact_summary 等列 |
 
 ### 4. 配置文件
 
@@ -153,6 +154,18 @@ changes:
   - repo: order-service
     diff: ./diffs/order.patch
     desc: 更新订单状态接口
+
+# HTTP API Server 配置（shirakami-server 专用）
+server:
+  addr: ":8080"                  # 监听地址
+  max_concurrent_analyses: 1     # 最大并发分析任务数（NFS 场景建议保持 1）
+  default_modes:                 # 默认分析模式（不传 modes 时生效）
+    - chain
+    - e2e
+    - ut
+  webhook_secret: ""             # Webhook 验签密钥（GitLab token / GitHub HMAC key）
+  gitlab_token: ""               # GitLab API Token（回写 MR 评论）
+  github_token: ""               # GitHub API Token（回写 PR 评论）
 ```
 
 ### 环境变量
@@ -164,6 +177,12 @@ changes:
 | `SHIRAKAMI_LLM_MODEL` | 模型名称 | `llm.model` |
 | `SHIRAKAMI_DB_DSN` | PostgreSQL DSN | `db.dsn` |
 | `SHIRAKAMI_REDIS_ADDR` | Redis 地址 | `redis.addr` |
+| `SHIRAKAMI_SERVER_ADDR` | HTTP 服务监听地址（默认 `:8080`） | `server.addr` |
+| `SHIRAKAMI_SERVER_MAX_CONCURRENT` | 最大并发分析任务数（默认 `1`） | `server.max_concurrent_analyses` |
+| `SHIRAKAMI_SERVER_DEFAULT_MODES` | 默认分析模式（默认 `chain,e2e,ut`） | `server.default_modes` |
+| `SHIRAKAMI_WEBHOOK_SECRET` | Webhook 验签密钥（GitLab token / GitHub HMAC key） | `server.webhook_secret` |
+| `SHIRAKAMI_GITLAB_TOKEN` | GitLab API Token（用于 Webhook 回写 MR 评论） | `server.gitlab_token` |
+| `SHIRAKAMI_GITHUB_TOKEN` | GitHub API Token（用于 Webhook 回写 PR 评论） | `server.github_token` |
 
 环境变量优先级高于配置文件。
 
@@ -211,56 +230,175 @@ Impact Summary
 启动 API 服务器：
 
 ```bash
-./bin/shirakami-server --config shirakami.yaml --addr :8080
+./bin/shirakami-server --config shirakami.yaml
+# 或通过环境变量指定监听地址
+SHIRAKAMI_SERVER_ADDR=:8080 ./bin/shirakami-server --config shirakami.yaml
 ```
 
-### 接口列表
+所有接口 BASE_URL 默认为 `http://localhost:8080`。
+
+### 接口一览
+
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| `GET` | `/healthz` | 健康检查 |
+| `GET` | `/api/v1/repos` | 查询所有可用代码仓 |
+| `POST` | `/api/v1/tasks` | 提交分析任务 |
+| `GET` | `/api/v1/tasks` | 查询最近任务列表（最多 20 条） |
+| `GET` | `/api/v1/tasks/{id}` | 查询任务状态 / 完整结果 |
+| `GET` | `/api/v1/tasks/{id}/chain` | 仅返回调用链 |
+| `GET` | `/api/v1/tasks/{id}/e2e` | 仅返回集成测试入口 |
+| `GET` | `/api/v1/tasks/{id}/ut` | 仅返回 UT 建议 |
+| `PUT` | `/api/v1/tasks/{id}/feedback` | 提交反馈 |
+| `POST` | `/api/v1/webhook` | GitLab MR / GitHub PR 自动触发 |
+| `GET` | `/metrics` | Prometheus 指标 |
+
+---
+
+#### 查询可用代码仓
+
+在提交任务前，先查询所有已配置的仓库名称与 Git 地址对应关系：
+
+```bash
+GET /api/v1/repos
+
+# 示例
+curl http://localhost:8080/api/v1/repos
+```
+
+返回字段（每个仓库）：
+
+| 字段 | 说明 |
+|------|------|
+| `name` | 仓库短名，用于 `source_repo` / `branches[].repo` |
+| `branch` | 配置的 base 分支（默认 master） |
+| `role` | `"entry"`（入口仓）或空 |
+| `url` | Git 仓库地址（已隐匿认证信息） |
+| `local_path` | NFS 上的本地克隆路径 |
+
+---
 
 #### 提交分析任务
 
 ```
 POST /api/v1/tasks
 Content-Type: application/json
+```
 
-{
-  "input_diff": "--- a/payment.go\n+++ b/payment.go\n...",
-  "input_desc": "修改支付超时重试逻辑"
-}
+请求字段：
 
-Response 202:
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `input_diff` | string | unified diff 原文（与 `input_branch` 二选一） |
+| `input_desc` | string | 变更描述（可选，辅助 LLM 理解） |
+| `input_type` | string | `"diff"` \| `"description"` \| `"combined"`（可省略，自动推断） |
+| `source_repo` | string | 主变更仓库名（来自 `/api/v1/repos` 的 `name`） |
+| `input_branch` | string | 功能分支名；与 `source_repo` 配合，server 自动 git fetch + three-dot diff |
+| `branches` | array | 多仓多分支模式（见下），与 `input_branch` 二选一 |
+| `branches[].repo` | string | 仓库名（来自 `/api/v1/repos` 的 `name`） |
+| `branches[].branch` | string | 功能分支名 |
+| `modes` | string[] | 分析模式，省略则全跑：`"chain"` \| `"e2e"` \| `"ut"` |
+
+**方式 A：直接传 diff**
+
+```bash
+curl -X POST http://localhost:8080/api/v1/tasks \
+  -H "Content-Type: application/json" \
+  -d '{
+    "input_diff": "--- a/payment.go\n+++ b/payment.go\n...",
+    "input_desc": "修改支付超时重试逻辑",
+    "source_repo": "payment-service",
+    "modes": ["chain","e2e","ut"]
+  }'
+```
+
+**方式 B：单仓分支（server 自动算 diff）**
+
+```bash
+curl -X POST http://localhost:8080/api/v1/tasks \
+  -H "Content-Type: application/json" \
+  -d '{
+    "source_repo":  "payment-service",
+    "input_branch": "feature/fix-timeout"
+  }'
+```
+
+**方式 C：多仓多分支联合分析**
+
+```bash
+curl -X POST http://localhost:8080/api/v1/tasks \
+  -H "Content-Type: application/json" \
+  -d '{
+    "branches": [
+      {"repo": "payment-service", "branch": "feature/fix-timeout"},
+      {"repo": "order-service",   "branch": "feature/fix-timeout"},
+      {"repo": "api-gateway",     "branch": "feature/fix-timeout"}
+    ],
+    "modes": ["chain","e2e","ut"]
+  }'
+```
+
+返回 `202 Accepted`：
+
+```json
 {
   "id": "550e8400-e29b-41d4-a716-446655440000",
   "status": "pending",
-  "input_type": "combined",
+  "source_repo": "payment-service",
+  "modes": ["chain","e2e","ut"],
   "created_at": "2024-01-01T00:00:00Z"
 }
 ```
 
+---
+
 #### 查询任务列表
 
-```
+```bash
 GET /api/v1/tasks
 ```
 
+返回最近 20 条任务，字段同下方「查询任务结果」，不含结果详情。running 状态任务附带 `progress`（当前 step 数）。
+
+---
+
 #### 查询任务结果
 
+```bash
+GET /api/v1/tasks/{id}          # 完整结果
+GET /api/v1/tasks/{id}/chain    # 仅调用链 + 入口
+GET /api/v1/tasks/{id}/e2e      # 仅集成测试入口 + 场景
+GET /api/v1/tasks/{id}/ut       # 仅 UT 建议
 ```
-GET /api/v1/tasks/{id}
 
-Response（completed 状态时含 call_chain / entry_points）:
-{
-  "id": "...",
-  "status": "completed",
-  "call_chain": [...],
-  "entry_points": [...],
-  "token_usage": 12345,
-  "step_count": 42
-}
-```
+`status` 含义：
+
+| 值 | 说明 |
+|----|------|
+| `pending` | 在队列中等待（`queue_position` 表示前面还有几个） |
+| `running` | 分析中（`progress` 为当前 agent step 数） |
+| `completed` | 完成，结果字段非空 |
+| `failed` | 分析失败 |
+
+`completed` 时的完整结果字段：
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `call_chain` | array | 调用链节点列表 |
+| `entry_points` | array | 集成测试入口列表 |
+| `ut_suggestions` | string | UT 建议文本 |
+| `function_analyses` | object | 函数级详细分析（含 UT 场景优先级） |
+| `impact_summary` | string | 影响范围摘要 |
+| `cross_repo_hops` | int | 跨仓跳转次数 |
+| `risk` | string | 风险等级 |
+| `token_usage` | int | 消耗 token 数 |
+| `step_count` | int | agent 执行步数 |
+
+---
 
 #### 提交反馈
 
-```
+```bash
 PUT /api/v1/tasks/{id}/feedback
 Content-Type: application/json
 
@@ -270,7 +408,9 @@ Content-Type: application/json
 }
 ```
 
-type 取值：`false_positive` / `false_negative` / `correct`
+`type` 取值：`correct`（结果正确）/ `false_positive`（误报）/ `false_negative`（漏报）
+
+---
 
 #### Webhook（GitLab MR / GitHub PR 自动触发）
 
@@ -280,18 +420,15 @@ POST /api/v1/webhook
 
 支持 GitLab Merge Request Hook（`X-Gitlab-Event`）和 GitHub pull_request 事件（`X-GitHub-Event`）。  
 MR/PR open、update、reopen 时自动创建分析任务；close/merge 忽略。  
-支持 GitLab plain-text token 和 GitHub HMAC-SHA256 签名验证。
+支持 GitLab plain-text token 和 GitHub HMAC-SHA256 签名验证（通过 `SHIRAKAMI_WEBHOOK_SECRET` 配置）。
 
-#### Prometheus 指标
+---
 
-```
-GET /metrics
-```
+#### Prometheus 指标 / 健康检查
 
-#### 健康检查
-
-```
-GET /healthz
+```bash
+GET /metrics    # Prometheus 指标（内部监控用）
+GET /healthz    # 健康检查，返回 200 ok
 ```
 
 ## 架构概述
