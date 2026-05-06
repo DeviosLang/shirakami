@@ -157,6 +157,7 @@ func runServer(cmd *cobra.Command, args []string) error {
 	mux.HandleFunc("/api/v1/repos", srv.handleRepos)
 	mux.HandleFunc("/api/v1/tasks", srv.handleTasks)
 	mux.HandleFunc("/api/v1/tasks/", srv.handleTaskByID)
+	mux.HandleFunc("/api/v1/cache", srv.handleCache)
 	mux.Handle("/api/v1/webhook", webhookHandler)
 
 	log.Sugar().Infof("listening on %s", listenAddr)
@@ -260,6 +261,10 @@ type TaskResponse struct {
 	CrossRepoHops    int    `json:"cross_repo_hops,omitempty"`
 	Risk             string `json:"risk,omitempty"`
 	IndexCoverage    any    `json:"index_coverage,omitempty"`
+
+	// Warnings contains human-readable diagnostic hints when the result is empty.
+	// For example: diff has hunks but no function names were detected.
+	Warnings []string `json:"warnings,omitempty"`
 }
 
 // FeedbackRequest is the JSON body for PUT /api/v1/tasks/:id/feedback.
@@ -327,6 +332,8 @@ func (s *apiServer) handleTaskByID(w http.ResponseWriter, r *http.Request) {
 	switch {
 	case sub == "feedback" && r.Method == http.MethodPut:
 		s.submitFeedback(w, r, id)
+	case sub == "cache" && r.Method == http.MethodDelete:
+		s.deleteTaskCache(w, r, id)
 	case sub == "" && r.Method == http.MethodGet:
 		s.getTask(w, r, id, "")
 	case (sub == "chain" || sub == "e2e" || sub == "ut") && r.Method == http.MethodGet:
@@ -581,6 +588,11 @@ func (s *apiServer) getTask(w http.ResponseWriter, r *http.Request, id string, m
 						resp.IndexCoverage = indexCoverage
 					}
 				}
+			}
+
+			// Inject diagnostic warnings when result is empty.
+			if isEmptyResult(result) {
+				resp.Warnings = buildEmptyResultWarnings(task.InputDiff)
 			}
 		}
 	}
@@ -963,6 +975,44 @@ func jsonError(w http.ResponseWriter, msg string, code int) {
 }
 
 // ---------------------------------------------------------------------------
+// Cache management handlers
+// ---------------------------------------------------------------------------
+
+// handleCache handles DELETE /api/v1/cache — clears ALL cached analysis results.
+func (s *apiServer) handleCache(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodDelete {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	n, err := s.cache.DeleteAll(r.Context())
+	if err != nil {
+		jsonError(w, "failed to clear cache: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	jsonOK(w, map[string]any{"deleted": n})
+}
+
+// deleteTaskCache handles DELETE /api/v1/tasks/{id}/cache — clears the cached
+// result for a specific task so the next identical submission triggers a fresh
+// LLM analysis instead of returning the cached result.
+func (s *apiServer) deleteTaskCache(w http.ResponseWriter, r *http.Request, id string) {
+	task, err := s.store.GetTask(r.Context(), id)
+	if err != nil {
+		jsonError(w, "task not found", http.StatusNotFound)
+		return
+	}
+	if task.CacheKey == "" {
+		jsonOK(w, map[string]any{"deleted": 0, "message": "task has no cache key"})
+		return
+	}
+	if err := s.cache.Delete(r.Context(), task.CacheKey); err != nil {
+		jsonError(w, "failed to delete cache: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	jsonOK(w, map[string]any{"deleted": 1, "cache_key": task.CacheKey})
+}
+
+// ---------------------------------------------------------------------------
 // storageTaskAdapter adapts *storage.Store to webhook.TaskCreator.
 // The webhook handler uses the old 5-arg signature; we fill sourceRepo=""
 // and modes=nil (defaults to all) for webhook-triggered tasks.
@@ -1030,4 +1080,69 @@ func (s *apiServer) fetchBranchDiff(repoName, featureBranch string) (diff, baseB
 		return "", baseBranch, fmt.Errorf("branch %q has no diff against %s/%s — nothing to analyze", featureBranch, repoName, baseBranch)
 	}
 	return diffStr, baseBranch, nil
+}
+
+// isEmptyResult reports whether a completed TaskResult has no meaningful output.
+// A result is considered empty when:
+//   - call_chain is nil/null/[] OR contains only nodes with empty File fields
+//     (LLM internal monologue nodes that slipped through)
+//   - entry_points is nil/null/[]
+func isEmptyResult(r *storage.TaskResult) bool {
+	chainEmpty := len(r.CallChain) == 0 ||
+		string(r.CallChain) == "null" ||
+		string(r.CallChain) == "[]" ||
+		callChainHasNoFiles(r.CallChain)
+	epEmpty := len(r.EntryPoints) == 0 ||
+		string(r.EntryPoints) == "null" ||
+		string(r.EntryPoints) == "[]"
+	return chainEmpty && epEmpty
+}
+
+// callChainHasNoFiles returns true when every node in the call_chain JSON array
+// has an empty "File" field — which happens when the LLM writes its reasoning
+// as a function name instead of emitting a real call node.
+func callChainHasNoFiles(raw json.RawMessage) bool {
+	var nodes []struct {
+		File string `json:"File"`
+	}
+	if err := json.Unmarshal(raw, &nodes); err != nil || len(nodes) == 0 {
+		return false
+	}
+	for _, n := range nodes {
+		if strings.TrimSpace(n.File) != "" {
+			return false
+		}
+	}
+	return true
+}
+
+// buildEmptyResultWarnings inspects the stored inputDiff and returns a list of
+// human-readable, actionable diagnostic messages explaining why no results were
+// produced. Returns nil when the diff looks fine (no obvious issue detected).
+func buildEmptyResultWarnings(inputDiff string) []string {
+	if strings.TrimSpace(inputDiff) == "" {
+		return []string{
+			"input_diff 为空，无法提取变更函数。请提供 unified diff（git diff 输出格式）。",
+		}
+	}
+
+	hunks := itool.ParseDiffHunks(inputDiff)
+	if len(hunks) == 0 {
+		return []string{
+			"diff 中未解析到任何 hunk（@@ 块）。请确认提交的是标准 unified diff 格式（git diff 输出）。",
+		}
+	}
+
+	funcs := itool.ParseDiffFunctions(inputDiff)
+	if len(funcs) == 0 {
+		return []string{
+			"diff 包含有效 hunk，但未识别到任何变更函数名，导致分析无起点。" +
+				"常见原因：@@ 行末尾缺少函数/方法名。" +
+				"git 自动生成的 diff 会在 @@ 行末尾附加当前函数名，例如：" +
+				"@@ -209,10 +209,10 @@ def get_data(self): 。" +
+				"手写 diff 时请在 @@ 行末尾补充所在函数名。",
+		}
+	}
+
+	return nil
 }

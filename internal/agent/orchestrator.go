@@ -651,6 +651,31 @@ func (o *Orchestrator) extractChangedFunctions(ctx context.Context, input Analys
 		return nil, nil
 	}
 
+	// Layer A+: extract function names from @@ hunk context.
+	// git diff automatically appends the enclosing function name after the
+	// closing @@ delimiter. This is a zero-dep static source that gives us
+	// FILE_PATH::FUNC_NAME even when the diff only modifies internal statements
+	// (no new `def`/`func` line appears in the added lines).
+	var hunkContextFunctions []string
+	{
+		seenCtx := make(map[string]bool)
+		for _, h := range hunks {
+			if h.FuncContext == "" {
+				continue
+			}
+			filePath := h.File
+			if input.SourceRepo != "" && !strings.HasPrefix(filePath, input.SourceRepo+"/") {
+				filePath = input.SourceRepo + "/" + filePath
+			}
+			qualified := filePath + "::" + h.FuncContext
+			if !seenCtx[qualified] {
+				seenCtx[qualified] = true
+				hunkContextFunctions = append(hunkContextFunctions, qualified)
+			}
+		}
+		log.Debugw("extract.layerA+", "hunk_context_funcs", len(hunkContextFunctions))
+	}
+
 	// -----------------------------------------------------------------------
 	// Layer B: DiffToSymbols via index (requires pool + active index mode)
 	// -----------------------------------------------------------------------
@@ -712,9 +737,11 @@ func (o *Orchestrator) extractChangedFunctions(ctx context.Context, input Analys
 	}
 
 	// If Layer B covered everything, skip the LLM entirely.
+	// Merge with Layer A+ context functions before returning.
 	if len(uncoveredHunks) == 0 && len(symbolFunctions) > 0 {
-		log.Infow("extract.complete", "source", "index", "count", len(symbolFunctions))
-		return filterTestFunctions(symbolFunctions), nil
+		merged := dedupeStrings(append(symbolFunctions, hunkContextFunctions...))
+		log.Infow("extract.complete", "source", "index", "count", len(merged))
+		return filterTestFunctions(merged), nil
 	}
 
 	// -----------------------------------------------------------------------
@@ -762,13 +789,17 @@ Rules:
 	llmFunctions := parseFileFunctionList(result.Content)
 	llmFunctions = filterTestFunctions(llmFunctions)
 
-	// Merge: index results take precedence; LLM fills the gaps.
-	merged := append(symbolFunctions, llmFunctions...)
+	// Merge: index > Layer A+ (hunk context) > LLM fills the gaps.
+	// Layer A+ provides zero-cost deterministic file+func info from @@ headers;
+	// LLM may duplicate these but deduplication handles it cleanly.
+	merged := append(symbolFunctions, hunkContextFunctions...)
+	merged = append(merged, llmFunctions...)
 	merged = dedupeStrings(merged)
 
 	log.Infow("extract.complete",
 		"source", "hybrid",
 		"from_index", len(symbolFunctions),
+		"from_hunk_context", len(hunkContextFunctions),
 		"from_llm", len(llmFunctions),
 		"total", len(merged),
 	)

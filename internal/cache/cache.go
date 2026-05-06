@@ -87,6 +87,38 @@ func (c *Cache) Set(ctx context.Context, key string, result *AnalysisResult, ttl
 	return c.rdb.Set(ctx, cacheKeyPrefix(key), data, ttl).Err()
 }
 
+// Delete removes the cached entry for the given raw cache key (as stored in
+// the tasks table). Returns nil if the key did not exist.
+func (c *Cache) Delete(ctx context.Context, key string) error {
+	return c.rdb.Del(ctx, cacheKeyPrefix(key)).Err()
+}
+
+// DeleteAll removes every shirakami:cache:* entry from Redis.
+// Returns the number of deleted keys and any error.
+func (c *Cache) DeleteAll(ctx context.Context) (int64, error) {
+	const pattern = "shirakami:cache:*"
+	var cursor uint64
+	var total int64
+	for {
+		keys, next, err := c.rdb.Scan(ctx, cursor, pattern, 100).Result()
+		if err != nil {
+			return total, fmt.Errorf("scan cache keys: %w", err)
+		}
+		if len(keys) > 0 {
+			n, err := c.rdb.Del(ctx, keys...).Result()
+			if err != nil {
+				return total, fmt.Errorf("del cache keys: %w", err)
+			}
+			total += n
+		}
+		cursor = next
+		if cursor == 0 {
+			break
+		}
+	}
+	return total, nil
+}
+
 func cacheKeyPrefix(key string) string {
 	return "shirakami:cache:" + key
 }

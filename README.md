@@ -289,6 +289,8 @@ SHIRAKAMI_SERVER_ADDR=:8080 ./bin/shirakami-server --config shirakami.yaml
 | `GET` | `/api/v1/tasks/{id}/e2e` | 仅返回集成测试入口 |
 | `GET` | `/api/v1/tasks/{id}/ut` | 仅返回 UT 建议 |
 | `PUT` | `/api/v1/tasks/{id}/feedback` | 提交反馈 |
+| `DELETE` | `/api/v1/tasks/{id}/cache` | 清除指定任务的缓存（触发重新分析） |
+| `DELETE` | `/api/v1/cache` | 清除所有分析缓存 |
 | `POST` | `/api/v1/webhook` | GitLab MR / GitHub PR 自动触发 |
 | `GET` | `/metrics` | Prometheus 指标 |
 
@@ -537,6 +539,27 @@ Content-Type: application/json
 ```
 
 `type` 取值：`correct`（结果正确）/ `false_positive`（误报）/ `false_negative`（漏报）
+
+---
+
+#### 清除缓存
+
+分析结果默认缓存 72 小时。当 diff 相同但希望重新跑 LLM（例如代码库有更新、或上次结果为空）时，可手动清除缓存。
+
+**清除指定任务的缓存**（推荐）：使用 submit.sh 返回的 task_id：
+
+```bash
+# 清除 task 62d923a6 的缓存，下次提交相同 diff 将重新分析
+curl -X DELETE http://localhost:8080/api/v1/tasks/62d923a6-c8cc-47b9-9295-cded3ed7af4b/cache
+# 返回：{"cache_key":"<hash>","deleted":1}
+```
+
+**清除所有缓存**（核弹操作）：
+
+```bash
+curl -X DELETE http://localhost:8080/api/v1/cache
+# 返回：{"deleted":8}   ← 删除的 key 数量
+```
 
 ---
 
