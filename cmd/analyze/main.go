@@ -15,6 +15,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/DeviosLang/shirakami/internal/agent"
+	"github.com/DeviosLang/shirakami/internal/benchmark"
 	"github.com/DeviosLang/shirakami/internal/cache"
 	"github.com/DeviosLang/shirakami/internal/checkpoint"
 	"github.com/DeviosLang/shirakami/internal/config"
@@ -245,7 +246,7 @@ func buildAnalyzeCmd() *cobra.Command {
 			// Create task record.
 			var taskID string
 			if store != nil {
-				task, err := store.CreateTask(ctx, inputType, input.Diff, input.Description, cacheKey)
+				task, err := store.CreateTask(ctx, inputType, input.Diff, input.Description, cacheKey, sourceRepo, nil)
 				if err != nil {
 					log.Sugar().Warnw("create task record failed", "err", err)
 				} else {
@@ -305,7 +306,11 @@ func buildAnalyzeCmd() *cobra.Command {
 			}
 
 			// Index mode: load symbol graph for hybrid/deterministic analysis.
-			indexMode := "off"
+			// Priority: --index-mode CLI flag > config.index_mode > "off".
+			indexMode := cfg.IndexMode
+			if indexMode == "" {
+				indexMode = "off"
+			}
 			if cmd.Flags().Changed("index-mode") {
 				indexMode, _ = cmd.Flags().GetString("index-mode")
 			}
@@ -438,12 +443,16 @@ func buildAnalyzeCmd() *cobra.Command {
 			if output.ShadowReport != nil && output.ShadowReport.Details != "" {
 				fmt.Printf("\n%s\n", output.ShadowReport.Details)
 
-				// Persist shadow report to reports/shadow-parity/ directory.
+				// Convert agent.ShadowParityReport → benchmark.ParityReport and persist.
+				parityReport := shadowToParityReport(output.ShadowReport, input.SourceRepo, description)
 				shadowDir := filepath.Join(workspaceDir, "reports", "shadow-parity")
-				_ = os.MkdirAll(shadowDir, 0755)
-				shadowFile := filepath.Join(shadowDir, fmt.Sprintf("%s.json", time.Now().Format("2006-01-02T15-04-05")))
-				if sjb, serr := json.MarshalIndent(output.ShadowReport, "", "  "); serr == nil {
-					_ = os.WriteFile(shadowFile, sjb, 0644)
+				if serr := benchmark.SaveReport(parityReport, shadowDir); serr != nil {
+					logger.S().Warnw("shadow.save_failed", "err", serr)
+				} else {
+					trendPath := filepath.Join(shadowDir, "parity-trend.csv")
+					if terr := benchmark.AppendTrend(trendPath, parityReport); terr != nil {
+						logger.S().Warnw("shadow.trend_failed", "err", terr)
+					}
 				}
 			}
 
@@ -460,7 +469,7 @@ func buildAnalyzeCmd() *cobra.Command {
 	cmd.Flags().BoolVar(&noCache, "no-cache", false, "skip cache lookup and force fresh analysis")
 	cmd.Flags().StringVar(&analysisConfig, "analysis", "", "YAML analysis config file (supports multiple patches + scope filter); when set, overrides --diff")
 	cmd.Flags().BoolVar(&fastMode, "fast", false, "fast mode: limit cross-repo rounds to 3 (default is deep mode with 10 rounds)")
-	cmd.Flags().String("index-mode", "off", "index usage mode: off (pure LLM), shadow, hybrid, deterministic")
+	cmd.Flags().String("index-mode", "", "index usage mode: off (pure LLM), shadow, hybrid, deterministic (default from config.index_mode)")
 
 	return cmd
 }
@@ -768,6 +777,7 @@ func buildSchemaResult(taskID string, output *agent.AnalysisOutput, input agent.
 			Line:     n.Line,
 			Repo:     n.Repo,
 			NodeType: role,
+			Source:   schema.NodeSource(n.Source),
 		})
 		// Collect cross-repo impact.
 		if n.Repo != "" && n.Repo != input.SourceRepo {
@@ -791,8 +801,10 @@ func buildSchemaResult(taskID string, output *agent.AnalysisOutput, input agent.
 				Line:     e.Line,
 				Repo:     e.Repo,
 				NodeType: schema.NodeTypeEntry,
+				Source:   schema.NodeSource(e.Source),
 			},
 			Protocol: schema.ProtocolHTTP,
+			Source:   schema.NodeSource(e.Source),
 		})
 	}
 
@@ -965,6 +977,7 @@ func buildSchemaResult(taskID string, output *agent.AnalysisOutput, input agent.
 		UTSuggestions:    utSuggestions,
 		ImpactSummary: schema.ImpactSummary{
 			SourceRepo:      input.SourceRepo,
+			DirectFunctions: output.ChangedFunctions,
 			DirectCount:     len(output.ChangedFunctions),
 			CrossRepoImpact: crossRepoImpact,
 			CrossRepoCount:  len(crossRepoImpact),
@@ -1034,4 +1047,30 @@ func findEntryNodeIdx(entryNodes []schema.EntryPoint, entryFunction, entryFile s
 		}
 	}
 	return idx
+}
+
+// shadowToParityReport converts the lightweight agent.ShadowParityReport into a
+// full benchmark.ParityReport suitable for SaveReport / AppendTrend.
+// DiffRecord detail is not available here (that would require rerunning
+// NormalizeV1Result + CompareResults), so Records is left empty — the aggregate
+// counters are still populated, which is sufficient for trend tracking.
+func shadowToParityReport(sr *agent.ShadowParityReport, sourceRepo, description string) *benchmark.ParityReport {
+	now := time.Now()
+	report := &benchmark.ParityReport{
+		RunID:             now.Format("2006-01-02T15-04-05"),
+		Timestamp:         now,
+		SourceRepo:        sourceRepo,
+		Description:       description,
+		TotalEdgesV1:      sr.TotalEdgesLLM,
+		TotalEdgesV2:      sr.TotalEdgesGraph,
+		MatchCount:        sr.MatchCount,
+		MissCount:         sr.MissCount,
+		ExtraPendingCount: sr.ExtraPendingCount,
+		EntryPointsV1:     sr.EntryPointsLLM,
+		EntryPointsV2:     sr.EntryPointsGraph,
+		EntryPointMatch:   sr.EntryPointMatch,
+		EntryPointMiss:    sr.EntryPointMiss,
+		MissRate:          sr.MissRate,
+	}
+	return report
 }

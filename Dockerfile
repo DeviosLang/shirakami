@@ -22,7 +22,9 @@ FROM node:20-alpine AS pyright-builder
 RUN npm install -g pyright
 
 # ── Stage 4: Runtime ─────────────────────────────────────────────────────────
-FROM alpine:3.19
+# Use golang:alpine as the runtime base so that `go list` is available for the
+# Go symbol indexer (index update).  The Alpine variant keeps the image small.
+FROM golang:1.25-alpine
 
 RUN apk add --no-cache \
     git \

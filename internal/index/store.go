@@ -6,6 +6,7 @@ package index
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -91,6 +92,8 @@ func (s *Store) SaveNodes(ctx context.Context, nodes []SymbolNode) error {
 }
 
 // SaveEdges bulk-inserts symbol edges (upsert on conflict).
+// Edges whose source_id or target_id do not exist in symbol_nodes (e.g. imports
+// of external libraries) are silently skipped to avoid FK constraint violations.
 func (s *Store) SaveEdges(ctx context.Context, edges []SymbolEdge) error {
 	if len(edges) == 0 {
 		return nil
@@ -102,10 +105,13 @@ func (s *Store) SaveEdges(ctx context.Context, edges []SymbolEdge) error {
 	}
 	defer tx.Rollback(ctx)
 
+	skipped := 0
 	for _, e := range edges {
 		_, err := tx.Exec(ctx, `
 			INSERT INTO symbol_edges (id, source_id, target_id, type, file_path, line, confidence)
-			VALUES ($1, $2, $3, $4, $5, $6, $7)
+			SELECT $1, $2, $3, $4, $5, $6, $7
+			WHERE EXISTS (SELECT 1 FROM symbol_nodes WHERE id = $2)
+			  AND EXISTS (SELECT 1 FROM symbol_nodes WHERE id = $3)
 			ON CONFLICT (source_id, target_id, type) DO UPDATE SET
 				file_path = EXCLUDED.file_path,
 				line = EXCLUDED.line,
@@ -113,11 +119,26 @@ func (s *Store) SaveEdges(ctx context.Context, edges []SymbolEdge) error {
 			e.ID, e.SourceID, e.TargetID, e.Type, e.FilePath, e.Line, e.Confidence,
 		)
 		if err != nil {
+			// isFKViolation is a safety net; the WHERE-EXISTS guard should prevent
+			// FK errors, but keep this fallback in case of concurrent deletes.
+			if isFKViolation(err) {
+				skipped++
+				continue
+			}
 			return fmt.Errorf("index store save edge %s: %w", e.ID, err)
 		}
 	}
 
-	return tx.Commit(ctx)
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("index store commit edges: %w", err)
+	}
+	_ = skipped // skipped count is informational; callers may log it if needed
+	return nil
+}
+
+// isFKViolation returns true for PostgreSQL foreign key constraint violations (SQLSTATE 23503).
+func isFKViolation(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "23503")
 }
 
 // SaveMetadata upserts index metadata for a repo.

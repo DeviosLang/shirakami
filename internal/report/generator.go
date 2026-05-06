@@ -137,8 +137,11 @@ func generateTerminal(result *schema.AnalysisResult) string {
 
 	// Self-check
 	if result.SelfCheckReport != "" {
-		fmt.Fprintf(&b, "\n%s自检报告:%s\n%s%s%s\n",
-			ansiBold, ansiReset, ansiGray, result.SelfCheckReport, ansiReset)
+		cleaned := cleanWorkerDetail(result.SelfCheckReport)
+		if cleaned != "" {
+			fmt.Fprintf(&b, "\n%s自检报告:%s\n%s%s%s\n",
+				ansiBold, ansiReset, ansiGray, cleaned, ansiReset)
+		}
 	}
 
 	return b.String()
@@ -198,11 +201,12 @@ func generateMarkdown(result *schema.AnalysisResult) string {
 	}
 	if len(nodesWithFile) > 0 {
 		fmt.Fprintf(&b, "## 调用链节点 (%d)\n\n", len(nodesWithFile))
-		b.WriteString("| 仓库 | 文件 | 行 | 函数 |\n")
-		b.WriteString("|------|------|----|------|\n")
+		b.WriteString("| 仓库 | 文件 | 行 | 函数 | 来源 |\n")
+		b.WriteString("|------|------|----|------|------|\n")
 		for _, n := range nodesWithFile {
-			fmt.Fprintf(&b, "| `%s` | `%s` | %d | `%s` |\n",
-				n.Repo, n.FilePath, n.Line, n.FuncName)
+			sourceLabel := nodeSourceLabel(n.Source)
+			fmt.Fprintf(&b, "| `%s` | `%s` | %d | `%s` | %s |\n",
+				n.Repo, n.FilePath, n.Line, n.FuncName, sourceLabel)
 		}
 		b.WriteString("\n")
 	}
@@ -240,15 +244,16 @@ func generateMarkdown(result *schema.AnalysisResult) string {
 		for _, repo := range repoOrder {
 			eps := repoEps[repo]
 			fmt.Fprintf(&b, "### %s\n\n", repo)
-			b.WriteString("| 文件 | 行 | 入口 |\n")
-			b.WriteString("|------|----|----|----|\n")
+			b.WriteString("| 文件 | 行 | 入口 | 来源 |\n")
+			b.WriteString("|------|----|------|------|\n")
 			for _, ep := range eps {
 				label := ep.Node.FuncName
 				if ep.Path != "" {
 					label = ep.Path
 				}
-				fmt.Fprintf(&b, "| `%s` | %d | `%s` |\n",
-					ep.Node.FilePath, ep.Node.Line, label)
+				sourceLabel := nodeSourceLabel(ep.Source)
+				fmt.Fprintf(&b, "| `%s` | %d | `%s` | %s |\n",
+					ep.Node.FilePath, ep.Node.Line, label, sourceLabel)
 			}
 			b.WriteString("\n")
 
@@ -368,6 +373,15 @@ func generateMarkdown(result *schema.AnalysisResult) string {
 	// Impact summary
 	b.WriteString("## 影响范围\n\n")
 	fmt.Fprintf(&b, "- **直接影响:** `%s` 内 %d 个函数\n", sourceRepo, result.ImpactSummary.DirectCount)
+	// List the directly-changed functions when available.
+	if len(result.ImpactSummary.DirectFunctions) > 0 {
+		b.WriteString("\n  | 函数 |\n")
+		b.WriteString("  |------|\n")
+		for _, fn := range result.ImpactSummary.DirectFunctions {
+			fmt.Fprintf(&b, "  | `%s` |\n", fn)
+		}
+		b.WriteString("\n")
+	}
 	if result.ImpactSummary.CrossRepoCount > 0 {
 		fmt.Fprintf(&b, "- **跨仓影响 (%d):** %s\n",
 			result.ImpactSummary.CrossRepoCount,
@@ -394,9 +408,12 @@ func generateMarkdown(result *schema.AnalysisResult) string {
 
 	// Worker raw output (shown when structured parsing produced no results)
 	if result.SelfCheckReport != "" {
-		b.WriteString("## Worker 分析详情\n\n")
-		b.WriteString(result.SelfCheckReport)
-		b.WriteString("\n")
+		cleaned := cleanWorkerDetail(result.SelfCheckReport)
+		if cleaned != "" {
+			b.WriteString("## Worker 分析详情\n\n")
+			b.WriteString(cleaned)
+			b.WriteString("\n")
+		}
 	}
 
 	return b.String()
@@ -429,13 +446,101 @@ func writeMarkdownChainPath(b *strings.Builder, chain schema.CallChain) {
 // Helpers
 // ---------------------------------------------------------------------------
 
-// entryPointForChain returns the entry point matching the i-th upward chain, if any.
+// cleanWorkerDetail filters LLM chain-of-thought prose from a worker's raw
+// output, retaining only JSON blocks and their ### section headers.
+//
+// Workers write structured JSON objects (nodes, cross_repo_calls, …) mixed
+// with free-form reasoning text.  We want to show only the structured parts
+// so that the Markdown report stays machine-readable and free of leaked
+// internal reasoning.
+//
+// Strategy:
+//  1. Split the raw text into lines.
+//  2. Track whether we are inside a JSON block (started with '{' or '[').
+//  3. Inside a JSON block, keep every line.
+//  4. Outside a JSON block, only keep blank lines and lines that start a new
+//     section header (### …) or start a JSON object/array.
+//  5. Remove trailing runs of blank lines.
+func cleanWorkerDetail(s string) string {
+	if s == "" {
+		return ""
+	}
+	lines := strings.Split(s, "\n")
+	out := make([]string, 0, len(lines))
+
+	depth := 0 // brace/bracket depth counter
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+
+		if depth > 0 {
+			// Inside JSON block — count braces/brackets to track end.
+			out = append(out, line)
+			for _, ch := range trimmed {
+				switch ch {
+				case '{', '[':
+					depth++
+				case '}', ']':
+					depth--
+				}
+			}
+			continue
+		}
+
+		// Outside JSON block.
+		switch {
+		case trimmed == "":
+			// Keep blank lines (they separate sections).
+			out = append(out, line)
+		case strings.HasPrefix(trimmed, "###"):
+			// Section headers (### [repo-name]) are safe to keep.
+			out = append(out, line)
+		case strings.HasPrefix(trimmed, "{") || strings.HasPrefix(trimmed, "["):
+			// Start of a JSON block.
+			out = append(out, line)
+			for _, ch := range trimmed {
+				switch ch {
+				case '{', '[':
+					depth++
+				case '}', ']':
+					depth--
+				}
+			}
+		default:
+			// Plain prose / chain-of-thought — drop.
+		}
+	}
+
+	// Trim trailing blank lines.
+	for len(out) > 0 && strings.TrimSpace(out[len(out)-1]) == "" {
+		out = out[:len(out)-1]
+	}
+
+	if len(out) == 0 {
+		return ""
+	}
+	return strings.Join(out, "\n") + "\n"
+}
+
+
 func entryPointForChain(eps []schema.EntryPoint, i int) *schema.EntryPoint {
 	if i < len(eps) {
 		ep := eps[i]
 		return &ep
 	}
 	return nil
+}
+
+// nodeSourceLabel returns a short Markdown label for a node's discovery source.
+// "worker" → "Worker 搜索", "inferred" → "跨仓推断", "" → "-".
+func nodeSourceLabel(src schema.NodeSource) string {
+	switch src {
+	case schema.NodeSourceWorker:
+		return "Worker 搜索"
+	case schema.NodeSourceInferred:
+		return "跨仓推断"
+	default:
+		return "-"
+	}
 }
 
 // directRepo returns the source repository name for the impact summary line.

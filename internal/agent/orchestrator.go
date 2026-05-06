@@ -35,6 +35,10 @@ type AnalysisInput struct {
 	// ScopeOnlyRepos optionally restricts cross-repo tracing to these target repos.
 	// When empty, all discovered cross-repo calls are followed.
 	ScopeOnlyRepos []string
+	// Modes controls which analysis passes to run.
+	// Valid values: "chain", "e2e", "ut". Empty slice means run all.
+	// "e2e" enables per-entry-point scenario generation; "ut" enables UT analysis.
+	Modes []string
 }
 
 // PatchRef describes one patch in a multi-patch analysis.
@@ -80,6 +84,12 @@ type ShadowParityReport struct {
 	EntryPointMatch   int     `json:"entry_point_match"`
 	EntryPointMiss    int     `json:"entry_point_miss"`
 	Details           string  `json:"details"` // terminal-formatted report
+	// Edge totals for full ParityReport conversion.
+	TotalEdgesLLM   int `json:"total_edges_llm,omitempty"`
+	TotalEdgesGraph int `json:"total_edges_graph,omitempty"`
+	// Entry point totals.
+	EntryPointsLLM   int `json:"entry_points_llm,omitempty"`
+	EntryPointsGraph int `json:"entry_points_graph,omitempty"`
 }
 
 // Orchestrator coordinates multi-repo call-chain analysis.
@@ -121,6 +131,10 @@ type Orchestrator struct {
 	// runGraphAnalysis with proper symbol disambiguation, risk assessment,
 	// entry-point detection, and cross-repo hop tracking.
 	resolver *resolve.Resolver
+	// modes captures the analysis passes to run, set from AnalysisInput.Modes
+	// at the start of Run() and consumed by runWorkerBatch() to pass to Workers.
+	// Empty slice means all passes are enabled.
+	modes []string
 }
 
 // IndexGraph is the interface consumed by Orchestrator for deterministic analysis.
@@ -233,6 +247,9 @@ func (o *Orchestrator) Run(ctx context.Context, input AnalysisInput) (*AnalysisO
 	log := logger.S()
 	runStart := time.Now()
 
+	// Capture modes for this run so runWorkerBatch can pass them to Workers.
+	o.modes = input.Modes
+
 	// Resolve max rounds early so we can log the mode.
 	maxRounds := o.maxRounds
 	if maxRounds <= 0 {
@@ -287,8 +304,8 @@ func (o *Orchestrator) Run(ctx context.Context, input AnalysisInput) (*AnalysisO
 				"uncovered", len(graphResult.uncovered),
 				"duration_ms", time.Since(runStart).Milliseconds(),
 			)
-			output.CallGraph = graphResult.nodes
-			output.EntryPoints = graphResult.entryPoints
+			output.CallGraph = tagCallNodes(graphResult.nodes, "graph")
+			output.EntryPoints = tagCallNodes(graphResult.entryPoints, "graph")
 			output.Risk = graphResult.risk
 			output.CrossRepoHops = graphResult.crossRepoHops
 			if len(changed) > 0 {
@@ -307,8 +324,8 @@ func (o *Orchestrator) Run(ctx context.Context, input AnalysisInput) (*AnalysisO
 		}
 
 		// Hybrid mode with partial coverage: merge graph results + continue with LLM for uncovered
-		output.CallGraph = append(output.CallGraph, graphResult.nodes...)
-		output.EntryPoints = append(output.EntryPoints, graphResult.entryPoints...)
+		output.CallGraph = append(output.CallGraph, tagCallNodes(graphResult.nodes, "graph")...)
+		output.EntryPoints = append(output.EntryPoints, tagCallNodes(graphResult.entryPoints, "graph")...)
 		output.Risk = graphResult.risk
 		output.CrossRepoHops = graphResult.crossRepoHops
 		if len(changed) > 0 {
@@ -392,11 +409,24 @@ func (o *Orchestrator) Run(ctx context.Context, input AnalysisInput) (*AnalysisO
 				continue
 			}
 			output.WorkerOutputs[repoName] = result
-			output.CallGraph = append(output.CallGraph, result.Nodes...)
+			// Tag all nodes and entry points from this Worker as "worker" source
+			// so downstream report rendering can distinguish them from deterministic
+			// graph results. The Source field is empty for legacy / test data.
+			taggedNodes := make([]CallNode, len(result.Nodes))
+			for i, n := range result.Nodes {
+				n.Source = "worker"
+				taggedNodes[i] = n
+			}
+			output.CallGraph = append(output.CallGraph, taggedNodes...)
 
 			// Collect entry points regardless of ReachedEntry flag.
 			if len(result.EntryPoints) > 0 {
-				output.EntryPoints = append(output.EntryPoints, result.EntryPoints...)
+				taggedEntries := make([]CallNode, len(result.EntryPoints))
+				for i, ep := range result.EntryPoints {
+					ep.Source = "worker"
+					taggedEntries[i] = ep
+				}
+				output.EntryPoints = append(output.EntryPoints, taggedEntries...)
 			}
 
 			// Collect constraint and test scenario analyses.
@@ -865,6 +895,7 @@ func (o *Orchestrator) runWorkerBatch(ctx context.Context, pending map[string][]
 					Priority:         j.priority,
 					ContractHints:    o.contractHints,
 					ImportContext:    o.importContext,
+					Modes:            o.modes,
 				})
 				mu.Lock()
 				if err != nil {
@@ -1376,6 +1407,18 @@ func dedupeCallNodes(nodes []CallNode) []CallNode {
 			seen[key] = true
 			out = append(out, n)
 		}
+	}
+	return out
+}
+
+// tagCallNodes returns a copy of nodes with Source set to src.
+// Used to annotate whether nodes came from the deterministic graph ("graph")
+// or from LLM Workers ("worker").
+func tagCallNodes(nodes []CallNode, src string) []CallNode {
+	out := make([]CallNode, len(nodes))
+	for i, n := range nodes {
+		n.Source = src
+		out[i] = n
 	}
 	return out
 }
@@ -1894,6 +1937,12 @@ func (o *Orchestrator) buildShadowReport(llmOutput *AnalysisOutput, graphResult 
 			report.EntryPointMiss++
 		}
 	}
+
+	// Populate edge and entry-point totals for downstream conversion.
+	report.TotalEdgesLLM = len(llmEdges)
+	report.TotalEdgesGraph = len(graphEdges)
+	report.EntryPointsLLM = len(llmEP)
+	report.EntryPointsGraph = len(graphEP)
 
 	// Build terminal summary
 	report.Details = fmt.Sprintf(

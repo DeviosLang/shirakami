@@ -32,26 +32,36 @@ const (
 
 // Task represents an analysis task record.
 type Task struct {
-	ID          string
-	InputType   InputType
-	InputDiff   string
-	InputDesc   string
-	CacheKey    string
-	Status      TaskStatus
-	CreatedAt   time.Time
-	CompletedAt *time.Time
+	ID            string
+	InputType     InputType
+	InputDiff     string
+	InputDesc     string
+	CacheKey      string
+	Status        TaskStatus
+	CreatedAt     time.Time
+	CompletedAt   *time.Time
+	Modes         []string
+	SourceRepo    string
+	QueuePosition *int
 }
 
 // TaskResult represents an analysis result record.
 type TaskResult struct {
-	ID            string
-	TaskID        string
-	CallChain     json.RawMessage
-	TestScenarios string
-	EntryPoints   json.RawMessage
-	TokenUsage    int
-	StepCount     int
-	CreatedAt     time.Time
+	ID               string
+	TaskID           string
+	CallChain        json.RawMessage
+	TestScenarios    string
+	EntryPoints      json.RawMessage
+	TokenUsage       int
+	StepCount        int
+	CreatedAt        time.Time
+	UTSuggestions    string
+	FunctionAnalyses json.RawMessage
+	ImpactSummary    string
+	CrossRepoHops    int
+	Risk             string
+	IndexCoverage    json.RawMessage
+	Modes            []string
 }
 
 // ErrNotFound is returned when a task or result is not found.
@@ -68,12 +78,16 @@ func New(db *pgxpool.Pool) *Store {
 }
 
 // CreateTask inserts a new analysis task and returns its ID.
-func (s *Store) CreateTask(ctx context.Context, inputType InputType, inputDiff, inputDesc, cacheKey string) (*Task, error) {
+func (s *Store) CreateTask(ctx context.Context, inputType InputType, inputDiff, inputDesc, cacheKey, sourceRepo string, modes []string) (*Task, error) {
+	if len(modes) == 0 {
+		modes = []string{"chain", "e2e", "ut"}
+	}
 	row := s.db.QueryRow(ctx,
-		`INSERT INTO analysis_tasks (input_type, input_diff, input_desc, cache_key, status)
-		 VALUES ($1, $2, $3, $4, 'pending')
-		 RETURNING id, input_type, input_diff, input_desc, cache_key, status, created_at, completed_at`,
-		string(inputType), inputDiff, inputDesc, cacheKey,
+		`INSERT INTO analysis_tasks (input_type, input_diff, input_desc, cache_key, status, source_repo, modes)
+		 VALUES ($1, $2, $3, $4, 'pending', $5, $6)
+		 RETURNING id, input_type, input_diff, input_desc, cache_key, status, created_at, completed_at,
+		           modes, source_repo, queue_position`,
+		string(inputType), inputDiff, inputDesc, cacheKey, sourceRepo, modes,
 	)
 
 	var task Task
@@ -81,6 +95,7 @@ func (s *Store) CreateTask(ctx context.Context, inputType InputType, inputDiff, 
 	err := row.Scan(
 		&task.ID, &itStr, &task.InputDiff, &task.InputDesc,
 		&task.CacheKey, &statusStr, &task.CreatedAt, &task.CompletedAt,
+		&task.Modes, &task.SourceRepo, &task.QueuePosition,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("create task: %w", err)
@@ -93,7 +108,8 @@ func (s *Store) CreateTask(ctx context.Context, inputType InputType, inputDiff, 
 // GetTask retrieves a task by ID.
 func (s *Store) GetTask(ctx context.Context, id string) (*Task, error) {
 	row := s.db.QueryRow(ctx,
-		`SELECT id, input_type, input_diff, input_desc, cache_key, status, created_at, completed_at
+		`SELECT id, input_type, input_diff, input_desc, cache_key, status, created_at, completed_at,
+		        modes, source_repo, queue_position
 		   FROM analysis_tasks WHERE id = $1`,
 		id,
 	)
@@ -103,6 +119,7 @@ func (s *Store) GetTask(ctx context.Context, id string) (*Task, error) {
 	err := row.Scan(
 		&task.ID, &itStr, &task.InputDiff, &task.InputDesc,
 		&task.CacheKey, &statusStr, &task.CreatedAt, &task.CompletedAt,
+		&task.Modes, &task.SourceRepo, &task.QueuePosition,
 	)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrNotFound
@@ -121,7 +138,8 @@ func (s *Store) ListTasks(ctx context.Context, limit int) ([]Task, error) {
 		limit = 20
 	}
 	rows, err := s.db.Query(ctx,
-		`SELECT id, input_type, input_diff, input_desc, cache_key, status, created_at, completed_at
+		`SELECT id, input_type, input_diff, input_desc, cache_key, status, created_at, completed_at,
+		        modes, source_repo, queue_position
 		   FROM analysis_tasks
 		  ORDER BY created_at DESC
 		  LIMIT $1`,
@@ -139,6 +157,7 @@ func (s *Store) ListTasks(ctx context.Context, limit int) ([]Task, error) {
 		if err := rows.Scan(
 			&task.ID, &itStr, &task.InputDiff, &task.InputDesc,
 			&task.CacheKey, &statusStr, &task.CreatedAt, &task.CompletedAt,
+			&task.Modes, &task.SourceRepo, &task.QueuePosition,
 		); err != nil {
 			return nil, fmt.Errorf("scan task: %w", err)
 		}
@@ -172,14 +191,23 @@ func (s *Store) UpdateTaskStatus(ctx context.Context, id string, status TaskStat
 // SaveResult inserts an analysis result for a task.
 func (s *Store) SaveResult(ctx context.Context, result *TaskResult) error {
 	_, err := s.db.Exec(ctx,
-		`INSERT INTO analysis_results (task_id, call_chain, test_scenarios, entry_points, token_usage, step_count)
-		 VALUES ($1, $2, $3, $4, $5, $6)`,
+		`INSERT INTO analysis_results
+		   (task_id, call_chain, test_scenarios, entry_points, token_usage, step_count,
+		    ut_suggestions, function_analyses, impact_summary, cross_repo_hops, risk, index_coverage, modes)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)`,
 		result.TaskID,
 		result.CallChain,
 		result.TestScenarios,
 		result.EntryPoints,
 		result.TokenUsage,
 		result.StepCount,
+		result.UTSuggestions,
+		result.FunctionAnalyses,
+		result.ImpactSummary,
+		result.CrossRepoHops,
+		result.Risk,
+		result.IndexCoverage,
+		result.Modes,
 	)
 	if err != nil {
 		return fmt.Errorf("save result: %w", err)
@@ -190,7 +218,8 @@ func (s *Store) SaveResult(ctx context.Context, result *TaskResult) error {
 // GetResult retrieves the analysis result for a task.
 func (s *Store) GetResult(ctx context.Context, taskID string) (*TaskResult, error) {
 	row := s.db.QueryRow(ctx,
-		`SELECT id, task_id, call_chain, test_scenarios, entry_points, token_usage, step_count, created_at
+		`SELECT id, task_id, call_chain, test_scenarios, entry_points, token_usage, step_count, created_at,
+		        ut_suggestions, function_analyses, impact_summary, cross_repo_hops, risk, index_coverage, modes
 		   FROM analysis_results WHERE task_id = $1 ORDER BY created_at DESC LIMIT 1`,
 		taskID,
 	)
@@ -199,6 +228,8 @@ func (s *Store) GetResult(ctx context.Context, taskID string) (*TaskResult, erro
 	err := row.Scan(
 		&r.ID, &r.TaskID, &r.CallChain, &r.TestScenarios,
 		&r.EntryPoints, &r.TokenUsage, &r.StepCount, &r.CreatedAt,
+		&r.UTSuggestions, &r.FunctionAnalyses, &r.ImpactSummary,
+		&r.CrossRepoHops, &r.Risk, &r.IndexCoverage, &r.Modes,
 	)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrNotFound

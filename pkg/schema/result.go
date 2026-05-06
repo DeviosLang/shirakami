@@ -28,13 +28,29 @@ const (
 	ProtocolCLI  Protocol = "CLI"
 )
 
+// NodeSource indicates how a node was discovered during analysis.
+type NodeSource string
+
+const (
+	// NodeSourceWorker means the node was directly identified by a Worker agent
+	// searching within a repository.
+	NodeSourceWorker NodeSource = "worker"
+	// NodeSourceInferred means the node was inferred by the Orchestrator from
+	// cross-repository call contracts (not directly observed by a Worker).
+	NodeSourceInferred NodeSource = "inferred"
+)
+
 // CallNode represents a single function node in a call chain.
 type CallNode struct {
-	FuncName string   `json:"func_name"`
-	FilePath string   `json:"file_path"`
-	Line     int      `json:"line"`
-	Repo     string   `json:"repo"`
-	NodeType NodeType `json:"node_type"`
+	FuncName string     `json:"func_name"`
+	FilePath string     `json:"file_path"`
+	Line     int        `json:"line"`
+	Repo     string     `json:"repo"`
+	NodeType NodeType   `json:"node_type"`
+	// Source indicates how this node was discovered: "worker" (directly observed
+	// by a WorkerAgent) or "inferred" (deduced from cross-repo contracts by the
+	// Orchestrator). Empty string means source is unknown (legacy data).
+	Source   NodeSource `json:"source,omitempty"`
 }
 
 // CallEdge represents a directed edge between two call nodes.
@@ -56,6 +72,10 @@ type EntryPoint struct {
 	Protocol      Protocol `json:"protocol"`
 	Path          string   `json:"path"` // e.g. "POST /api/v1/payment/process"
 	TestScenarios []string `json:"test_scenarios"`
+	// Source indicates how this entry point was identified: "worker" (directly
+	// found by a WorkerAgent inspecting the entry repo) or "inferred"
+	// (deduced by the Orchestrator from cross-repo call contracts).
+	Source NodeSource `json:"source,omitempty"`
 	// Fields populated by scenario follow-up analysis.
 	// ChangedVia lists the diff-changed functions in the call path to this entry.
 	ChangedVia         []string                `json:"changed_via,omitempty"`

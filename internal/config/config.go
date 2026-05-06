@@ -14,6 +14,13 @@ type Config struct {
 	Workspace WorkspaceConfig `mapstructure:"workspace"`
 	Contracts []ContractEntry `mapstructure:"contracts"`
 	Webhook   WebhookConfig   `mapstructure:"webhook"`
+	// IndexMode controls how the symbol graph index is used during analysis.
+	// Valid values: "off" (default, pure LLM), "shadow", "hybrid", "deterministic".
+	// Can be overridden per-run via the --index-mode CLI flag.
+	// Environment variable: SHIRAKAMI_INDEX_MODE
+	IndexMode string `mapstructure:"index_mode"`
+	// Server holds HTTP server configuration (used in server mode).
+	Server ServerConfig `mapstructure:"server"`
 }
 
 // ContractEntry declares a known cross-repo call relationship.
@@ -76,6 +83,23 @@ type WebhookConfig struct {
 	GitHubToken string `mapstructure:"github_token"`
 }
 
+// ServerConfig holds HTTP API server settings.
+type ServerConfig struct {
+	// Addr is the listen address for the HTTP server (default: ":8080").
+	// Environment variable: SHIRAKAMI_SERVER_ADDR
+	Addr string `mapstructure:"addr"`
+
+	// MaxConcurrentAnalyses limits how many analysis jobs run simultaneously.
+	// Useful for NFS-backed workspaces where concurrent git operations conflict.
+	// Default: 1. Environment variable: SHIRAKAMI_SERVER_MAX_CONCURRENT
+	MaxConcurrentAnalyses int `mapstructure:"max_concurrent_analyses"`
+
+	// DefaultModes is the list of analysis modes to run when a request omits the
+	// modes field. Valid values: "chain", "e2e", "ut". Default: ["chain","e2e","ut"].
+	// Environment variable: SHIRAKAMI_SERVER_DEFAULT_MODES (comma-separated)
+	DefaultModes []string `mapstructure:"default_modes"`
+}
+
 // Load reads configuration from file and environment.
 // It looks for shirakami.yaml in the current directory, $HOME, or /etc/shirakami/.
 //
@@ -110,6 +134,10 @@ func Load(cfgFile string) (*Config, error) {
 	_ = viper.BindEnv("webhook.secret", "SHIRAKAMI_WEBHOOK_SECRET")
 	_ = viper.BindEnv("webhook.gitlab_token", "SHIRAKAMI_GITLAB_TOKEN")
 	_ = viper.BindEnv("webhook.github_token", "SHIRAKAMI_GITHUB_TOKEN")
+	_ = viper.BindEnv("index_mode", "SHIRAKAMI_INDEX_MODE")
+	_ = viper.BindEnv("server.addr", "SHIRAKAMI_SERVER_ADDR")
+	_ = viper.BindEnv("server.max_concurrent_analyses", "SHIRAKAMI_SERVER_MAX_CONCURRENT")
+	_ = viper.BindEnv("server.default_modes", "SHIRAKAMI_SERVER_DEFAULT_MODES")
 
 	// defaults
 	viper.SetDefault("workspace.dir", "/tmp/shirakami-workspace")
@@ -117,6 +145,10 @@ func Load(cfgFile string) (*Config, error) {
 	viper.SetDefault("llm.model", "gpt-4o")
 	viper.SetDefault("llm.endpoint", "https://api.openai.com/v1")
 	viper.SetDefault("llm.max_tokens", 128000)
+	viper.SetDefault("index_mode", "off")
+	viper.SetDefault("server.addr", ":8080")
+	viper.SetDefault("server.max_concurrent_analyses", 1)
+	viper.SetDefault("server.default_modes", []string{"chain", "e2e", "ut"})
 
 	if err := viper.ReadInConfig(); err != nil {
 		if _, ok := err.(viper.ConfigFileNotFoundError); !ok {

@@ -19,6 +19,11 @@ type CallNode struct {
 	Function string // qualified function name
 	File     string // file path relative to repo root
 	Line     int    // line number (0 if unknown)
+	// Source indicates how this node was discovered.
+	// "worker" = directly found by a WorkerAgent search.
+	// "graph"  = resolved by the deterministic symbol graph (Layer B).
+	// Empty string = unknown / legacy.
+	Source string
 }
 
 // WorkerTask is the input handed to a WorkerAgent.
@@ -36,6 +41,10 @@ type WorkerTask struct {
 	// ImportContext is a pre-built import graph summary for the repo (Python).
 	// Reduces LLM search rounds by providing known import relationships upfront.
 	ImportContext string
+	// Modes controls which follow-up passes to run after main tracing.
+	// Valid values: "chain", "e2e", "ut". Empty slice means run all.
+	// "e2e" enables runScenarioAnalysis; "ut" enables runUTAnalysis.
+	Modes []string
 }
 
 // SearchResult holds one raw ripgrep hit — file path, line, and caller name.
@@ -503,7 +512,7 @@ func (w *WorkerAgent) Analyse(ctx context.Context, task WorkerTask) (*WorkerResu
 	// Batching: entry points are split into chunks of maxScenarioChunkSize to
 	// prevent JSON truncation.  When a chunk produces 0 scenarios, it is retried
 	// once with an explicit "strict JSON" reminder (mirrors runUTAnalysis).
-	if len(workerResult.EntryPoints) > 0 {
+	if len(workerResult.EntryPoints) > 0 && workerModeEnabled(task.Modes, "e2e") {
 		workerResult.EntryScenarios = w.runScenarioAnalysis(
 			ctx, taskID, result.Content, task.ChangedFunctions, workerResult.EntryPoints,
 		)
@@ -525,7 +534,7 @@ func (w *WorkerAgent) Analyse(ctx context.Context, task WorkerTask) (*WorkerResu
 			realFuncs = append(realFuncs, fn)
 		}
 	}
-	if len(realFuncs) > 0 {
+	if len(realFuncs) > 0 && workerModeEnabled(task.Modes, "ut") {
 		workerResult.UTAnalyses = w.runUTAnalysis(ctx, taskID, result.Content, realFuncs)
 	}
 
@@ -768,6 +777,20 @@ func (w *WorkerAgent) runUTAnalysis(
 	return allResults
 }
 
+// workerModeEnabled returns true when the given mode should run.
+// An empty or nil modes slice means "run all" (default full analysis).
+func workerModeEnabled(modes []string, mode string) bool {
+	if len(modes) == 0 {
+		return true
+	}
+	for _, m := range modes {
+		if strings.EqualFold(m, mode) {
+			return true
+		}
+	}
+	return false
+}
+
 // parseWorkerOutput extracts structured data from LLM output.
 // Strategy order:
 //  1. Extract ```json ... ``` fenced block and unmarshal.
@@ -794,8 +817,15 @@ func parseWorkerOutput(repoName, content string) *WorkerResult {
 		return out
 	}
 
-	// Convert nodes.
+	// Convert nodes — skip pseudo-nodes where the LLM emitted an import
+	// statement or bare module name instead of a real function symbol.
+	// Heuristics: function name starts with "import " (Python import stmt)
+	// or contains only lowercase module-path tokens with no parens/brackets
+	// and line == 0 (LLM hallucinated position).
 	for _, n := range parsed.Nodes {
+		if isPseudoNode(n.Function) {
+			continue
+		}
 		out.Nodes = append(out.Nodes, CallNode{
 			Repo:     coalesce(n.Repo, repoName),
 			File:     n.File,
@@ -847,6 +877,9 @@ func parseWorkerOutput(repoName, content string) *WorkerResult {
 	for _, cf := range parsed.ChangedFunctions {
 		// Add call chain nodes to the global node list.
 		for _, n := range cf.CallChain {
+			if isPseudoNode(n.Function) {
+				continue
+			}
 			out.Nodes = append(out.Nodes, CallNode{
 				Repo:     coalesce(n.Repo, repoName),
 				File:     n.File,
@@ -931,6 +964,32 @@ func parseWorkerOutput(repoName, content string) *WorkerResult {
 	}
 
 	return out
+}
+
+// isPseudoNode returns true when a function name is not a real callable symbol
+// but rather an import statement, a module-level variable, or some other
+// non-function construct that the LLM mistakenly emitted as a call-chain node.
+//
+// Detected patterns (all case-insensitive start checks):
+//   - "import "         → Python/Go import statement verbatim
+//   - "from "           → Python "from X import Y" statement
+//   - "require("        → Node.js require() at module level
+//   - "#"               → comment line
+//
+// Additionally any name that is entirely whitespace or empty is filtered.
+func isPseudoNode(name string) bool {
+	if name == "" {
+		return true
+	}
+	trimmed := strings.TrimSpace(name)
+	if trimmed == "" {
+		return true
+	}
+	lower := strings.ToLower(trimmed)
+	return strings.HasPrefix(lower, "import ") ||
+		strings.HasPrefix(lower, "from ") ||
+		strings.HasPrefix(lower, "require(") ||
+		strings.HasPrefix(lower, "#")
 }
 
 // extractJSON finds a JSON object in LLM output.
