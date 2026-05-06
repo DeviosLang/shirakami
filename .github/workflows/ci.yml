@@ -70,3 +70,42 @@ jobs:
           name: benchmark-results
           path: benchmark-results.json
           retention-days: 30
+
+  # ──────────────────────────────────────────────────────────────
+  # Job 3: Layer B 集成测试（DiffToSymbols symbol_recall ≥ 0.80）
+  # 使用 GitHub Actions 内置 PostgreSQL service container，
+  # 通过 TEST_PG_DSN 环境变量跳过 testcontainers。
+  # ──────────────────────────────────────────────────────────────
+  layerb:
+    name: Layer B Integration Tests
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: golden_test
+          POSTGRES_USER: test
+          POSTGRES_PASSWORD: test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U test -d golden_test"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Run Layer B golden tests
+        env:
+          TEST_PG_DSN: "postgres://test:test@localhost:5432/golden_test?sslmode=disable"
+        run: |
+          go test ./tests/golden/... \
+            -v -run TestDiffToSymbols \
+            -count=1 -timeout=120s

@@ -1,0 +1,11 @@
+diff --git a/compute/service/dispatch.py b/compute/service/dispatch.py
+index abc1234..def5678 100644
+--- a/compute/service/dispatch.py
++++ b/compute/service/dispatch.py
+@@ -98,6 +98,8 @@ class DispatchService:
+
+     def health_check(self):
+         """Service health check endpoint."""
++        # Add disk space check
++        self._check_disk_space()
+         return {"status": "ok", "version": self.version}

@@ -13,6 +13,7 @@ type Config struct {
 	Redis     RedisConfig     `mapstructure:"redis"`
 	Workspace WorkspaceConfig `mapstructure:"workspace"`
 	Contracts []ContractEntry `mapstructure:"contracts"`
+	Webhook   WebhookConfig   `mapstructure:"webhook"`
 }
 
 // ContractEntry declares a known cross-repo call relationship.
@@ -58,6 +59,23 @@ type WorkspaceConfig struct {
 	Repos []RepoConfig `mapstructure:"repos"`
 }
 
+// WebhookConfig holds GitLab/GitHub webhook settings.
+type WebhookConfig struct {
+	// Secret is the shared HMAC secret used to verify incoming webhook payloads.
+	// For GitLab: compared against X-Gitlab-Token header (plain text).
+	// For GitHub: used to verify X-Hub-Signature-256 (HMAC-SHA256).
+	Secret string `mapstructure:"secret"`
+
+	// CommentOnMR enables posting analysis results as MR/PR comments.
+	CommentOnMR bool `mapstructure:"comment_on_mr"`
+
+	// GitLabToken is the GitLab personal access token used to post comments.
+	GitLabToken string `mapstructure:"gitlab_token"`
+
+	// GitHubToken is the GitHub personal access token used to post PR comments.
+	GitHubToken string `mapstructure:"github_token"`
+}
+
 // Load reads configuration from file and environment.
 // It looks for shirakami.yaml in the current directory, $HOME, or /etc/shirakami/.
 //
@@ -89,6 +107,9 @@ func Load(cfgFile string) (*Config, error) {
 	_ = viper.BindEnv("db.dsn", "SHIRAKAMI_DB_DSN")
 	_ = viper.BindEnv("redis.addr", "SHIRAKAMI_REDIS_ADDR")
 	_ = viper.BindEnv("redis.password", "SHIRAKAMI_REDIS_PASSWORD")
+	_ = viper.BindEnv("webhook.secret", "SHIRAKAMI_WEBHOOK_SECRET")
+	_ = viper.BindEnv("webhook.gitlab_token", "SHIRAKAMI_GITLAB_TOKEN")
+	_ = viper.BindEnv("webhook.github_token", "SHIRAKAMI_GITHUB_TOKEN")
 
 	// defaults
 	viper.SetDefault("workspace.dir", "/tmp/shirakami-workspace")

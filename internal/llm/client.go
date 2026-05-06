@@ -24,6 +24,13 @@ type Message interface {
 	messageRole() string
 }
 
+// SystemMessage is a system-level instruction message.
+type SystemMessage struct {
+	Content string
+}
+
+func (m SystemMessage) messageRole() string { return "system" }
+
 // UserMessage is a message from the user.
 type UserMessage struct {
 	Content string
@@ -225,6 +232,11 @@ func convertMessages(messages []Message) ([]openai.ChatCompletionMessage, error)
 	out := make([]openai.ChatCompletionMessage, 0, len(messages))
 	for _, m := range messages {
 		switch msg := m.(type) {
+		case SystemMessage:
+			out = append(out, openai.ChatCompletionMessage{
+				Role:    openai.ChatMessageRoleSystem,
+				Content: msg.Content,
+			})
 		case UserMessage:
 			out = append(out, openai.ChatCompletionMessage{
 				Role:    openai.ChatMessageRoleUser,
@@ -306,4 +318,21 @@ func parseResponse(resp openai.ChatCompletionResponse) (*Response, error) {
 	}
 
 	return result, nil
+}
+
+// CompleteText is a convenience wrapper for single-turn text conversations.
+// It sends an optional system prompt and a user prompt, returning the assistant's
+// text response. Satisfies the benchmark.LLMClient interface without importing
+// the benchmark package.
+func (c *Client) CompleteText(ctx context.Context, systemPrompt, userPrompt string) (string, error) {
+	var msgs []Message
+	if systemPrompt != "" {
+		msgs = append(msgs, SystemMessage{Content: systemPrompt})
+	}
+	msgs = append(msgs, UserMessage{Content: userPrompt})
+	resp, err := c.Complete(ctx, msgs, nil)
+	if err != nil {
+		return "", err
+	}
+	return resp.Content, nil
 }

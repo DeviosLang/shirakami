@@ -1,0 +1,8 @@
+{
+  "case_id": "single-file-utils-change",
+  "description": "单文件新增方法，无已有调用者，无跨仓库影响",
+  "created_at": "2026-05-05",
+  "source": "手工构造",
+  "difficulty": "easy",
+  "tags": ["single-repo", "new-function", "no-callers"]
+}

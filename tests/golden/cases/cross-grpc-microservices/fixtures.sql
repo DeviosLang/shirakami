@@ -26,15 +26,18 @@ INSERT INTO symbol_nodes (id, repo, file_path, name, kind, start_line, end_line,
    '(ctx context.Context, req *pb.CurrencyConversionRequest) (*pb.Money, error)',
    'deadbeef');
 
--- symbol_edges: 跨仓库调用边
-INSERT INTO symbol_edges (from_id, to_id, kind, confidence, commit_hash) VALUES
-  ('checkoutservice:src/checkoutservice/main.go:checkoutService.PlaceOrder#2',
+-- symbol_edges: 调用关系（GRPC_CALLS 降为 CALLS，schema 仅支持 CALLS/IMPORTS/EXTENDS/IMPLEMENTS）
+INSERT INTO symbol_edges (id, source_id, target_id, type, file_path, line, confidence) VALUES
+  ('checkoutservice:edge:PlaceOrder->convertCurrency',
+   'checkoutservice:src/checkoutservice/main.go:checkoutService.PlaceOrder#2',
    'checkoutservice:src/checkoutservice/main.go:checkoutService.convertCurrency#3',
-   'CALLS', 1.0, 'a9f4e31'),
-  ('checkoutservice:src/checkoutservice/main.go:checkoutService.convertCurrency#3',
+   'CALLS', 'src/checkoutservice/main.go', 210, 1.0),
+  ('checkoutservice:edge:convertCurrency->getCurrencySvcClient',
+   'checkoutservice:src/checkoutservice/main.go:checkoutService.convertCurrency#3',
    'checkoutservice:src/checkoutservice/main.go:checkoutService.getCurrencySvcClient#0',
-   'CALLS', 1.0, 'a9f4e31'),
-  -- 跨仓库 gRPC 调用（GRPC_CALLS 类型，低置信度）
-  ('checkoutservice:src/checkoutservice/main.go:checkoutService.convertCurrency#3',
+   'CALLS', 'src/checkoutservice/main.go', 250, 1.0),
+  -- 跨仓库 gRPC 调用（以 CALLS 类型存储，confidence=0.95 表示 gRPC 推断）
+  ('checkoutservice:edge:convertCurrency->CurrencyService.Convert',
+   'checkoutservice:src/checkoutservice/main.go:checkoutService.convertCurrency#3',
    'currencyservice:main.go:CurrencyService.Convert#2',
-   'GRPC_CALLS', 0.95, 'a9f4e31');
+   'CALLS', 'src/checkoutservice/main.go', 253, 0.95);

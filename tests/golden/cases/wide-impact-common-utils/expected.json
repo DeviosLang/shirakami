@@ -1,0 +1,40 @@
+{
+  "changed_functions": [
+    {
+      "name": "execute",
+      "repo": "vstation_compute",
+      "file": "compute/common/utils.py",
+      "start_line": 167
+    }
+  ],
+  "call_chain": [
+    {
+      "source": "vstation_compute:compute/disk/encrypt_disk.py:init_sm4_dev",
+      "target": "vstation_compute:compute/common/utils.py:execute",
+      "type": "CALLS",
+      "depth": 1
+    },
+    {
+      "source": "vstation_compute:compute/libvirt/lvinit.py:start",
+      "target": "vstation_compute:compute/common/utils.py:execute",
+      "type": "CALLS",
+      "depth": 1
+    },
+    {
+      "source": "vstation_compute:compute/image/xen2kvm.py:exec_cmd",
+      "target": "vstation_compute:compute/common/utils.py:execute",
+      "type": "CALLS",
+      "depth": 1
+    }
+  ],
+  "entry_points": [
+    {
+      "repo": "vstation_compute",
+      "function": "VMachineCreate",
+      "file": "compute/dispatch.py",
+      "protocol": "JSON-RPC",
+      "path": "VMachineCreate"
+    }
+  ],
+  "cross_repo_calls": []
+}

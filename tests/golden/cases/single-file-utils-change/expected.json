@@ -1,0 +1,13 @@
+{
+  "changed_functions": [
+    {
+      "name": "VirtioInstaller.install_virtio_driver_v2",
+      "repo": "vstation_compute",
+      "file": "compute/image/install_win_virtio.py",
+      "start_line": 222
+    }
+  ],
+  "call_chain": [],
+  "entry_points": [],
+  "cross_repo_calls": []
+}

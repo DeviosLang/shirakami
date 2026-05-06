@@ -22,16 +22,20 @@ INSERT INTO symbol_nodes (id, repo, file_path, name, kind, start_line, end_line,
    '(c *Context)', 'd4b45d9');
 
 -- symbol_edges
-INSERT INTO symbol_edges (from_id, to_id, kind, confidence, commit_hash) VALUES
-  ('gin:context.go:Context.JSON#2',
+INSERT INTO symbol_edges (id, source_id, target_id, type, file_path, line, confidence) VALUES
+  ('gin:edge:Context.JSON->Context.Render',
+   'gin:context.go:Context.JSON#2',
    'gin:context.go:Context.Render#2',
-   'CALLS', 1.0, 'd4b45d9'),
-  ('gin:context.go:Context.IndentedJSON#2',
+   'CALLS', 'context.go', 980, 1.0),
+  ('gin:edge:Context.IndentedJSON->Context.Render',
+   'gin:context.go:Context.IndentedJSON#2',
    'gin:context.go:Context.Render#2',
-   'CALLS', 1.0, 'd4b45d9'),
-  ('gin:context.go:Context.Render#2',
+   'CALLS', 'context.go', 988, 1.0),
+  ('gin:edge:Context.Render->Context.Abort',
+   'gin:context.go:Context.Render#2',
    'gin:context.go:Context.Abort#0',
-   'CALLS', 0.9, 'd4b45d9'),
-  ('gin:gin.go:Engine.ServeHTTP#2',
+   'CALLS', 'context.go', 939, 0.9),
+  ('gin:edge:Engine.ServeHTTP->Engine.handleHTTPRequest',
+   'gin:gin.go:Engine.ServeHTTP#2',
    'gin:gin.go:Engine.handleHTTPRequest#1',
-   'CALLS', 1.0, 'd4b45d9');
+   'CALLS', 'gin.go', 353, 1.0);

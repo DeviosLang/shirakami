@@ -1,7 +1,10 @@
 package benchmark
 
 import (
+	"os"
+	"path/filepath"
 	"testing"
+	"time"
 )
 
 func TestCompareResults_BasicParity(t *testing.T) {
@@ -178,4 +181,208 @@ func containsHelper(s, sub string) bool {
 		}
 	}
 	return false
+}
+
+// ---------------------------------------------------------------------------
+// Tests for LoadReport / ApplyVerdict / AppendTrend
+// ---------------------------------------------------------------------------
+
+func makeTestReport(matchCount, missCount, extraPending int) *ParityReport {
+	r := &ParityReport{
+		RunID:             "test-run",
+		Timestamp:         time.Now(),
+		SourceRepo:        "test-repo",
+		Description:       "test",
+		TotalEdgesV1:      matchCount + missCount,
+		TotalEdgesV2:      matchCount + extraPending,
+		MatchCount:        matchCount,
+		MissCount:         missCount,
+		ExtraPendingCount: extraPending,
+	}
+	// Populate Records to match counts.
+	for i := 0; i < matchCount; i++ {
+		r.Records = append(r.Records, DiffRecord{
+			Edge:     NormalizedEdge{SourceFunc: "match", TargetFunc: "target", EdgeType: "CALLS"},
+			Category: CategoryMatch,
+		})
+	}
+	for i := 0; i < missCount; i++ {
+		r.Records = append(r.Records, DiffRecord{
+			Edge:     NormalizedEdge{SourceFunc: "miss", TargetFunc: "target", EdgeType: "CALLS"},
+			Category: CategoryMiss,
+		})
+	}
+	for i := 0; i < extraPending; i++ {
+		r.Records = append(r.Records, DiffRecord{
+			Edge:     NormalizedEdge{SourceFunc: "extra", TargetFunc: "newFunc", EdgeType: "CALLS"},
+			Category: CategoryExtraPend,
+		})
+	}
+	denom := matchCount + missCount
+	if denom > 0 {
+		r.MissRate = float64(missCount) / float64(denom)
+	}
+	return r
+}
+
+func TestLoadReport_LatestKeyword(t *testing.T) {
+	dir := t.TempDir()
+	r := makeTestReport(2, 1, 1)
+	if err := SaveReport(r, dir); err != nil {
+		t.Fatalf("SaveReport: %v", err)
+	}
+
+	// Load via "latest"
+	loaded, err := LoadReport(dir, "latest")
+	if err != nil {
+		t.Fatalf("LoadReport(latest): %v", err)
+	}
+	if loaded.RunID != r.RunID {
+		t.Errorf("RunID: got %q, want %q", loaded.RunID, r.RunID)
+	}
+	if loaded.MatchCount != 2 {
+		t.Errorf("MatchCount: got %d, want 2", loaded.MatchCount)
+	}
+}
+
+func TestLoadReport_EmptyRunID(t *testing.T) {
+	dir := t.TempDir()
+	r := makeTestReport(1, 0, 0)
+	if err := SaveReport(r, dir); err != nil {
+		t.Fatalf("SaveReport: %v", err)
+	}
+
+	loaded, err := LoadReport(dir, "")
+	if err != nil {
+		t.Fatalf("LoadReport(''): %v", err)
+	}
+	if loaded.MatchCount != 1 {
+		t.Errorf("MatchCount: got %d, want 1", loaded.MatchCount)
+	}
+}
+
+func TestLoadReport_NotFound(t *testing.T) {
+	dir := t.TempDir()
+	_, err := LoadReport(dir, "latest")
+	if err == nil {
+		t.Error("expected error when latest.json does not exist")
+	}
+}
+
+func TestApplyVerdict_TP(t *testing.T) {
+	r := makeTestReport(2, 1, 1)
+
+	if err := ApplyVerdict(r, "newFunc", "tp"); err != nil {
+		t.Fatalf("ApplyVerdict(tp): %v", err)
+	}
+	if r.ExtraPendingCount != 0 {
+		t.Errorf("ExtraPendingCount after tp: got %d, want 0", r.ExtraPendingCount)
+	}
+	if r.ExtraTPCount != 1 {
+		t.Errorf("ExtraTPCount after tp: got %d, want 1", r.ExtraTPCount)
+	}
+}
+
+func TestApplyVerdict_FP(t *testing.T) {
+	r := makeTestReport(2, 0, 1)
+
+	if err := ApplyVerdict(r, "extra", "fp"); err != nil {
+		t.Fatalf("ApplyVerdict(fp): %v", err)
+	}
+	if r.ExtraPendingCount != 0 {
+		t.Errorf("ExtraPendingCount after fp: got %d, want 0", r.ExtraPendingCount)
+	}
+	if r.ExtraFPCount != 1 {
+		t.Errorf("ExtraFPCount after fp: got %d, want 1", r.ExtraFPCount)
+	}
+	// FPRate = 1 / (2 + 0 + 1) = 0.333
+	if r.FPRate < 0.32 || r.FPRate > 0.34 {
+		t.Errorf("FPRate after fp: got %.3f, want ~0.333", r.FPRate)
+	}
+}
+
+func TestApplyVerdict_InvalidVerdict(t *testing.T) {
+	r := makeTestReport(1, 0, 1)
+	if err := ApplyVerdict(r, "extra", "unknown"); err == nil {
+		t.Error("expected error for invalid verdict")
+	}
+}
+
+func TestApplyVerdict_NoMatch(t *testing.T) {
+	r := makeTestReport(2, 1, 0) // no extra_pending
+	if err := ApplyVerdict(r, "anything", "tp"); err == nil {
+		t.Error("expected error when no extra_pending records exist")
+	}
+}
+
+func TestAppendTrend_CreatesFileWithHeader(t *testing.T) {
+	dir := t.TempDir()
+	trendPath := filepath.Join(dir, "parity-trend.csv")
+
+	r := makeTestReport(3, 1, 0)
+	if err := AppendTrend(trendPath, r); err != nil {
+		t.Fatalf("AppendTrend: %v", err)
+	}
+
+	data, err := os.ReadFile(trendPath)
+	if err != nil {
+		t.Fatalf("read trend file: %v", err)
+	}
+	content := string(data)
+
+	// Header must be present.
+	if !contains(content, "timestamp,run_id,source_repo") {
+		t.Errorf("header not found in trend file:\n%s", content)
+	}
+	// Data row must be present.
+	if !contains(content, "test-run") {
+		t.Errorf("run_id not found in trend row:\n%s", content)
+	}
+}
+
+func TestAppendTrend_AppendsRows(t *testing.T) {
+	dir := t.TempDir()
+	trendPath := filepath.Join(dir, "parity-trend.csv")
+
+	for i := 0; i < 3; i++ {
+		r := makeTestReport(i+1, 0, 0)
+		if err := AppendTrend(trendPath, r); err != nil {
+			t.Fatalf("AppendTrend iteration %d: %v", i, err)
+		}
+	}
+
+	data, err := os.ReadFile(trendPath)
+	if err != nil {
+		t.Fatalf("read trend file: %v", err)
+	}
+	// 1 header + 3 data rows = 4 lines (trailing newline gives 5 splits but last empty)
+	lines := splitNonEmpty(string(data))
+	if len(lines) != 4 {
+		t.Errorf("expected 4 lines (header + 3 rows), got %d:\n%s", len(lines), string(data))
+	}
+}
+
+func splitNonEmpty(s string) []string {
+	var out []string
+	for _, line := range splitLines(s) {
+		if line != "" {
+			out = append(out, line)
+		}
+	}
+	return out
+}
+
+func splitLines(s string) []string {
+	var lines []string
+	start := 0
+	for i, c := range s {
+		if c == '\n' {
+			lines = append(lines, s[start:i])
+			start = i + 1
+		}
+	}
+	if start < len(s) {
+		lines = append(lines, s[start:])
+	}
+	return lines
 }

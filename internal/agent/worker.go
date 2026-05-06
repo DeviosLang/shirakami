@@ -250,7 +250,7 @@ type llmEntryScenariosOutput struct {
 //   (a) nested JSON objects are handled correctly, and
 //   (b) multiple fenced blocks in the same response are not merged into
 //       invalid JSON (which the old greedy regex (?s)`{.+}` caused).
-var fencedJSONStartRe = regexp.MustCompile("```json[ \\t]*\\r?\\n?[ \\t]*(\\{")
+var fencedJSONStartRe = regexp.MustCompile("```json[ \\t]*\\r?\\n?[ \\t]*(\\{)")
 
 // WorkerAgent performs local call-chain analysis inside a single repository.
 type WorkerAgent struct {

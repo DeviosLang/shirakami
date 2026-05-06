@@ -16,10 +16,13 @@ CREATE TABLE IF NOT EXISTS contracts (
     line        INTEGER,               -- approximate line number
     symbol_id   TEXT REFERENCES symbol_nodes(id) ON DELETE SET NULL,
     commit_hash TEXT NOT NULL DEFAULT '',
-    indexed_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-
-    UNIQUE(repo, protocol, path, COALESCE(method, ''), role)
+    indexed_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+
+-- PostgreSQL does not allow expressions in inline UNIQUE constraints, so use a
+-- partial unique index instead to handle NULL method values.
+CREATE UNIQUE INDEX IF NOT EXISTS uq_contracts
+    ON contracts(repo, protocol, path, COALESCE(method, ''), role);
 
 CREATE INDEX IF NOT EXISTS idx_contract_repo ON contracts(repo, role);
 CREATE INDEX IF NOT EXISTS idx_contract_path ON contracts(protocol, path);

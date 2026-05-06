@@ -1,0 +1,8 @@
+{
+  "case_id": "wide-impact-common-utils",
+  "description": "修改高扇出公共函数 execute()，预期 wide_impact=true（调用者 > 20）",
+  "created_at": "2026-05-05",
+  "source": "基于 v29 报告中 utils.py 的 wide-impact 模式",
+  "difficulty": "medium",
+  "tags": ["wide-impact", "single-repo", "public-utility", "python"]
+}

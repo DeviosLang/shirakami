@@ -25,6 +25,7 @@ import (
 	"github.com/DeviosLang/shirakami/internal/logger"
 	"github.com/DeviosLang/shirakami/internal/storage"
 	itool "github.com/DeviosLang/shirakami/internal/tool"
+	"github.com/DeviosLang/shirakami/internal/webhook"
 )
 
 var (
@@ -99,11 +100,37 @@ func runServer(cmd *cobra.Command, args []string) error {
 		cache: analysisCache,
 	}
 
+	// Build webhook handler.
+	var commenter webhook.Commenter
+	if cfg.Webhook.CommentOnMR {
+		if cfg.Webhook.GitLabToken != "" {
+			commenter = &webhook.GitLabCommenter{
+				Token:   cfg.Webhook.GitLabToken,
+				BaseURL: "https://gitlab.com",
+			}
+		} else if cfg.Webhook.GitHubToken != "" {
+			commenter = &webhook.GitHubCommenter{
+				Token: cfg.Webhook.GitHubToken,
+			}
+		}
+	}
+	webhookHandler := webhook.New(
+		&storageTaskAdapter{store: store},
+		webhook.Config{
+			Secret:    cfg.Webhook.Secret,
+			Commenter: commenter,
+			Launch: func(taskID, inputDiff, inputDesc, cacheKey string) {
+				srv.runAnalysis(taskID, inputDiff, inputDesc, cacheKey)
+			},
+		},
+	)
+
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", handleHealthz)
 	mux.Handle("/metrics", feedback.Handler())
 	mux.HandleFunc("/api/v1/tasks", srv.handleTasks)
 	mux.HandleFunc("/api/v1/tasks/", srv.handleTaskByID)
+	mux.Handle("/api/v1/webhook", webhookHandler)
 
 	log.Sugar().Infof("listening on %s", addr)
 	return http.ListenAndServe(addr, mux)
@@ -441,4 +468,20 @@ func jsonError(w http.ResponseWriter, msg string, code int) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(code)
 	json.NewEncoder(w).Encode(map[string]string{"error": msg}) //nolint:errcheck
+}
+
+// ---------------------------------------------------------------------------
+// storageTaskAdapter adapts *storage.Store to webhook.TaskCreator.
+// ---------------------------------------------------------------------------
+
+type storageTaskAdapter struct {
+	store *storage.Store
+}
+
+func (a *storageTaskAdapter) CreateTask(ctx context.Context, inputType, inputDiff, inputDesc, cacheKey string) (webhook.TaskRecord, error) {
+	task, err := a.store.CreateTask(ctx, storage.InputType(inputType), inputDiff, inputDesc, cacheKey)
+	if err != nil {
+		return webhook.TaskRecord{}, err
+	}
+	return webhook.TaskRecord{ID: task.ID}, nil
 }

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -10,6 +11,8 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/DeviosLang/shirakami/internal/benchmark"
+	"github.com/DeviosLang/shirakami/internal/config"
+	"github.com/DeviosLang/shirakami/internal/llm"
 	"github.com/DeviosLang/shirakami/internal/tool"
 )
 
@@ -22,6 +25,8 @@ func buildBenchmarkCmd() *cobra.Command {
 	cmd.AddCommand(buildBenchmarkVerifyCmd())
 	cmd.AddCommand(buildBenchmarkRunCmd())
 	cmd.AddCommand(buildBenchmarkDebugCmd())
+	cmd.AddCommand(buildBenchmarkJudgeCmd())
+	cmd.AddCommand(buildBenchmarkAutoJudgeCmd())
 	return cmd
 }
 
@@ -361,6 +366,209 @@ Example:
 	}
 
 	cmd.Flags().StringVar(&goldenDir, "golden-dir", "tests/golden/cases", "path to golden test cases directory")
+
+	return cmd
+}
+
+// ---------------------------------------------------------------------------
+// shirakami benchmark judge
+// ---------------------------------------------------------------------------
+
+// buildBenchmarkJudgeCmd creates the `shirakami benchmark judge` sub-command.
+//
+// Usage:
+//
+//	shirakami benchmark judge --run latest --symbol "Cache.Get" --verdict tp
+//	shirakami benchmark judge --run latest --symbol "order-service:placeOrder→payment-service:Charge" --verdict fp
+func buildBenchmarkJudgeCmd() *cobra.Command {
+	var (
+		parityDir string
+		runID     string
+		symbol    string
+		verdict   string
+		trendFile string
+	)
+
+	cmd := &cobra.Command{
+		Use:   "judge",
+		Short: "Apply a tp/fp verdict to an extra_pending shadow-parity record",
+		Long: `Loads a saved shadow parity report, applies a tp (true positive) or fp
+(false positive) verdict to the first extra_pending record matching the given
+symbol key, persists the updated report, and appends a row to the trend CSV.
+
+Examples:
+  # Mark 'Cache.Get' as a true positive (v2 correctly found a caller v1 missed)
+  shirakami benchmark judge --symbol "Cache.Get" --verdict tp
+
+  # Mark by full edge key as false positive
+  shirakami benchmark judge \
+    --run 2026-05-06T12-00-00 \
+    --symbol "order-service:placeOrder→payment-service:Charge[CALLS]" \
+    --verdict fp`,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if symbol == "" {
+				return fmt.Errorf("--symbol is required")
+			}
+			if verdict == "" {
+				return fmt.Errorf("--verdict is required (tp or fp)")
+			}
+
+			// Load the report.
+			report, err := benchmark.LoadReport(parityDir, runID)
+			if err != nil {
+				return fmt.Errorf("load report: %w", err)
+			}
+
+			pendingBefore := report.ExtraPendingCount
+			if err := benchmark.ApplyVerdict(report, symbol, verdict); err != nil {
+				return err
+			}
+
+			fmt.Printf("Applied verdict=%s to run=%s (extra_pending: %d → %d)\n",
+				strings.ToUpper(verdict), report.RunID, pendingBefore, report.ExtraPendingCount)
+			fmt.Printf("  miss_rate=%.4f  fp_rate=%.4f\n", report.MissRate, report.FPRate)
+
+			// Persist updated report (overwrite timestamped file + latest.json).
+			if err := benchmark.SaveReport(report, parityDir); err != nil {
+				return fmt.Errorf("save updated report: %w", err)
+			}
+			fmt.Printf("Saved updated report to %s/\n", parityDir)
+
+			// Append trend row.
+			if err := benchmark.AppendTrend(trendFile, report); err != nil {
+				// Non-fatal — trend is informational.
+				fmt.Fprintf(os.Stderr, "warn: failed to append trend: %v\n", err)
+			} else {
+				fmt.Printf("Appended trend row to %s\n", trendFile)
+			}
+
+			return nil
+		},
+	}
+
+	cmd.Flags().StringVar(&parityDir, "parity-dir", "reports/shadow-parity", "directory containing parity report JSON files")
+	cmd.Flags().StringVar(&runID, "run", "latest", "run ID to load (use 'latest' for the most recent run)")
+	cmd.Flags().StringVar(&symbol, "symbol", "", "symbol key to match in extra_pending records (required)")
+	cmd.Flags().StringVar(&verdict, "verdict", "", "tp (true positive) or fp (false positive) (required)")
+	cmd.Flags().StringVar(&trendFile, "trend-file", "reports/shadow-parity/parity-trend.csv", "path to the trend CSV file")
+
+	_ = cmd.MarkFlagRequired("symbol")
+	_ = cmd.MarkFlagRequired("verdict")
+
+	return cmd
+}
+
+// ---------------------------------------------------------------------------
+// shirakami benchmark autojudge
+// ---------------------------------------------------------------------------
+
+// buildBenchmarkAutoJudgeCmd creates the `shirakami benchmark autojudge` command.
+//
+// Usage:
+//
+//	shirakami benchmark autojudge --run latest
+//	shirakami benchmark autojudge --run 2026-05-06T12-00-00 --max-records 5
+func buildBenchmarkAutoJudgeCmd() *cobra.Command {
+	var (
+		parityDir  string
+		runID      string
+		trendFile  string
+		maxRecords int
+		verbose    bool
+	)
+
+	cmd := &cobra.Command{
+		Use:   "autojudge",
+		Short: "Auto-judge extra_pending records via adversarial LLM verification (§12.6)",
+		Long: `Runs the three-phase Generate→Critic→Judge adversarial pipeline on every
+extra_pending record in the specified shadow-parity report.
+
+Each record gets three LLM calls:
+  1. Proof   — argue the call EXISTS
+  2. Disproof — argue the call does NOT exist
+  3. Judge   — weigh both sides → EXISTS / NOT_EXISTS / UNCERTAIN
+
+Records judged UNCERTAIN remain extra_pending for human review.
+The report is updated in-place and a trend row is appended.
+
+Examples:
+  shirakami benchmark autojudge --run latest
+  shirakami benchmark autojudge --run 2026-05-06T12-00-00 --max-records 3 --verbose`,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			// Load LLM client from config.
+			cfg, err := config.Load(cfgFile)
+			if err != nil {
+				return fmt.Errorf("load config: %w", err)
+			}
+			llmClient := llm.NewClient(llm.Config{
+				BaseURL:   cfg.LLM.Endpoint,
+				APIKey:    cfg.LLM.APIKey,
+				Model:     cfg.LLM.Model,
+				MaxTokens: 2048,
+			})
+
+			report, err := benchmark.LoadReport(parityDir, runID)
+			if err != nil {
+				return fmt.Errorf("load report: %w", err)
+			}
+
+			if report.ExtraPendingCount == 0 {
+				fmt.Println("No extra_pending records — nothing to judge.")
+				return nil
+			}
+
+			fmt.Printf("Auto-judging %d extra_pending records in run %s...\n",
+				report.ExtraPendingCount, report.RunID)
+
+			opts := benchmark.AutoJudgeOptions{
+				MaxRecords: maxRecords,
+			}
+			if verbose {
+				opts.Verbose = func(format string, args ...any) {
+					fmt.Printf(format+"\n", args...)
+				}
+			}
+
+			summary, err := benchmark.RunAutoJudge(context.Background(), llmClient, report, opts)
+			if err != nil {
+				return fmt.Errorf("auto-judge: %w", err)
+			}
+
+			// Print summary table.
+			fmt.Printf("\n── Auto-Judge Summary ──────────────────────────────────\n")
+			fmt.Printf("  Total extra_pending : %d\n", summary.Total)
+			fmt.Printf("  Judged (definitive) : %d  (tp=%d, fp=%d)\n",
+				summary.Judged, summary.TPCount, summary.FPCount)
+			fmt.Printf("  Remaining (uncertain): %d\n", summary.Remaining)
+			fmt.Printf("  miss_rate : %.4f    fp_rate : %.4f\n",
+				report.MissRate, report.FPRate)
+
+			// Save updated report.
+			if err := benchmark.SaveReport(report, parityDir); err != nil {
+				return fmt.Errorf("save report: %w", err)
+			}
+			fmt.Printf("Saved updated report to %s/\n", parityDir)
+
+			// Append trend row.
+			trendPath := trendFile
+			if trendPath == "" {
+				trendPath = filepath.Join(parityDir, "parity-trend.csv")
+			}
+			if err := benchmark.AppendTrend(trendPath, report); err != nil {
+				fmt.Fprintf(os.Stderr, "warn: failed to append trend: %v\n", err)
+			} else {
+				fmt.Printf("Appended trend row to %s\n", trendPath)
+			}
+
+			return nil
+		},
+	}
+
+	cmd.Flags().StringVar(&parityDir, "parity-dir", "reports/shadow-parity", "directory containing parity report JSON files")
+	cmd.Flags().StringVar(&runID, "run", "latest", "run ID to load (use 'latest' for the most recent run)")
+	cmd.Flags().StringVar(&trendFile, "trend-file", "", "path to trend CSV (default: <parity-dir>/parity-trend.csv)")
+	cmd.Flags().IntVar(&maxRecords, "max-records", 0, "cap on records to judge in one run (0 = no limit)")
+	cmd.Flags().BoolVar(&verbose, "verbose", false, "print per-record judgment details")
 
 	return cmd
 }

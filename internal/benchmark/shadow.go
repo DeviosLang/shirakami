@@ -289,3 +289,154 @@ func filterRecords(records []DiffRecord, category DiffCategory) []DiffRecord {
 	}
 	return result
 }
+
+// ---------------------------------------------------------------------------
+// Load / Update / Trend
+// ---------------------------------------------------------------------------
+
+// LoadReport loads a parity report from outputDir.
+// runID may be "latest" (or empty string) to load latest.json,
+// or an explicit timestamp slug (e.g. "2026-05-06T12-30-00") to load that file.
+func LoadReport(outputDir, runID string) (*ParityReport, error) {
+	var filename string
+	if runID == "" || runID == "latest" {
+		filename = "latest.json"
+	} else {
+		// Accept bare timestamp slug or already-suffixed filename.
+		if strings.HasSuffix(runID, ".json") {
+			filename = runID
+		} else {
+			filename = runID + ".json"
+		}
+	}
+	path := filepath.Join(outputDir, filename)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("load report %s: %w", path, err)
+	}
+	var report ParityReport
+	if err := json.Unmarshal(data, &report); err != nil {
+		return nil, fmt.Errorf("parse report %s: %w", path, err)
+	}
+	return &report, nil
+}
+
+// ApplyVerdict updates the category of an extra_pending record identified by
+// symbolKey and recalculates aggregate counts and rates.
+//
+// symbolKey is matched against each record's Edge.Key() first; if that fails,
+// it is matched as a case-insensitive substring of SourceFunc or TargetFunc.
+// verdict must be "tp" or "fp".
+//
+// Returns an error if no matching record is found or verdict is invalid.
+func ApplyVerdict(report *ParityReport, symbolKey, verdict string) error {
+	var newCat DiffCategory
+	switch strings.ToLower(verdict) {
+	case "tp":
+		newCat = CategoryExtraTP
+	case "fp":
+		newCat = CategoryExtraFP
+	default:
+		return fmt.Errorf("invalid verdict %q: must be tp or fp", verdict)
+	}
+
+	lower := strings.ToLower(symbolKey)
+	matched := false
+	for i := range report.Records {
+		r := &report.Records[i]
+		if r.Category != CategoryExtraPend {
+			continue
+		}
+		if r.Edge.Key() == symbolKey ||
+			strings.Contains(strings.ToLower(r.Edge.SourceFunc), lower) ||
+			strings.Contains(strings.ToLower(r.Edge.TargetFunc), lower) {
+			r.Category = newCat
+			r.Details = fmt.Sprintf("judged as %s", string(newCat))
+			matched = true
+			break // apply to first matching record only
+		}
+	}
+	if !matched {
+		return fmt.Errorf("no extra_pending record matching symbol %q found in report %s", symbolKey, report.RunID)
+	}
+
+	// Recount from scratch.
+	report.MatchCount = 0
+	report.MissCount = 0
+	report.ExtraPendingCount = 0
+	report.ExtraTPCount = 0
+	report.ExtraFPCount = 0
+	for _, r := range report.Records {
+		switch r.Category {
+		case CategoryMatch:
+			report.MatchCount++
+		case CategoryMiss:
+			report.MissCount++
+		case CategoryExtraPend:
+			report.ExtraPendingCount++
+		case CategoryExtraTP:
+			report.ExtraTPCount++
+		case CategoryExtraFP:
+			report.ExtraFPCount++
+		}
+	}
+	denom := report.MatchCount + report.MissCount
+	if denom > 0 {
+		report.MissRate = float64(report.MissCount) / float64(denom)
+	}
+	fpDenom := report.MatchCount + report.MissCount + report.ExtraFPCount
+	if fpDenom > 0 {
+		report.FPRate = float64(report.ExtraFPCount) / float64(fpDenom)
+	}
+	return nil
+}
+
+// AppendTrend appends one summary row to a CSV file at trendPath.
+// If the file does not exist it is created with a header line first.
+//
+// CSV columns:
+//
+//	timestamp,run_id,source_repo,total_v1,total_v2,match,miss,extra_pending,extra_tp,extra_fp,miss_rate,fp_rate
+func AppendTrend(trendPath string, report *ParityReport) error {
+	if err := os.MkdirAll(filepath.Dir(trendPath), 0755); err != nil {
+		return fmt.Errorf("create trend dir: %w", err)
+	}
+
+	// Write header if file does not exist yet.
+	needHeader := false
+	if _, err := os.Stat(trendPath); os.IsNotExist(err) {
+		needHeader = true
+	}
+
+	f, err := os.OpenFile(trendPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		return fmt.Errorf("open trend file: %w", err)
+	}
+	defer f.Close()
+
+	if needHeader {
+		header := "timestamp,run_id,source_repo,total_v1,total_v2,match,miss,extra_pending,extra_tp,extra_fp,miss_rate,fp_rate\n"
+		if _, err := f.WriteString(header); err != nil {
+			return fmt.Errorf("write header: %w", err)
+		}
+	}
+
+	row := fmt.Sprintf("%s,%s,%s,%d,%d,%d,%d,%d,%d,%d,%.4f,%.4f\n",
+		report.Timestamp.UTC().Format("2006-01-02T15:04:05Z"),
+		report.RunID,
+		report.SourceRepo,
+		report.TotalEdgesV1,
+		report.TotalEdgesV2,
+		report.MatchCount,
+		report.MissCount,
+		report.ExtraPendingCount,
+		report.ExtraTPCount,
+		report.ExtraFPCount,
+		report.MissRate,
+		report.FPRate,
+	)
+	if _, err := f.WriteString(row); err != nil {
+		return fmt.Errorf("write trend row: %w", err)
+	}
+	return nil
+}

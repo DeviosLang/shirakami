@@ -194,11 +194,40 @@ func TestDiffToSymbols_GoldenCases(t *testing.T) {
 // Helpers for Layer B
 // ---------------------------------------------------------------------------
 
-// startGoldenPostgres starts a PostgreSQL container scoped to the test suite.
+// startGoldenPostgres returns a (*sql.DB, *pgxpool.Pool) backed by PostgreSQL.
+//
+// If the TEST_PG_DSN environment variable is set, the function connects directly
+// to that external PostgreSQL instance (useful in CI / k8s environments where a
+// real Postgres is already running) and skips Docker entirely.
+//
+// Otherwise it starts a postgres:16-alpine container via testcontainers-go.
 func startGoldenPostgres(t *testing.T) (*sql.DB, *pgxpool.Pool) {
 	t.Helper()
 	ctx := context.Background()
 
+	// ── External PostgreSQL (TEST_PG_DSN) ──────────────────────────────────
+	if dsn := os.Getenv("TEST_PG_DSN"); dsn != "" {
+		t.Logf("TEST_PG_DSN is set — using external PostgreSQL (skipping testcontainers)")
+
+		db, err := sql.Open("pgx", dsn)
+		if err != nil {
+			t.Fatalf("open sql.DB (external): %v", err)
+		}
+		if err := db.PingContext(ctx); err != nil {
+			t.Fatalf("ping external PostgreSQL: %v", err)
+		}
+		t.Cleanup(func() { _ = db.Close() })
+
+		pool, err := pgxpool.New(ctx, dsn)
+		if err != nil {
+			t.Fatalf("pgxpool.New (external): %v", err)
+		}
+		t.Cleanup(func() { pool.Close() })
+
+		return db, pool
+	}
+
+	// ── testcontainers: spin up a fresh postgres:16-alpine ─────────────────
 	container, err := tcpostgres.Run(ctx,
 		"postgres:16-alpine",
 		tcpostgres.WithDatabase("golden_test"),
