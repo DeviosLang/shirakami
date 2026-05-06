@@ -146,7 +146,7 @@ func runServer(cmd *cobra.Command, args []string) error {
 			Secret:    cfg.Webhook.Secret,
 			Commenter: commenter,
 			Launch: func(taskID, inputDiff, inputDesc, cacheKey string) {
-				go srv.runAnalysis(taskID, inputDiff, inputDesc, cacheKey, "", cfg.Server.DefaultModes)
+				go srv.runAnalysis(taskID, inputDiff, inputDesc, cacheKey, "", cfg.Server.DefaultModes, "")
 			},
 		},
 	)
@@ -212,6 +212,12 @@ type SubmitTaskRequest struct {
 	Branches []BranchEntry `json:"branches,omitempty"`
 
 	Modes []string `json:"modes"` // optional: ["chain","e2e","ut"] – empty = all
+
+	// ExtraPrompt is optional business-context text injected into the e2e scenario
+	// and UT follow-up prompts. Use it to improve accuracy when domain knowledge
+	// cannot be inferred from code alone.
+	// Example: "This service uses SM4 encryption; always verify the key-loading path."
+	ExtraPrompt string `json:"extra_prompt,omitempty"`
 }
 
 // BranchEntry is one repo+branch pair inside the Branches list.
@@ -428,7 +434,7 @@ func (s *apiServer) submitTask(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Launch analysis in background (semaphore controls concurrency).
-	go s.runAnalysis(task.ID, req.InputDiff, req.InputDesc, cacheKey, req.SourceRepo, modes)
+	go s.runAnalysis(task.ID, req.InputDiff, req.InputDesc, cacheKey, req.SourceRepo, modes, req.ExtraPrompt)
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusAccepted)
@@ -652,7 +658,7 @@ func (s *apiServer) clearProgress(taskID string) {
 }
 
 // runAnalysis runs the analysis respecting the semaphore concurrency limit.
-func (s *apiServer) runAnalysis(taskID, inputDiff, inputDesc, cacheKey, sourceRepo string, modes []string) {
+func (s *apiServer) runAnalysis(taskID, inputDiff, inputDesc, cacheKey, sourceRepo string, modes []string, extraPrompt string) {
 	ctx := context.Background()
 	log := logger.S()
 
@@ -741,6 +747,7 @@ func (s *apiServer) runAnalysis(taskID, inputDiff, inputDesc, cacheKey, sourceRe
 		Description: inputDesc,
 		SourceRepo:  sourceRepo,
 		Modes:       modes,
+		ExtraPrompt: extraPrompt,
 	})
 	if err != nil {
 		log.Errorw("analysis failed", "task_id", taskID, "err", err)

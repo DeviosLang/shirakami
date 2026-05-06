@@ -53,3 +53,29 @@ changes:
   - repo: order-service
     diff: ./diffs/order.patch
     desc: 更新订单状态接口
+
+# ──────────────────────────────────────────────────────────────
+# 多 patch 联合分析（--analysis 标志所使用的独立 YAML 格式）
+# 注意：以下为独立 analysis config 文件的格式示例，
+#       与上面的 shirakami.yaml 主配置文件是两个不同的文件。
+#       使用方式：shirakami analyze --analysis ./my-analysis.yaml --config shirakami.yaml
+# ──────────────────────────────────────────────────────────────
+#
+# source_repo: payment-service
+# description: "MR-1234 + MR-1235 联合影响分析"
+#
+# # extra_prompt：注入到 e2e/UT 场景生成 prompt 的业务上下文（可选）
+# # 适合沉淀无法从代码推断的领域知识，例如加密规范、外部系统 SLA、测试框架要求
+# extra_prompt: |
+#   该服务通过 SM4 国密算法加密磁盘，密钥由 KMS 服务下发。
+#   e2e 场景必须覆盖：KMS 不可达时的降级路径、加密设备挂载后 /dev/vd* 状态验证。
+#   UT mock 需模拟 libvirt.open() 和 kms.GetKey() 两个外部调用。
+#
+# patches:
+#   - path: ./diffs/mr1234.patch
+#     description: "修复支付超时重试逻辑"
+#   - path: ./diffs/mr1235.patch
+#     description: "更新订单状态接口"
+#
+# scope:
+#   only_cross_repos: [order-service, api-gateway]  # 只分析这些仓库的跨仓调用

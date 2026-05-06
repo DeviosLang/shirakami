@@ -15,6 +15,7 @@ import (
 //
 //	source_repo: vstation_compute
 //	description: "MR1681 + MR1782 combined impact analysis"
+//	extra_prompt: "This service manages KVM block devices; verify libvirt XML changes in every e2e scenario."
 //	patches:
 //	  - path: /app/diffs/mr1681.patch
 //	    description: "Python 2/3 compat fix"
@@ -25,6 +26,9 @@ import (
 type AnalysisInputConfig struct {
 	SourceRepo  string          `yaml:"source_repo"`
 	Description string          `yaml:"description"`
+	// ExtraPrompt is optional business-context text injected into the e2e
+	// and UT follow-up prompts for all patches in this config.
+	ExtraPrompt string          `yaml:"extra_prompt,omitempty"`
 	Patches     []PatchConfig   `yaml:"patches"`
 	Scope       *ScopeConfig    `yaml:"scope,omitempty"`
 }
@@ -104,6 +108,7 @@ func (c *AnalysisInputConfig) ToAnalysisInput() (AnalysisInput, error) {
 		Description: c.Description,
 		SourceRepo:  c.SourceRepo,
 		PatchInfo:   patchInfos,
+		ExtraPrompt: c.ExtraPrompt,
 	}
 	if c.Scope != nil {
 		input.ScopeOnlyRepos = c.Scope.OnlyCrossRepos

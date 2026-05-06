@@ -81,6 +81,45 @@ cp config/shirakami.example.yaml shirakami.yaml
 ./bin/shirakami analyze --config shirakami.yaml --diff ./changes.patch --format json
 ```
 
+#### 多 patch 联合分析（`--analysis` YAML 配置文件）
+
+当需要同时分析多个 patch（例如关联 MR），或希望**固化业务上下文**（`extra_prompt`）以便复用，可使用独立的 analysis YAML：
+
+```yaml
+# my-analysis.yaml
+source_repo: payment-service
+description: "MR-1234 + MR-1235 联合影响分析"
+
+# extra_prompt：注入到 e2e/UT 场景生成 prompt 的业务上下文（可选）
+# 适合沉淀无法从代码推断的领域知识，避免每次 HTTP 请求重复填写
+extra_prompt: |
+  该服务通过 SM4 国密算法加密磁盘，密钥由 KMS 服务下发。
+  e2e 场景必须覆盖：KMS 不可达时的降级路径、加密设备挂载后 /dev/vd* 状态验证。
+  UT mock 需模拟 libvirt.open() 和 kms.GetKey() 两个外部调用。
+
+patches:
+  - path: ./diffs/mr1234.patch
+    description: "修复支付超时重试逻辑"
+  - path: ./diffs/mr1235.patch
+    description: "更新订单状态接口"
+
+scope:
+  only_cross_repos: [order-service, api-gateway]  # 可选，只分析这些仓库的跨仓调用
+```
+
+```bash
+./bin/shirakami analyze --config shirakami.yaml --analysis my-analysis.yaml
+```
+
+`extra_prompt` 字段说明：
+
+| 用法 | 场景 |
+|------|------|
+| YAML `extra_prompt`（`--analysis` 文件） | **沉淀型**：业务知识固化到文件，CI / 日常分析复用 |
+| HTTP API `extra_prompt`（见下文） | **即席型**：单次请求临时补充，灵活但不持久 |
+
+两种方式的 `extra_prompt` 内容语义完全相同，均注入到 e2e 场景生成和 UT 建议 prompt 的末尾。
+
 ### 6. 构建并更新符号图索引（Layer B）
 
 符号图索引是 Layer B 的基础，存储在 PostgreSQL `symbol_nodes` / `symbol_edges` 表中。  
@@ -298,6 +337,7 @@ Content-Type: application/json
 | `branches[].repo` | string | 仓库名（来自 `/api/v1/repos` 的 `name`） |
 | `branches[].branch` | string | 功能分支名 |
 | `modes` | string[] | 分析模式，省略则全跑：`"chain"` \| `"e2e"` \| `"ut"` |
+| `extra_prompt` | string | 业务上下文补充（可选）。注入到 e2e/UT 场景生成 prompt，用于补充 LLM 无法从代码推断的领域知识，例如加密算法规范、外部系统约束、测试框架要求等 |
 
 **方式 A：直接传 diff**
 
@@ -337,6 +377,27 @@ curl -X POST http://localhost:8080/api/v1/tasks \
     "modes": ["chain","e2e","ut"]
   }'
 ```
+
+**方式 D：附带业务上下文（extra_prompt）**
+
+当 LLM 无法从代码本身推断出关键领域知识时，可通过 `extra_prompt` 补充，使生成的 e2e / UT 场景更贴近实际测试要求。
+
+```bash
+curl -X POST http://localhost:8080/api/v1/tasks \
+  -H "Content-Type: application/json" \
+  -d '{
+    "source_repo":  "cvm_api",
+    "input_branch": "feature/encrypt-disk-v2",
+    "modes": ["e2e","ut"],
+    "extra_prompt": "该服务使用 SM4 国密算法加密磁盘，密钥通过 KMS 加载。e2e 场景必须覆盖：1) KMS 不可达时的降级路径；2) 加密设备挂载后 /dev/vd* 状态验证；3) libvirt XML 中 encryption 字段正确写入。UT mock 需模拟 libvirt.open() 和 kms.GetKey() 两个外部调用。"
+  }'
+```
+
+`extra_prompt` 使用建议：
+- **领域约束**：外部系统 SLA、加密规范、幂等要求等
+- **测试框架**：指定 mock 库、测试工具（如 `pytest-mock`、`gomock`）
+- **验证重点**：明确列出必须验证的副作用（DB 字段、MQ 消息、日志行）
+- **不要**：重复描述 diff 内容（LLM 已经看过代码），保持简洁
 
 返回 `202 Accepted`：
 

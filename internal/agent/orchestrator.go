@@ -39,6 +39,12 @@ type AnalysisInput struct {
 	// Valid values: "chain", "e2e", "ut". Empty slice means run all.
 	// "e2e" enables per-entry-point scenario generation; "ut" enables UT analysis.
 	Modes []string
+	// ExtraPrompt is an optional free-text hint injected into the e2e scenario
+	// and UT follow-up prompts. Use it to provide business context that helps
+	// the LLM generate more accurate test scenarios (e.g. "this service uses
+	// SM4 encryption; verify the key-loading path in every scenario").
+	// Supplied per-request via the HTTP API or per-patch via YAML config.
+	ExtraPrompt string
 }
 
 // PatchRef describes one patch in a multi-patch analysis.
@@ -135,6 +141,8 @@ type Orchestrator struct {
 	// at the start of Run() and consumed by runWorkerBatch() to pass to Workers.
 	// Empty slice means all passes are enabled.
 	modes []string
+	// extraPrompt is optional business-context text injected into e2e/UT prompts.
+	extraPrompt string
 }
 
 // IndexGraph is the interface consumed by Orchestrator for deterministic analysis.
@@ -249,6 +257,7 @@ func (o *Orchestrator) Run(ctx context.Context, input AnalysisInput) (*AnalysisO
 
 	// Capture modes for this run so runWorkerBatch can pass them to Workers.
 	o.modes = input.Modes
+	o.extraPrompt = input.ExtraPrompt
 
 	// Resolve max rounds early so we can log the mode.
 	maxRounds := o.maxRounds
@@ -896,6 +905,7 @@ func (o *Orchestrator) runWorkerBatch(ctx context.Context, pending map[string][]
 					ContractHints:    o.contractHints,
 					ImportContext:    o.importContext,
 					Modes:            o.modes,
+					ExtraPrompt:      o.extraPrompt,
 				})
 				mu.Lock()
 				if err != nil {

@@ -45,6 +45,10 @@ type WorkerTask struct {
 	// Valid values: "chain", "e2e", "ut". Empty slice means run all.
 	// "e2e" enables runScenarioAnalysis; "ut" enables runUTAnalysis.
 	Modes []string
+	// ExtraPrompt is optional business-context text appended to the e2e scenario
+	// and UT follow-up prompts. Helps the LLM generate more accurate test cases
+	// when domain knowledge is not inferable from the code alone.
+	ExtraPrompt string
 }
 
 // SearchResult holds one raw ripgrep hit — file path, line, and caller name.
@@ -514,7 +518,7 @@ func (w *WorkerAgent) Analyse(ctx context.Context, task WorkerTask) (*WorkerResu
 	// once with an explicit "strict JSON" reminder (mirrors runUTAnalysis).
 	if len(workerResult.EntryPoints) > 0 && workerModeEnabled(task.Modes, "e2e") {
 		workerResult.EntryScenarios = w.runScenarioAnalysis(
-			ctx, taskID, result.Content, task.ChangedFunctions, workerResult.EntryPoints,
+			ctx, taskID, result.Content, task.ChangedFunctions, workerResult.EntryPoints, task.ExtraPrompt,
 		)
 		log.Infow("worker.scenarios_done",
 			"repo", task.RepoName,
@@ -535,7 +539,7 @@ func (w *WorkerAgent) Analyse(ctx context.Context, task WorkerTask) (*WorkerResu
 		}
 	}
 	if len(realFuncs) > 0 && workerModeEnabled(task.Modes, "ut") {
-		workerResult.UTAnalyses = w.runUTAnalysis(ctx, taskID, result.Content, realFuncs)
+		workerResult.UTAnalyses = w.runUTAnalysis(ctx, taskID, result.Content, realFuncs, task.ExtraPrompt)
 	}
 
 	return workerResult, nil
@@ -555,6 +559,7 @@ func (w *WorkerAgent) runScenarioAnalysis(
 	priorContent string,
 	changedFunctions []string,
 	entryPoints []CallNode,
+	extraPrompt string,
 ) []EntryPointScenario {
 	log := logger.S()
 	const maxScenarioChunkSize = 5
@@ -576,7 +581,7 @@ func (w *WorkerAgent) runScenarioAnalysis(
 
 	for idx, chunk := range chunks {
 		chunkStart := time.Now()
-		prompt := buildScenarioFollowUp(changedFunctions, chunk)
+		prompt := buildScenarioFollowUp(changedFunctions, chunk, extraPrompt)
 		resp, err := w.loop.RunFollowUpNoTools(ctx, taskID, priorContent, prompt)
 		if err != nil {
 			log.Warnw("worker.scenario_chunk_failed",
@@ -646,6 +651,7 @@ func (w *WorkerAgent) runUTAnalysis(
 	taskID string,
 	priorContent string,
 	realFuncs []string,
+	extraPrompt string,
 ) []UTAnalysis {
 	log := logger.S()
 	const maxUTChunkSize = 8
@@ -685,7 +691,7 @@ func (w *WorkerAgent) runUTAnalysis(
 
 	for idx, chunk := range chunks {
 		chunkStart := time.Now()
-		prompt := buildUTFollowUp(chunk)
+		prompt := buildUTFollowUp(chunk, extraPrompt)
 		resp, err := w.loop.RunFollowUpNoTools(ctx, taskID, priorContent, prompt)
 		if err != nil {
 			log.Warnw("worker.ut_chunk_failed",
@@ -746,7 +752,7 @@ func (w *WorkerAgent) runUTAnalysis(
 	}
 	if len(missing) > 0 && len(missing) <= maxUTChunkSize {
 		sweepStart := time.Now()
-		prompt := buildUTFollowUp(missing)
+		prompt := buildUTFollowUp(missing, extraPrompt)
 		resp, err := w.loop.RunFollowUpNoTools(ctx, taskID, priorContent, prompt)
 		if err == nil && resp != nil {
 			parsed := parseUTAnalyses(resp.Content)
@@ -1082,9 +1088,18 @@ func formatList(items []string) string {
 	return sb.String()
 }
 
+// extraPromptSection returns a formatted extra-prompt block to append to follow-up
+// prompts, or an empty string when extraPrompt is blank.
+func extraPromptSection(extraPrompt string) string {
+	if extraPrompt == "" {
+		return ""
+	}
+	return "\n\n--- Business context (provided by the caller, use to improve scenario accuracy) ---\n" + extraPrompt + "\n--- End of business context ---"
+}
+
 // buildScenarioFollowUp constructs the follow-up prompt asking the LLM to generate
 // per-entry-point test scenarios based on the diff-changed functions and found entry points.
-func buildScenarioFollowUp(changedFunctions []string, entryPoints []CallNode) string {
+func buildScenarioFollowUp(changedFunctions []string, entryPoints []CallNode, extraPrompt string) string {
 	// Build entry point list.
 	var epList strings.Builder
 	for _, ep := range entryPoints {
@@ -1151,7 +1166,7 @@ Output ONLY this JSON (no explanation):
     }
   ]
 }
-`+"```",
+`+"```"+extraPromptSection(extraPrompt),
 		epList.String(),
 		cfList.String(),
 	)
@@ -1228,7 +1243,7 @@ type llmUTOutput struct {
 
 // buildUTFollowUp asks the LLM for unit-test suggestions focused on each
 // changed function's internal logic.
-func buildUTFollowUp(changedFunctions []string) string {
+func buildUTFollowUp(changedFunctions []string, extraPrompt string) string {
 	var cfList strings.Builder
 	for _, fn := range changedFunctions {
 		fmt.Fprintf(&cfList, "  - %s\n", fn)
@@ -1289,7 +1304,7 @@ Output ONLY this JSON in a ` + "```json" + ` fenced block — no prose before or
     }
   ]
 }
-`+"```",
+`+"```"+extraPromptSection(extraPrompt),
 		len(changedFunctions),
 		cfList.String(),
 	)
