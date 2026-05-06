@@ -341,15 +341,82 @@ Content-Type: application/json
 
 **方式 A：直接传 diff**
 
+`input_diff` 是标准的 unified diff 格式字符串，有以下几种生成方式：
+
+<details>
+<summary>如何生成 input_diff（点击展开）</summary>
+
+**① 本地工作区未提交的改动**
+
 ```bash
+# 当前工作区所有未暂存/已暂存的变更
+git diff HEAD > changes.patch
+
+# 仅已暂存（staged）的改动
+git diff --cached > changes.patch
+```
+
+**② 两个提交之间的差异**
+
+```bash
+# 某次提交引入的变更（与其父提交比较）
+git show <commit-sha> > changes.patch
+
+# 两个 commit/tag 之间
+git diff <old-sha>..<new-sha> > changes.patch
+```
+
+**③ 功能分支 vs 主干（three-dot diff，推荐用于 MR/PR 场景）**
+
+```bash
+# 从 main 分叉以来，feature 分支引入的所有变更
+git diff origin/main...feature/fix-timeout > changes.patch
+
+# 等价形式（明确指定 merge-base）
+git diff $(git merge-base origin/main feature/fix-timeout) feature/fix-timeout > changes.patch
+```
+
+**④ GitLab / GitHub MR·PR 直接下载 patch**
+
+```bash
+# GitLab（需要 PRIVATE-TOKEN）
+curl -H "PRIVATE-TOKEN: <token>" \
+  "https://gitlab.example.com/api/v4/projects/<id>/merge_requests/<iid>/diffs" \
+  | jq -r '.[].diff' > changes.patch
+
+# GitHub
+curl -H "Authorization: token <token>" \
+  -H "Accept: application/vnd.github.v3.diff" \
+  "https://api.github.com/repos/<owner>/<repo>/pulls/<number>" \
+  > changes.patch
+```
+
+**⑤ 将 patch 文件内联到 JSON（推荐用 jq 转义）**
+
+```bash
+# jq 自动处理换行符、引号等转义
+INPUT_DIFF=$(cat changes.patch | jq -Rs .)
+
 curl -X POST http://localhost:8080/api/v1/tasks \
   -H "Content-Type: application/json" \
-  -d '{
-    "input_diff": "--- a/payment.go\n+++ b/payment.go\n...",
-    "input_desc": "修改支付超时重试逻辑",
-    "source_repo": "payment-service",
-    "modes": ["chain","e2e","ut"]
-  }'
+  -d "{\"input_diff\": $INPUT_DIFF, \"source_repo\": \"payment-service\"}"
+```
+
+> **提示**：如果只是想快速触发分析，推荐直接用**方式 B（`input_branch`）**，server 会自动执行 git fetch + three-dot diff，无需手动生成 patch 文件。
+
+</details>
+
+```bash
+# 生成 patch 后直接通过 jq 内联提交
+INPUT_DIFF=$(git diff origin/main...feature/fix-timeout | jq -Rs .)
+curl -X POST http://localhost:8080/api/v1/tasks \
+  -H "Content-Type: application/json" \
+  -d "{
+    \"input_diff\": $INPUT_DIFF,
+    \"input_desc\": \"修改支付超时重试逻辑\",
+    \"source_repo\": \"payment-service\",
+    \"modes\": [\"chain\",\"e2e\",\"ut\"]
+  }"
 ```
 
 **方式 B：单仓分支（server 自动算 diff）**
