@@ -80,6 +80,37 @@ cp config/shirakami.example.yaml shirakami.yaml
 ./bin/shirakami analyze --config shirakami.yaml --diff ./changes.patch --format json
 ```
 
+### 6. 构建并更新符号图索引（Layer B）
+
+符号图索引是 Layer B 的基础，存储在 PostgreSQL `symbol_nodes` / `symbol_edges` 表中。  
+**每次代码仓库更新（git pull / checkout 新分支）后，都需要同步索引**，否则 Layer B 使用旧快照，自动降级到 LLM（Layer C）兜底。
+
+```bash
+# 查看所有仓库的索引状态（CURRENT / STALE / NOT INDEXED）
+./bin/shirakami index check --config shirakami.yaml
+
+# 增量更新（只重新索引有变化的仓库，检测依据：当前 HEAD 是否与上次 indexed commit 一致）
+./bin/shirakami index update --config shirakami.yaml
+
+# 只更新特定仓库
+./bin/shirakami index update --config shirakami.yaml --repo vstation_compute
+
+# 全量重建某个仓库（先删除旧数据再完整重新索引）
+./bin/shirakami index rebuild --config shirakami.yaml --repo vstation_compute
+```
+
+**索引触发时机建议：**
+
+| 场景 | 操作 |
+|------|------|
+| 日常分析前（代码已 pull） | `index update`（增量，几秒内完成无变化的仓库） |
+| 切换 feature 分支后 | `index update --repo <name>`（只更新那个仓库） |
+| 仓库重大重构 / 符号数量异常 | `index rebuild --repo <name>`（全量重建） |
+| CI 流水线 / 定期任务 | `index update`（全量增量扫描） |
+
+**语言支持：** Go 仓库（有 `go.mod`）通过 `go/ast` + `go/types` 构建精确调用边，覆盖率 ≥ 90%。  
+Python 仓库（有 `requirements.txt` / `setup.py` / `pyproject.toml`）通过 pyright 索引，自动降级至 Layer C 兜底。
+
 ## 配置文件说明
 
 ```yaml
@@ -325,17 +356,24 @@ docker run --rm -v /mnt/shirakami:/src -w /src golang:1.25-alpine go test ./...
 
 ### Golden Test 基准框架
 
-`tests/golden/` 目录维护人工标注的 golden cases，覆盖 Go / Python 多种变更场景：
+`tests/golden/` 目录维护人工标注的 golden cases，覆盖 Go / Python / 跨仓库多种变更场景。
 
-| case | 难度 | 场景 |
-|------|------|------|
-| `go-grpc-server-worker` | ★★ | Go 新方法 + 重构 |
-| `go-prometheus-counter-vec` | ★★ | 接口签名变更 + 跨文件传播 |
-| `go-gin-context-json` | ★ | 方法体改动（无新函数声明） |
-| `go-cache-invalidation` | ★ | 方法签名变更 + 新方法 |
-| `py-fastapi-serialize-response` | ★★ | Python 函数签名扩展 |
-| `py-celery-task-retry` | ★★ | MQ 任务入口 + 重试链路 |
-| `cross-grpc-microservices` | ★★★ | 跨仓库 gRPC 调用 |
+**当前基线（Layer A，ParseDiffHunks 文件覆盖率）：12 个 case 全部 file_recall = 1.00**
+
+| case | 难度 | 场景 | file_recall |
+|------|------|------|-------------|
+| `go-gin-context-json` | ★ | 方法体改动（无新函数声明） | 1.00 |
+| `go-cache-invalidation` | ★ | 方法签名变更 + 新方法 | 1.00 |
+| `shallow-config-change` | ★ | 配置文件小改动 | 1.00 |
+| `single-file-utils-change` | ★ | 单文件工具函数变更 | 1.00 |
+| `go-grpc-server-worker` | ★★ | Go 新方法 + 重构 | 1.00 |
+| `go-prometheus-counter-vec` | ★★ | 接口签名变更 + 跨文件传播 | 1.00 |
+| `py-fastapi-serialize-response` | ★★ | Python 函数签名扩展 | 1.00 |
+| `py-celery-task-retry` | ★★ | MQ 任务入口 + 重试链路 | 1.00 |
+| `wide-impact-common-utils` | ★★ | 公共工具函数广泛影响 | 1.00 |
+| `cross-grpc-microservices` | ★★★ | 跨仓库 gRPC 调用 | 1.00 |
+| `cross-repo-dispatch` | ★★★ | 跨仓库调度链路 | 1.00 |
+| `compute-mr1681-encrypt-disk` | ★★★ | 真实 MR：Python 磁盘加密 + 跨仓库影响 | 1.00 |
 
 ```bash
 # 运行 Layer A 测试（纯文本 diff 解析，无 Docker）
@@ -406,7 +444,16 @@ Token 方式：将 URL 中的 `git@github.com:org/repo.git` 改为 `https://TOKE
 
 **Q: Symbol Graph（Layer B）什么时候生效**
 
-Layer B 对 Go 仓库有效（通过 `go/packages` + ripgrep 构建符号边），Python 仓库自动降级到 Layer C（LLM）。`go-cache-invalidation` 私有 case 用于测试 Layer B 自身，不对外提交。
+Layer B 对 Go 仓库有效（通过 `go/ast` + `go/types` 构建精确调用边，覆盖率 ≥ 90%），Python 仓库自动降级到 Layer C（LLM）。
+
+Layer B 生效的前提是**已对目标仓库建立索引**。若索引未建立或已过时（`index check` 显示 STALE），分析时自动降级到 Layer C，不影响结果正确性，但 LLM 消耗增加。
+
+更新方式见「[构建并更新符号图索引](#6-构建并更新符号图索引layer-b)」章节。`go-cache-invalidation` 私有 case 用于测试 Layer B 自身，不对外提交。
+
+**Q: 代码仓库切换了分支，索引需要更新吗**
+
+需要。索引以 commit hash 为版本标识，切换分支后 HEAD 变化，`index check` 会显示 STALE。
+执行 `./bin/shirakami index update --repo <name>` 即可增量更新该仓库索引（通常几十秒内完成）。
 
 ## License
 
