@@ -180,7 +180,7 @@ Impact Summary
 启动 API 服务器：
 
 ```bash
-./bin/shirakami-server --config shirakami.yaml --listen :8080
+./bin/shirakami-server --config shirakami.yaml --addr :8080
 ```
 
 ### 接口列表
@@ -188,51 +188,79 @@ Impact Summary
 #### 提交分析任务
 
 ```
-POST /analyze
+POST /api/v1/tasks
 Content-Type: application/json
 
 {
-  "diff": "--- a/payment.go\n+++ b/payment.go\n...",
-  "desc": "修改支付超时重试逻辑"
+  "input_diff": "--- a/payment.go\n+++ b/payment.go\n...",
+  "input_desc": "修改支付超时重试逻辑"
 }
 
-Response:
+Response 202:
 {
-  "task_id": "550e8400-e29b-41d4-a716-446655440000",
-  "status": "pending"
+  "id": "550e8400-e29b-41d4-a716-446655440000",
+  "status": "pending",
+  "input_type": "combined",
+  "created_at": "2024-01-01T00:00:00Z"
 }
+```
+
+#### 查询任务列表
+
+```
+GET /api/v1/tasks
 ```
 
 #### 查询任务结果
 
 ```
-GET /tasks/{task_id}
+GET /api/v1/tasks/{id}
 
-Response:
+Response（completed 状态时含 call_chain / entry_points）:
 {
-  "task_id": "...",
+  "id": "...",
   "status": "completed",
-  "result": { ... }
+  "call_chain": [...],
+  "entry_points": [...],
+  "token_usage": 12345,
+  "step_count": 42
 }
 ```
 
 #### 提交反馈
 
 ```
-POST /feedback
+PUT /api/v1/tasks/{id}/feedback
 Content-Type: application/json
 
 {
-  "task_id": "550e8400-e29b-41d4-a716-446655440000",
   "type": "false_positive",
   "comment": "OrderService.UpdateStatus 实际不被调用"
 }
 ```
 
+type 取值：`false_positive` / `false_negative` / `correct`
+
+#### Webhook（GitLab MR / GitHub PR 自动触发）
+
+```
+POST /api/v1/webhook
+```
+
+支持 GitLab Merge Request Hook（`X-Gitlab-Event`）和 GitHub pull_request 事件（`X-GitHub-Event`）。  
+MR/PR open、update、reopen 时自动创建分析任务；close/merge 忽略。  
+支持 GitLab plain-text token 和 GitHub HMAC-SHA256 签名验证。
+
 #### Prometheus 指标
 
 ```
 GET /metrics
+```
+
+#### 健康检查
+
+```
+GET /healthz
 ```
 
 ## 架构概述
@@ -321,6 +349,26 @@ go test ./tests/golden/... -short -run TestParseDiffHunks_GoldenCases/go-gin-con
 ```
 
 Golden case 来源与设计思路详见 [`tests/golden/SOURCES.md`](tests/golden/SOURCES.md)。
+
+### Benchmark CLI 子命令
+
+```bash
+# 遍历所有 golden cases，输出 file_recall / func_recall 汇总表
+./bin/shirakami benchmark run --golden-dir tests/golden/cases
+
+# JSON 格式输出
+./bin/shirakami benchmark run --golden-dir tests/golden/cases --format json
+
+# 单 case 详细调试（打印 miss/extra/match）
+./bin/shirakami benchmark debug go-gin-context-json
+
+# 验证 ParseDiffHunks 文件覆盖率（CI 用，<0.80 exit 1）
+./bin/shirakami benchmark verify --golden-dir tests/golden/cases
+
+# Shadow parity 人工判定 / LLM 自动判定
+./bin/shirakami benchmark judge   --id <record-id> --verdict tp
+./bin/shirakami benchmark autojudge --config shirakami.yaml
+```
 
 ### 集成测试
 
