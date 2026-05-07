@@ -823,6 +823,19 @@ func (o *Orchestrator) extractChangedFunctions(ctx context.Context, input Analys
 		diffForLLM = filterDiffToFiles(input.Diff, uncoveredFiles)
 	}
 
+	// Large-diff guard: if the diff to send exceeds 200 KB, compress it to
+	// structural lines only (file headers, hunk headers, function declaration
+	// lines). This keeps token usage manageable and avoids LLM timeouts while
+	// retaining all the information needed to identify changed function names.
+	const largeDiffThreshold = 200 * 1024 // 200 KB
+	if len(diffForLLM) > largeDiffThreshold {
+		diffForLLM = compressDiffForExtract(diffForLLM)
+		log.Infow("extract.large_diff_compressed",
+			"original_bytes", len(input.Diff),
+			"compressed_bytes", len(diffForLLM),
+		)
+	}
+
 	sysPrompt := fmt.Sprintf(`You are a code diff parser. Your ONLY job is to extract changed production function names.
 
 Workspace: %s
@@ -895,6 +908,56 @@ func filterDiffToFiles(diff string, files map[string]bool) string {
 		}
 	}
 	return sb.String()
+}
+
+// compressDiffForExtract reduces a large diff to structural lines only:
+// file headers (diff --git / --- / +++), hunk headers (@@…@@), and lines that
+// introduce a function/method/class definition (def , func , class , etc.).
+// The result is much smaller in bytes but retains all information needed to
+// identify which functions were changed — suitable for the LLM extract pass.
+func compressDiffForExtract(diff string) string {
+	var sb strings.Builder
+	for _, line := range strings.Split(diff, "\n") {
+		if isStructuralDiffLine(line) {
+			sb.WriteString(line)
+			sb.WriteByte('\n')
+		}
+	}
+	return sb.String()
+}
+
+// isStructuralDiffLine returns true for lines that carry structural meaning
+// in a diff: file/hunk headers and function/class declaration lines.
+func isStructuralDiffLine(line string) bool {
+	// File and hunk headers.
+	if strings.HasPrefix(line, "diff ") ||
+		strings.HasPrefix(line, "--- ") ||
+		strings.HasPrefix(line, "+++ ") ||
+		strings.HasPrefix(line, "@@ ") {
+		return true
+	}
+	// Added or context lines that begin a function/class/method declaration.
+	// Strip the leading diff marker (+/-/ ) before checking.
+	bare := line
+	if len(line) > 0 && (line[0] == '+' || line[0] == '-' || line[0] == ' ') {
+		bare = line[1:]
+	}
+	trimmed := strings.TrimLeft(bare, " \t")
+	// Python / Go / JS / TS / Java / C / C++ function and class starters.
+	return strings.HasPrefix(trimmed, "def ") ||
+		strings.HasPrefix(trimmed, "async def ") ||
+		strings.HasPrefix(trimmed, "class ") ||
+		strings.HasPrefix(trimmed, "func ") ||
+		strings.HasPrefix(trimmed, "fun ") || // Kotlin
+		strings.HasPrefix(trimmed, "public ") ||
+		strings.HasPrefix(trimmed, "private ") ||
+		strings.HasPrefix(trimmed, "protected ") ||
+		strings.HasPrefix(trimmed, "static ") ||
+		strings.HasPrefix(trimmed, "override ") ||
+		strings.HasPrefix(trimmed, "export function ") ||
+		strings.HasPrefix(trimmed, "export default function ") ||
+		strings.HasPrefix(trimmed, "export const ") ||
+		strings.HasPrefix(trimmed, "export async function ")
 }
 
 // dedupeStrings removes duplicate strings from a slice, preserving order.
