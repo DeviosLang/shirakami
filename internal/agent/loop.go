@@ -2,16 +2,28 @@ package agent
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/DeviosLang/shirakami/internal/checkpoint"
+	"github.com/DeviosLang/shirakami/internal/compress"
 	"github.com/DeviosLang/shirakami/internal/llm"
 	"github.com/DeviosLang/shirakami/internal/logger"
 )
 
 const maxSteps = 300
+
+// Sliding window truncation constants.
+// When the message history exceeds slidingWindowThreshold entries, the loop
+// trims the middle to keep context size bounded before each LLM call.
+const (
+	slidingWindowToolResults = 40  // keep last N ToolResultMessage entries from tail
+	slidingWindowConv        = 20  // keep last K AssistantMessage entries from tail
+	slidingWindowThreshold   = 80  // only truncate when message count exceeds this
+)
 
 // Tool is the interface that any executable tool must satisfy.
 type Tool interface {
@@ -46,12 +58,23 @@ type LLMClient interface {
 //  5. stepCount >= maxSteps    → force-terminate and return partial result.
 //
 // Each step is persisted via checkpointer so the loop can resume after a crash.
+// Before each LLM call the TokenBudgetManager checks token usage and applies
+// the appropriate compression strategy (Plan A–D) when thresholds are exceeded.
 type AgentLoop struct {
 	llm          LLMClient
 	tools        []Tool
 	budget       int // max steps override (0 = use default maxSteps)
 	checkpointer *checkpoint.FileCheckpointer
 	systemPrompt string
+	// budgetMgr is optional; when set it is invoked before each LLM call to
+	// apply token compression strategies (Plan A–D) as context usage grows.
+	budgetMgr *compress.TokenBudgetManager
+	// metrics is optional; when set, per-step and lifecycle events are recorded.
+	metrics MetricsRecorder
+	// metricsModel is the model name label used when recording LLM token metrics.
+	metricsModel string
+	// metricsTaskType is the task_type label (e.g. "worker", "triage") for token metrics.
+	metricsTaskType string
 }
 
 // NewAgentLoop constructs a new AgentLoop.
@@ -70,6 +93,24 @@ func NewAgentLoop(
 		checkpointer: cp,
 		systemPrompt: systemPrompt,
 	}
+}
+
+// WithBudgetManager attaches a TokenBudgetManager to the loop so that
+// four-tier token compression (Plan A–D) is applied before each LLM call.
+// Call this after NewAgentLoop when a compress.TokenBudgetManager is available.
+func (a *AgentLoop) WithBudgetManager(mgr *compress.TokenBudgetManager) *AgentLoop {
+	a.budgetMgr = mgr
+	return a
+}
+
+// WithMetrics attaches Prometheus metrics to the loop.
+// model is the LLM model name (e.g. "gpt-4o") used as the metric label.
+// taskType is a short label describing the loop's role (e.g. "worker", "triage", "followup").
+func (a *AgentLoop) WithMetrics(m MetricsRecorder, model, taskType string) *AgentLoop {
+	a.metrics = m
+	a.metricsModel = model
+	a.metricsTaskType = taskType
+	return a
 }
 
 // Run executes the agent loop for the given task string.
@@ -92,6 +133,11 @@ func (a *AgentLoop) Run(ctx context.Context, taskID string, task string) (*Resul
 		return nil, fmt.Errorf("load checkpoint: %w", err)
 	}
 
+	// Record checkpoint resume when we are continuing a previously saved run.
+	if stepCount > 0 && a.metrics != nil {
+		a.metrics.RecordCheckpointResumed()
+	}
+
 	// Main loop.
 	log := logger.S()
 	for {
@@ -106,6 +152,31 @@ func (a *AgentLoop) Run(ctx context.Context, taskID string, task string) (*Resul
 				StepCount: stepCount,
 				Truncated: true,
 			}, nil
+		}
+
+		// Sliding window: drop middle messages to bound context size.
+		if len(messages) > slidingWindowThreshold {
+			before := len(messages)
+			messages = slidingWindowTruncate(messages)
+			log.Debugw("loop.sliding_window",
+				"task_id", taskID,
+				"step", stepCount,
+				"before", before,
+				"after", len(messages),
+			)
+		}
+
+		// Apply token budget compression strategies (Plan A–D) before each LLM call.
+		// This prevents context overflow without requiring the caller to manage token counts.
+		if a.budgetMgr != nil {
+			if compressErr := a.budgetMgr.CheckAndCompress(ctx, &messages); compressErr != nil {
+				log.Warnw("loop.compress_failed",
+					"task_id", taskID,
+					"step", stepCount,
+					"err", compressErr.Error(),
+				)
+				// Non-fatal: proceed without compression — next step may still succeed.
+			}
 		}
 
 		stepStart := time.Now()
@@ -132,6 +203,11 @@ func (a *AgentLoop) Run(ctx context.Context, taskID string, task string) (*Resul
 			"total_tokens", resp.Usage.TotalTokens,
 			"duration_ms", time.Since(stepStart).Milliseconds(),
 		)
+
+		// Record per-step LLM token consumption.
+		if a.metrics != nil && resp.Usage.TotalTokens > 0 {
+			a.metrics.RecordLLMTokens(a.metricsModel, a.metricsTaskType, resp.Usage.TotalTokens)
+		}
 
 		// Append assistant turn to history.
 		assistantMsg := llm.AssistantMessage{
@@ -259,15 +335,20 @@ func (a *AgentLoop) executeTools(ctx context.Context, toolCalls []llm.ToolCall) 
 						"tool", tc.Name,
 						"panic", fmt.Sprintf("%v", r),
 					)
+					panicErr := fmt.Errorf("tool %s panicked: %v", tc.Name, r)
 					results[i] = llm.ToolResultMessage{
 						ToolCallID: tc.ID,
-						Content:    fmt.Sprintf("error: tool %s panicked: %v", tc.Name, r),
+						Content:    toolErrorResponse(tc.Name, panicErr),
 					}
 				}
 			}()
 			content, err := a.runTool(ctx, tc)
 			if err != nil {
-				content = fmt.Sprintf("error: %s", err.Error())
+				log.Warnw("loop.tool_error",
+					"tool", tc.Name,
+					"err", err.Error(),
+				)
+				content = toolErrorResponse(tc.Name, err)
 			}
 			results[i] = llm.ToolResultMessage{
 				ToolCallID: tc.ID,
@@ -288,6 +369,65 @@ func (a *AgentLoop) runTool(ctx context.Context, tc llm.ToolCall) (string, error
 		}
 	}
 	return "", fmt.Errorf("unknown tool %q", tc.Name)
+}
+
+// toolErrorResponse converts a tool execution error into a structured JSON hint
+// so the LLM can distinguish error categories and choose the right recovery strategy.
+//
+// Error categories and their hints:
+//   - not_found:   file/symbol missing → try ripgrep to locate the correct path
+//   - timeout:     search/LSP call timed out → reduce scope or use a simpler query
+//   - permission:  access denied → check file permissions or workspace configuration
+//   - unknown_tool: tool name not registered → check available tool list
+//   - tool_panic:  internal panic → report to operator, do not retry with same args
+//   - error:       all other errors → generic hint
+func toolErrorResponse(toolName string, err error) string {
+	msg := err.Error()
+	lower := strings.ToLower(msg)
+
+	type errResponse struct {
+		Error string `json:"error"`
+		Hint  string `json:"hint"`
+	}
+
+	var resp errResponse
+	switch {
+	case strings.Contains(lower, "no such file") ||
+		strings.Contains(lower, "file not found") ||
+		strings.Contains(lower, "does not exist") ||
+		strings.Contains(lower, "not found") ||
+		strings.Contains(lower, "no matches"):
+		resp = errResponse{
+			Error: "not_found",
+			Hint:  "use ripgrep to search for the correct file path before retrying",
+		}
+	case strings.Contains(lower, "timeout") ||
+		strings.Contains(lower, "context deadline exceeded") ||
+		strings.Contains(lower, "deadline exceeded"):
+		resp = errResponse{
+			Error: "timeout",
+			Hint:  "reduce search scope, use --max-count or a narrower pattern",
+		}
+	case strings.Contains(lower, "permission denied") ||
+		strings.Contains(lower, "access denied"):
+		resp = errResponse{
+			Error: "permission",
+			Hint:  "this file is not accessible in the current workspace; skip it",
+		}
+	case strings.Contains(lower, "unknown tool"):
+		resp = errResponse{
+			Error: "unknown_tool",
+			Hint:  fmt.Sprintf("tool %q is not available; choose from the registered tool list", toolName),
+		}
+	default:
+		resp = errResponse{
+			Error: "error",
+			Hint:  msg,
+		}
+	}
+
+	b, _ := json.Marshal(resp)
+	return string(b)
 }
 
 // loadCheckpoint tries to restore messages and stepCount from a saved checkpoint.
@@ -321,6 +461,46 @@ func (a *AgentLoop) seedMessages(task string) []llm.Message {
 	}
 	msgs = append(msgs, llm.UserMessage{Content: task})
 	return msgs
+}
+
+// slidingWindowTruncate trims a message history to keep context size bounded.
+//
+// Strategy:
+//  1. Extract "seed" messages — all leading messages before the first
+//     AssistantMessage (i.e. system prompt + initial task user message).
+//  2. From the remaining messages keep only the last
+//     (slidingWindowToolResults + slidingWindowConv) entries.
+//  3. Return seed + tail, discarding the middle.
+//
+// This guarantees the LLM always sees the original task context plus the most
+// recent working memory, regardless of how many steps have elapsed.
+func slidingWindowTruncate(msgs []llm.Message) []llm.Message {
+	// Step 1: find the end of the seed prefix (everything before the first
+	// AssistantMessage).
+	seedEnd := 0
+	for i, m := range msgs {
+		if _, ok := m.(llm.AssistantMessage); ok {
+			seedEnd = i
+			break
+		}
+		// If no AssistantMessage found, seedEnd stays 0 and we treat the
+		// entire slice as tail (nothing to seed-protect separately).
+		seedEnd = i + 1
+	}
+	seed := msgs[:seedEnd]
+	rest := msgs[seedEnd:]
+
+	// Step 2: keep the last (slidingWindowToolResults + slidingWindowConv) entries.
+	tailSize := slidingWindowToolResults + slidingWindowConv
+	if len(rest) > tailSize {
+		rest = rest[len(rest)-tailSize:]
+	}
+
+	// Step 3: combine.
+	result := make([]llm.Message, 0, len(seed)+len(rest))
+	result = append(result, seed...)
+	result = append(result, rest...)
+	return result
 }
 
 // lastContent extracts the Content from the last AssistantMessage in the slice,

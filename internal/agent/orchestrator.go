@@ -13,6 +13,7 @@ import (
 	"github.com/DeviosLang/shirakami/internal/checkpoint"
 	"github.com/DeviosLang/shirakami/internal/index"
 	"github.com/DeviosLang/shirakami/internal/logger"
+	"github.com/DeviosLang/shirakami/internal/memory"
 	"github.com/DeviosLang/shirakami/internal/resolve"
 	"github.com/DeviosLang/shirakami/internal/tool"
 )
@@ -136,6 +137,13 @@ type Orchestrator struct {
 	// pool is the PostgreSQL connection pool for Layer B DiffToSymbols queries.
 	// When nil, Layer B is skipped and only Layer A + LLM fallback are used.
 	pool *pgxpool.Pool
+	// layer1 is the long-term knowledge base backed by PostgreSQL.
+	// When non-nil, high-confidence CallNode results are asynchronously written
+	// back after each Worker round so future analyses can skip redundant searches.
+	layer1 *memory.Layer1
+	// metrics is optional Prometheus metrics sink. When non-nil, worker durations
+	// and ghost-node outcomes are recorded after each batch run.
+	metrics MetricsRecorder
 	// resolver is the business-level impact analyser built on top of the in-memory
 	// symbol graph. When set it supersedes the raw indexGraph calls inside
 	// runGraphAnalysis with proper symbol disambiguation, risk assessment,
@@ -245,6 +253,22 @@ func (o *Orchestrator) SetImportContext(ctx string) {
 // DiffToSymbols to map diff hunks to indexed symbols without LLM involvement.
 func (o *Orchestrator) SetPool(pool *pgxpool.Pool) {
 	o.pool = pool
+}
+
+// SetLayer1 injects the long-term knowledge base so that high-confidence
+// CallNode results are written back to PostgreSQL asynchronously after each
+// Worker round. This allows future analyses of the same functions to skip
+// redundant LLM search calls.
+func (o *Orchestrator) SetLayer1(l1 *memory.Layer1) *Orchestrator {
+	o.layer1 = l1
+	return o
+}
+
+// SetMetrics injects a Prometheus metrics sink.
+// When set, worker durations and ghost-node outcomes are recorded automatically.
+func (o *Orchestrator) SetMetrics(m MetricsRecorder) *Orchestrator {
+	o.metrics = m
+	return o
 }
 
 // SetResolver injects the business-level impact resolver for graph-based analysis.
@@ -451,6 +475,11 @@ func (o *Orchestrator) Run(ctx context.Context, input AnalysisInput) (*AnalysisO
 
 			// Collect ghost files (LLM-hallucinated paths filtered by filterGhostNodes).
 			output.GhostFiles = append(output.GhostFiles, result.GhostFiles...)
+
+			// Async write-back to Layer1: persist high-confidence nodes for future runs.
+			if o.layer1 != nil && result != nil {
+				o.writeBackToLayer1(result, "")
+			}
 
 			repoVisited[repoName] = true
 
@@ -974,6 +1003,7 @@ func (o *Orchestrator) runWorkerBatch(ctx context.Context, pending map[string][]
 				worker := NewWorkerAgentWithBudget(
 					o.llmClient, o.tools, o.cp, o.repos, o.workspaceDir, budget,
 				)
+				workerStart := time.Now()
 				res, err := worker.Analyse(ctx, WorkerTask{
 					RepoName:         j.repo,
 					RepoPath:         repoPath,
@@ -986,6 +1016,9 @@ func (o *Orchestrator) runWorkerBatch(ctx context.Context, pending map[string][]
 					ExtraPrompt:      o.extraPrompt,
 					LineHints:        o.lineHints,
 				})
+				if o.metrics != nil {
+					o.metrics.RecordWorkerDuration(j.priority, j.repo, time.Since(workerStart).Seconds())
+				}
 				mu.Lock()
 				if err != nil {
 					batchResults[j.batchKey] = nil
@@ -1027,11 +1060,33 @@ func (o *Orchestrator) runWorkerBatch(ctx context.Context, pending map[string][]
 			}
 		}
 	}
+	// Record ghost-node metrics after merging: count rescued nodes (Source=="ghost_rescued")
+	// and lost nodes (entries remaining in GhostFiles).
+	if o.metrics != nil {
+		for _, res := range merged {
+			if res == nil {
+				continue
+			}
+			for _, n := range res.Nodes {
+				if n.Source == "ghost_rescued" {
+					o.metrics.RecordGhostNode("rescued")
+				}
+			}
+			for _, ep := range res.EntryPoints {
+				if ep.Source == "ghost_rescued" {
+					o.metrics.RecordGhostNode("rescued")
+				}
+			}
+			for range res.GhostFiles {
+				o.metrics.RecordGhostNode("lost")
+			}
+		}
+	}
 	return merged
 }
 
-// groupByRepo attempts to map fully-qualified function names to repository
-// names.  Names are expected in the form "repoName/pkg.Func" or simply
+// groupByRepo groups function names by repository.
+// Names are expected in the form "repoName/pkg.Func" or simply
 // "Func" (assigned to sourceRepo, or the first repo as last-resort fallback).
 func (o *Orchestrator) groupByRepo(functions []string, sourceRepo string) map[string][]string {
 	grouped := make(map[string][]string)
@@ -2185,5 +2240,40 @@ func (o *Orchestrator) runSupplementalScenarios(ctx context.Context, output *Ana
 			output.WorkerOutputs[r.repo] = wo
 		}
 		wo.EntryScenarios = append(wo.EntryScenarios, r.scenarios...)
+	}
+}
+
+// writeBackToLayer1 asynchronously persists high-confidence CallNode and
+// EntryPoint data from a Worker result into the Layer1 knowledge base.
+// Only nodes with both Function and File set are written (empty-field nodes
+// are LLM reasoning artefacts and not useful as knowledge-base entries).
+// The write is best-effort: errors are silently discarded by SaveSymbolSummaryAsync.
+func (o *Orchestrator) writeBackToLayer1(result *WorkerResult, commitHash string) {
+	log := logger.S()
+	log.Debugw("layer1.writeback",
+		"repo", result.RepoName,
+		"nodes", len(result.Nodes),
+	)
+
+	for _, n := range result.Nodes {
+		if n.Function == "" || n.File == "" {
+			continue
+		}
+		summary := fmt.Sprintf(
+			"CallNode: function=%s file=%s line=%d source=%s",
+			n.Function, n.File, n.Line, n.Source,
+		)
+		o.layer1.SaveSymbolSummaryAsync(result.RepoName, n.Function, n.File, n.Line, summary, commitHash)
+	}
+
+	for _, ep := range result.EntryPoints {
+		if ep.Function == "" || ep.File == "" {
+			continue
+		}
+		summary := fmt.Sprintf(
+			"EntryPoint: function=%s file=%s line=%d source=%s",
+			ep.Function, ep.File, ep.Line, ep.Source,
+		)
+		o.layer1.SaveSymbolSummaryAsync(result.RepoName, ep.Function, ep.File, ep.Line, summary, commitHash)
 	}
 }

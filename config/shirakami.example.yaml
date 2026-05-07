@@ -79,3 +79,14 @@ changes:
 #
 # scope:
 #   only_cross_repos: [order-service, api-gateway]  # 只分析这些仓库的跨仓调用
+
+# Prometheus Pushgateway 配置（可选）
+# 适合部署在内网、无法被 Prometheus 主动 scrape 时使用
+# 环境变量覆盖：
+#   SHIRAKAMI_METRICS_PUSHGATEWAY_URL — Pushgateway 地址
+#   SHIRAKAMI_METRICS_PUSH_INTERVAL   — 后台推送间隔（秒），0 = 仅在任务完成时推送
+#   SHIRAKAMI_METRICS_JOB_NAME        — Prometheus job 标签名称
+metrics:
+  pushgateway_url: "http://21.215.89.245:8080"  # Pushgateway 地址（留空则禁用）
+  push_interval_seconds: 30                      # 后台定期推送间隔，默认 30s
+  job_name: shirakami                            # Prometheus job 标签

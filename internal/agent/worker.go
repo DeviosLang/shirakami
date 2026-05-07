@@ -1547,6 +1547,7 @@ func filterGhostNodes(result *WorkerResult, repoPath, workspaceDir string) {
 					)
 					n.File = relFile
 					n.Line = line
+					n.Source = "ghost_rescued"
 					return n, true
 				}
 			}

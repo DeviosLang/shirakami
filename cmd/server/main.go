@@ -30,6 +30,7 @@ import (
 	"github.com/DeviosLang/shirakami/internal/feedback"
 	"github.com/DeviosLang/shirakami/internal/llm"
 	"github.com/DeviosLang/shirakami/internal/logger"
+	"github.com/DeviosLang/shirakami/internal/memory"
 	"github.com/DeviosLang/shirakami/internal/storage"
 	itool "github.com/DeviosLang/shirakami/internal/tool"
 	"github.com/DeviosLang/shirakami/internal/webhook"
@@ -80,6 +81,20 @@ func runServer(cmd *cobra.Command, args []string) error {
 		"default_modes", cfg.Server.DefaultModes,
 	)
 
+	// Start config hot-reload watcher. Only safe fields (LLM params,
+	// server.max_concurrent_analyses, server.default_modes) are reloaded;
+	// fields like db.dsn and redis.addr require a server restart.
+	watcher, watchErr := config.NewWatcher(func(updated *config.Config) {
+		// Caller is responsible for acting on updated safe fields.
+		// For now we just log; downstream components can be extended here.
+		_ = updated
+	})
+	if watchErr != nil {
+		log.Sugar().Warnw("config.watcher_failed", "err", watchErr)
+	} else {
+		defer watcher.Stop()
+	}
+
 	ctx := context.Background()
 
 	// Connect to DB.
@@ -123,8 +138,23 @@ func runServer(cmd *cobra.Command, args []string) error {
 		store:        store,
 		pool:         pool,
 		cache:        analysisCache,
+		metrics:      feedback.NewMetrics(),
 		semaphore:    make(chan struct{}, maxConcurrent),
 		queueCounter: new(atomic.Int64),
+	}
+
+	// Initialize Pushgateway pusher when configured.
+	if cfg.Metrics.PushgatewayURL != "" {
+		interval := time.Duration(cfg.Metrics.PushIntervalSeconds) * time.Second
+		pusher, pushErr := feedback.NewPusher(cfg.Metrics.PushgatewayURL, cfg.Metrics.JobName, interval)
+		if pushErr != nil {
+			// Non-fatal: log and continue without pushing.
+			log.Sugar().Warnw("pushgateway init failed", "err", pushErr)
+		} else {
+			srv.pusher = pusher
+			pusher.Start()
+			defer pusher.Stop(ctx)
+		}
 	}
 
 	// Build webhook handler.
@@ -189,6 +219,13 @@ type apiServer struct {
 	store *storage.Store
 	pool  *pgxpool.Pool
 	cache *cache.Cache
+
+	// metrics is the Prometheus metrics sink shared across all analysis runs.
+	metrics *feedback.Metrics
+
+	// pusher is the optional Pushgateway client. When non-nil, metrics are
+	// pushed to the Pushgateway after each task completes and periodically.
+	pusher *feedback.Pusher
 
 	// semaphore limits concurrent analysis jobs.
 	// Capacity == cfg.Server.MaxConcurrentAnalyses (default 1).
@@ -943,6 +980,13 @@ func (s *apiServer) runAnalysis(taskID, inputDiff, inputDesc, cacheKey, sourceRe
 	if s.cfg.IndexMode != "" && s.cfg.IndexMode != "off" {
 		orch.SetIndexMode(s.cfg.IndexMode)
 	}
+	if s.pool != nil {
+		l1 := memory.NewLayer1(s.pool)
+		orch.SetLayer1(l1)
+	}
+	if s.metrics != nil {
+		orch.SetMetrics(s.metrics)
+	}
 
 	output, err := orch.Run(ctx, agent.AnalysisInput{
 		Diff:        inputDiff,
@@ -954,6 +998,12 @@ func (s *apiServer) runAnalysis(taskID, inputDiff, inputDesc, cacheKey, sourceRe
 	if err != nil {
 		log.Errorw("analysis failed", "task_id", taskID, "err", err)
 		_ = s.store.UpdateTaskStatusWithError(ctx, taskID, err.Error())
+		if s.metrics != nil {
+			s.metrics.RecordTask("failed")
+		}
+		if s.pusher != nil {
+			s.pusher.Push()
+		}
 		return
 	}
 
@@ -1075,6 +1125,12 @@ func (s *apiServer) runAnalysis(taskID, inputDiff, inputDesc, cacheKey, sourceRe
 		Modes:            modes,
 	})
 	_ = s.store.UpdateTaskStatus(ctx, taskID, storage.TaskStatusCompleted)
+	if s.metrics != nil {
+		s.metrics.RecordTask("completed")
+	}
+	if s.pusher != nil {
+		s.pusher.Push()
+	}
 
 	cacheResult := &cache.AnalysisResult{
 		TaskID:           taskID,

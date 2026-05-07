@@ -21,6 +21,8 @@ type Config struct {
 	IndexMode string `mapstructure:"index_mode"`
 	// Server holds HTTP server configuration (used in server mode).
 	Server ServerConfig `mapstructure:"server"`
+	// Metrics holds Prometheus export settings.
+	Metrics MetricsConfig `mapstructure:"metrics"`
 }
 
 // ContractEntry declares a known cross-repo call relationship.
@@ -105,6 +107,26 @@ type ServerConfig struct {
 	DefaultModes []string `mapstructure:"default_modes"`
 }
 
+// MetricsConfig controls how Prometheus metrics are exported.
+type MetricsConfig struct {
+	// PushgatewayURL is the address of a Prometheus Pushgateway.
+	// When set, metrics are pushed to this URL at startup, on task completion,
+	// and periodically (see PushIntervalSeconds).
+	// Example: "http://21.215.89.245:8080"
+	// Environment variable: SHIRAKAMI_METRICS_PUSHGATEWAY_URL
+	PushgatewayURL string `mapstructure:"pushgateway_url"`
+
+	// PushIntervalSeconds is the interval (in seconds) between periodic pushes.
+	// Default: 30. Set to 0 to disable periodic pushing (task-triggered only).
+	// Environment variable: SHIRAKAMI_METRICS_PUSH_INTERVAL
+	PushIntervalSeconds int `mapstructure:"push_interval_seconds"`
+
+	// JobName is the Prometheus job label attached to all pushed metrics.
+	// Default: "shirakami".
+	// Environment variable: SHIRAKAMI_METRICS_JOB_NAME
+	JobName string `mapstructure:"job_name"`
+}
+
 // Load reads configuration from file and environment.
 // It looks for shirakami.yaml in the current directory, $HOME, or /etc/shirakami/.
 //
@@ -144,6 +166,9 @@ func Load(cfgFile string) (*Config, error) {
 	_ = viper.BindEnv("server.addr", "SHIRAKAMI_SERVER_ADDR")
 	_ = viper.BindEnv("server.max_concurrent_analyses", "SHIRAKAMI_SERVER_MAX_CONCURRENT")
 	_ = viper.BindEnv("server.default_modes", "SHIRAKAMI_SERVER_DEFAULT_MODES")
+	_ = viper.BindEnv("metrics.pushgateway_url", "SHIRAKAMI_METRICS_PUSHGATEWAY_URL")
+	_ = viper.BindEnv("metrics.push_interval_seconds", "SHIRAKAMI_METRICS_PUSH_INTERVAL")
+	_ = viper.BindEnv("metrics.job_name", "SHIRAKAMI_METRICS_JOB_NAME")
 
 	// defaults
 	viper.SetDefault("workspace.dir", "/tmp/shirakami-workspace")
@@ -156,6 +181,8 @@ func Load(cfgFile string) (*Config, error) {
 	viper.SetDefault("server.addr", ":8080")
 	viper.SetDefault("server.max_concurrent_analyses", 1)
 	viper.SetDefault("server.default_modes", []string{"chain", "e2e", "ut"})
+	viper.SetDefault("metrics.push_interval_seconds", 30)
+	viper.SetDefault("metrics.job_name", "shirakami")
 
 	if err := viper.ReadInConfig(); err != nil {
 		if _, ok := err.(viper.ConfigFileNotFoundError); !ok {
