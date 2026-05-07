@@ -620,9 +620,11 @@ func (s *apiServer) submitTask(w http.ResponseWriter, r *http.Request) {
 	// Launch analysis in background (semaphore controls concurrency).
 	go s.runAnalysis(task.ID, req.InputDiff, req.InputDesc, cacheKey, req.SourceRepo, modes, req.ExtraPrompt)
 
-	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(http.StatusAccepted)
-	json.NewEncoder(w).Encode(TaskResponse{ //nolint:errcheck
+	enc := json.NewEncoder(w)
+	enc.SetEscapeHTML(false)
+	enc.Encode(TaskResponse{ //nolint:errcheck
 		ID:         task.ID,
 		Status:     string(task.Status),
 		InputType:  string(task.InputType),
@@ -1158,14 +1160,18 @@ func handleHealthz(w http.ResponseWriter, r *http.Request) {
 }
 
 func jsonOK(w http.ResponseWriter, v any) {
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(v) //nolint:errcheck
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	enc := json.NewEncoder(w)
+	enc.SetEscapeHTML(false)
+	enc.Encode(v) //nolint:errcheck
 }
 
 func jsonError(w http.ResponseWriter, msg string, code int) {
-	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(code)
-	json.NewEncoder(w).Encode(map[string]string{"error": msg}) //nolint:errcheck
+	enc := json.NewEncoder(w)
+	enc.SetEscapeHTML(false)
+	enc.Encode(map[string]string{"error": msg}) //nolint:errcheck
 }
 
 // ---------------------------------------------------------------------------
