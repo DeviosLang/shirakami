@@ -14,4 +14,6 @@ type MetricsRecorder interface {
 	RecordWorkerDuration(tier, repo string, seconds float64)
 	// RecordCheckpointResumed increments the checkpoint-resume counter.
 	RecordCheckpointResumed()
+	// RecordSteps records the agent loop step count for one analysis task.
+	RecordSteps(steps float64)
 }

@@ -3,12 +3,34 @@ package feedback
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/DeviosLang/shirakami/internal/logger"
+	dto "github.com/prometheus/client_model/go"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/push"
 )
+
+// shirakamiGatherer wraps prometheus.DefaultGatherer and only returns metric
+// families whose name starts with "shirakami_".  This prevents Go runtime
+// metrics (go_memstats_*, go_gc_*, process_*) from being pushed to the
+// Pushgateway, which would cause "metric families overlap" warnings because
+// the Pushgateway ships its own copies of those metrics with different help
+// strings.
+type shirakamiGatherer struct{}
+
+func (shirakamiGatherer) Gather() ([]*dto.MetricFamily, error) {
+	all, err := prometheus.DefaultGatherer.Gather()
+	var filtered []*dto.MetricFamily
+	for _, mf := range all {
+		if strings.HasPrefix(mf.GetName(), "shirakami_") {
+			filtered = append(filtered, mf)
+		}
+	}
+	// Return filtered list; propagate gathering errors as-is (non-fatal).
+	return filtered, err
+}
 
 // Pusher wraps a Prometheus Pushgateway client and provides:
 //   - An immediate push on startup (connectivity check).
@@ -34,7 +56,7 @@ type Pusher struct {
 func NewPusher(url, jobName string, interval time.Duration) (*Pusher, error) {
 	log := logger.S()
 
-	p := push.New(url, jobName).Gatherer(prometheus.DefaultGatherer)
+	p := push.New(url, jobName).Gatherer(shirakamiGatherer{})
 
 	// Validate connectivity with an immediate push.
 	if err := p.Push(); err != nil {
@@ -70,7 +92,7 @@ func (pu *Pusher) Start() {
 				if err := pu.p.Push(); err != nil {
 					log.Warnw("metrics.push_failed", "err", err.Error())
 				} else {
-					log.Debugw("metrics.push_ok", "interval_s", int(pu.interval.Seconds()))
+					log.Infow("metrics.push_ok", "interval_s", int(pu.interval.Seconds()))
 				}
 			case <-pu.stopCh:
 				return

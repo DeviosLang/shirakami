@@ -283,8 +283,10 @@ var fencedJSONStartRe = regexp.MustCompile("```json[ \\t]*\\r?\\n?[ \\t]*(\\{)")
 
 // WorkerAgent performs local call-chain analysis inside a single repository.
 type WorkerAgent struct {
-	loop       *AgentLoop
-	entryRepos []string // names of entry-role repos, dynamically injected from config
+	loop        *AgentLoop
+	entryRepos  []string // names of entry-role repos, dynamically injected from config
+	metrics     MetricsRecorder
+	metricsModel string // LLM model name forwarded to loop.WithMetrics
 }
 
 // NewWorkerAgent creates a WorkerAgent for a specific repository.
@@ -330,6 +332,16 @@ func NewWorkerAgentWithBudget(
 
 	loop := NewAgentLoop(llmClient, tools, budget, cp, prompt)
 	return &WorkerAgent{loop: loop, entryRepos: entryRepos}
+}
+
+// WithMetrics attaches a Prometheus metrics recorder to the worker.
+// Call this after NewWorkerAgentWithBudget; model is the LLM model name label.
+// Returns the worker so calls can be chained.
+func (w *WorkerAgent) WithMetrics(m MetricsRecorder, model string) *WorkerAgent {
+	w.metrics = m
+	w.metricsModel = model
+	w.loop.WithMetrics(m, model, "worker")
+	return w
 }
 
 // Analyse runs the worker's agent loop and parses the structured JSON result.
@@ -514,6 +526,9 @@ func (w *WorkerAgent) Analyse(ctx context.Context, task WorkerTask) (*WorkerResu
 		"content_bytes", len(result.Content),
 		"duration_ms", time.Since(workerStart).Milliseconds(),
 	)
+	if w.metrics != nil {
+		w.metrics.RecordSteps(float64(result.StepCount))
+	}
 
 	// If the output doesn't contain a JSON block, ask the LLM to output it now.
 	// This handles cases where the LLM gives a prose summary instead of JSON.

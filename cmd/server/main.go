@@ -234,6 +234,11 @@ type apiServer struct {
 	// queueCounter tracks the number of analyses waiting in queue.
 	queueCounter *atomic.Int64
 
+	// cacheHits and cacheTotal are used to compute the cache-hit ratio gauge.
+	// Incremented atomically; ratio is updated each time runAnalysis is called.
+	cacheHits  atomic.Int64
+	cacheTotal atomic.Int64
+
 	// progressMu protects the progress map.
 	progressMu sync.RWMutex
 	// progress maps taskID → step count for in-flight analyses.
@@ -861,6 +866,26 @@ func (s *apiServer) submitFeedback(w http.ResponseWriter, r *http.Request, taskI
 		return
 	}
 
+	// Update false-positive-rate gauge asynchronously — non-blocking for the HTTP response.
+	if s.metrics != nil && s.pool != nil {
+		go func() {
+			// Count all feedback and false_positive feedback over the last 30 days.
+			var total, fp int
+			qCtx := context.Background()
+			row := s.pool.QueryRow(qCtx,
+				`SELECT COUNT(*) FROM feedback WHERE created_at >= NOW() - INTERVAL '30 days'`,
+			)
+			if err := row.Scan(&total); err == nil && total > 0 {
+				row2 := s.pool.QueryRow(qCtx,
+					`SELECT COUNT(*) FROM feedback WHERE type = 'false_positive' AND created_at >= NOW() - INTERVAL '30 days'`,
+				)
+				if err2 := row2.Scan(&fp); err2 == nil {
+					s.metrics.SetFalsePositiveRate(float64(fp) / float64(total))
+				}
+			}
+		}()
+	}
+
 	jsonOK(w, map[string]string{"status": "ok"})
 }
 
@@ -930,7 +955,17 @@ func (s *apiServer) runAnalysis(taskID, inputDiff, inputDesc, cacheKey, sourceRe
 	}
 
 	// Check cache first.
+	s.cacheTotal.Add(1)
 	if cached, ok := s.cache.Get(ctx, cacheKey); ok {
+		s.cacheHits.Add(1)
+		if s.metrics != nil {
+			hits := float64(s.cacheHits.Load())
+			total := float64(s.cacheTotal.Load())
+			if total > 0 {
+				s.metrics.SetCacheHitRatio(hits / total)
+			}
+			s.metrics.RecordTask("completed")
+		}
 		_ = s.store.SaveResult(ctx, &storage.TaskResult{
 			TaskID:           taskID,
 			CallChain:        cached.CallChain,
@@ -940,7 +975,18 @@ func (s *apiServer) runAnalysis(taskID, inputDiff, inputDesc, cacheKey, sourceRe
 			Modes:            modes,
 		})
 		_ = s.store.UpdateTaskStatus(ctx, taskID, storage.TaskStatusCompleted)
+		if s.pusher != nil {
+			s.pusher.Push()
+		}
 		return
+	}
+	// Update cache-hit ratio after a miss (denominator already incremented above).
+	if s.metrics != nil {
+		hits := float64(s.cacheHits.Load())
+		total := float64(s.cacheTotal.Load())
+		if total > 0 {
+			s.metrics.SetCacheHitRatio(hits / total)
+		}
 	}
 
 	_ = s.store.UpdateTaskStatus(ctx, taskID, storage.TaskStatusRunning)
@@ -985,7 +1031,7 @@ func (s *apiServer) runAnalysis(taskID, inputDiff, inputDesc, cacheKey, sourceRe
 		orch.SetLayer1(l1)
 	}
 	if s.metrics != nil {
-		orch.SetMetrics(s.metrics)
+		orch.SetMetrics(s.metrics, s.cfg.LLM.Model)
 	}
 
 	output, err := orch.Run(ctx, agent.AnalysisInput{

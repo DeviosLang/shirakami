@@ -29,6 +29,7 @@ repos_dedup.txt
 MULTI_REPO_ANALYSIS.md
 extract_repos.py
 k8s/
+scripts/tapd_analyze.py
 
 # Diff / patch files (loose patches in repo root; golden case patches are tracked separately)
 /diffs/*.patch

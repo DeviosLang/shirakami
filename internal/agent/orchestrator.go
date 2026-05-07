@@ -144,6 +144,9 @@ type Orchestrator struct {
 	// metrics is optional Prometheus metrics sink. When non-nil, worker durations
 	// and ghost-node outcomes are recorded after each batch run.
 	metrics MetricsRecorder
+	// llmModel is the model name forwarded to AgentLoop.WithMetrics for token metric labels.
+	// Set by SetMetrics(m, model) or inferred as empty string if not provided.
+	llmModel string
 	// resolver is the business-level impact analyser built on top of the in-memory
 	// symbol graph. When set it supersedes the raw indexGraph calls inside
 	// runGraphAnalysis with proper symbol disambiguation, risk assessment,
@@ -266,8 +269,12 @@ func (o *Orchestrator) SetLayer1(l1 *memory.Layer1) *Orchestrator {
 
 // SetMetrics injects a Prometheus metrics sink.
 // When set, worker durations and ghost-node outcomes are recorded automatically.
-func (o *Orchestrator) SetMetrics(m MetricsRecorder) *Orchestrator {
+// model is the LLM model name label used for token metrics (e.g. "gpt-4o").
+func (o *Orchestrator) SetMetrics(m MetricsRecorder, model ...string) *Orchestrator {
 	o.metrics = m
+	if len(model) > 0 {
+		o.llmModel = model[0]
+	}
 	return o
 }
 
@@ -852,6 +859,9 @@ Rules:
 - Just the list`, o.workspaceDir, input.SourceRepo, input.SourceRepo)
 
 	loop := NewAgentLoop(o.llmClient, nil, 0, o.cp, sysPrompt)
+	if o.metrics != nil {
+		loop.WithMetrics(o.metrics, o.llmModel, "extract")
+	}
 	task := fmt.Sprintf(
 		"Extract changed production functions from the following diff.\n\nDescription: %s\n\nDiff:\n%s",
 		input.Description, diffForLLM,
@@ -1066,6 +1076,9 @@ func (o *Orchestrator) runWorkerBatch(ctx context.Context, pending map[string][]
 				worker := NewWorkerAgentWithBudget(
 					o.llmClient, o.tools, o.cp, o.repos, o.workspaceDir, budget,
 				)
+				if o.metrics != nil {
+					worker.WithMetrics(o.metrics, o.llmModel)
+				}
 				workerStart := time.Now()
 				res, err := worker.Analyse(ctx, WorkerTask{
 					RepoName:         j.repo,
@@ -2250,6 +2263,9 @@ func (o *Orchestrator) runSupplementalScenarios(ctx context.Context, output *Ana
 			worker := NewWorkerAgentWithBudget(
 				o.llmClient, o.tools, o.cp, o.repos, o.workspaceDir, 0,
 			)
+			if o.metrics != nil {
+				worker.WithMetrics(o.metrics, o.llmModel)
+			}
 
 			var sb strings.Builder
 			sb.WriteString("Call-chain analysis summary:\n")
