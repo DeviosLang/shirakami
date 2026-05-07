@@ -143,6 +143,10 @@ type Orchestrator struct {
 	modes []string
 	// extraPrompt is optional business-context text injected into e2e/UT prompts.
 	extraPrompt string
+	// lineHints maps "repo/file::funcname" → approximate diff line number (new-file side).
+	// Populated by extractChangedFunctions from Layer A+ hunk context and forwarded to
+	// Workers via WorkerTask.LineHints so the LLM can disambiguate same-named functions.
+	lineHints map[string]int
 }
 
 // IndexGraph is the interface consumed by Orchestrator for deterministic analysis.
@@ -657,6 +661,10 @@ func (o *Orchestrator) extractChangedFunctions(ctx context.Context, input Analys
 	// FILE_PATH::FUNC_NAME even when the diff only modifies internal statements
 	// (no new `def`/`func` line appears in the added lines).
 	var hunkContextFunctions []string
+	// hunkLineHints maps the qualified "repo/file::funcname" key → approximate
+	// line number (new-file side) where the change starts. Forwarded to Workers
+	// so the LLM can disambiguate between multiple same-named functions in one file.
+	hunkLineHints := make(map[string]int)
 	{
 		seenCtx := make(map[string]bool)
 		for _, h := range hunks {
@@ -672,8 +680,15 @@ func (o *Orchestrator) extractChangedFunctions(ctx context.Context, input Analys
 				seenCtx[qualified] = true
 				hunkContextFunctions = append(hunkContextFunctions, qualified)
 			}
+			// Always update to the earliest (lowest) start line for this qualified key,
+			// so if the same function appears in multiple hunks we report the first change.
+			if existing, ok := hunkLineHints[qualified]; !ok || h.StartLine < existing {
+				hunkLineHints[qualified] = h.StartLine
+			}
 		}
 		log.Debugw("extract.layerA+", "hunk_context_funcs", len(hunkContextFunctions))
+		// Store hints on the Orchestrator so runWorkerBatch can forward them to Workers.
+		o.lineHints = hunkLineHints
 	}
 
 	// -----------------------------------------------------------------------
@@ -937,6 +952,7 @@ func (o *Orchestrator) runWorkerBatch(ctx context.Context, pending map[string][]
 					ImportContext:    o.importContext,
 					Modes:            o.modes,
 					ExtraPrompt:      o.extraPrompt,
+					LineHints:        o.lineHints,
 				})
 				mu.Lock()
 				if err != nil {

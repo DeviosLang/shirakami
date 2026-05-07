@@ -49,6 +49,11 @@ type WorkerTask struct {
 	// and UT follow-up prompts. Helps the LLM generate more accurate test cases
 	// when domain knowledge is not inferable from the code alone.
 	ExtraPrompt string
+	// LineHints maps "file::funcname" → approximate line number where the change
+	// occurs in the new file (from the diff hunk). When provided, the Worker
+	// prompt includes "(around line N)" hints so the LLM can distinguish between
+	// multiple same-named functions in the same file.
+	LineHints map[string]int
 }
 
 // SearchResult holds one raw ripgrep hit — file path, line, and caller name.
@@ -347,6 +352,22 @@ func (w *WorkerAgent) Analyse(ctx context.Context, task WorkerTask) (*WorkerResu
 		combinedFuncs = task.ChangedFunctions
 	}
 
+	// Annotate function entries with line-number hints when available.
+	// This helps the LLM disambiguate same-named functions in the same file
+	// (e.g. multiple get_data() overloads). The hint format is:
+	//   "repo/file.py::funcname (changed around line 209)"
+	// The hint is purely informational — it does NOT change the canonical
+	// FILE::FUNCNAME key used for deduplication elsewhere.
+	annotatedFuncs := make([]string, 0, len(combinedFuncs))
+	for _, fn := range combinedFuncs {
+		if task.LineHints != nil {
+			if lineNum, ok := task.LineHints[fn]; ok && lineNum > 0 {
+				fn = fmt.Sprintf("%s (changed around line %d)", fn, lineNum)
+			}
+		}
+		annotatedFuncs = append(annotatedFuncs, fn)
+	}
+
 	// Build contract hints section (from shirakami.yaml contracts declarations).
 	contractHintsSection := ""
 	if len(task.ContractHints) > 0 {
@@ -429,7 +450,7 @@ func (w *WorkerAgent) Analyse(ctx context.Context, task WorkerTask) (*WorkerResu
 			"```",
 		task.RepoName,
 		task.RepoPath,
-		formatList(combinedFuncs),
+		formatList(annotatedFuncs),
 		formatList(task.ExternalCallers),
 		contractHintsSection,
 		importContextSection,
