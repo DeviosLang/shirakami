@@ -130,7 +130,108 @@ var (
 
 ---
 
-## 第二轮分析：借鉴参考仓库（待补充）
 
-> 参考仓库：/mnt/GitNexus、/mnt/claude-code、/mnt/autoresearch  
-> 分析结果将在探索后补充到本文档。
+---
+
+## 第二轮分析：借鉴参考仓库（已补充）
+
+基于 GitNexus、claude-code、autoresearch 三个参考项目的深度分析，提取以下高价值设计模式。
+
+### GitNexus：DAG Pipeline + Type Safety
+
+**关键模式：** GitNexus 的 12 阶段 DAG pipeline（`scan → structure → parse → …→ processes`）展示了如何用静态类型管理复杂多步流程。
+
+**借鉴价值：**
+
+1. **显式依赖声明**（`deps: string[]`）
+   - Shirakami Orchestrator 的 cross-repo 迭代目前是隐式循环（10 轮最多）
+   - GitNexus 的 DAG runner 做拓扑排序 + 静态验证，拒绝循环和未声明依赖
+   - **建议：** Worker 之间的数据流显式化为 DAG
+
+2. **类型安全的阶段输出**（`getPhaseOutput<T>(deps, 'name')`）
+   - 每个 DAG 阶段强类型化其输出结果
+   - **建议：** 将 Shirakami Worker 的输出定义为强类型 schema
+
+3. **Binding Accumulator 生命周期管理**
+   - GitNexus parse 阶段创建绑定、crossFile 阶段释放
+   - **建议：** 为 Worker 结果设置明确的缓存生命周期（task-scoped LRU cache）
+
+### claude-code：Token 预算 + 渐进式压缩
+
+**关键模式：** Token 预算分层管理（60% Plan D → 70% Plan B → 80% Plan C → 92% Plan A）
+
+**借鉴价值：**
+
+1. **预算级联阈值**（budget tiers）
+   - Shirakami 当前只有一阶压缩
+   - claude-code 的四层阈值提供细粒度控制
+   - **建议：** 应用到 Shirakami LLM token 管理
+
+2. **错误恢复栈**（five-level recovery before surfacing error）
+   - claude-code 对 prompt-too-long 错误有 5 层尝试
+   - **建议：** Shirakami Worker 遇到 context overflow 时应有序尝试 N 种恢复策略
+
+3. **消息结果预算**
+   - 按优先级截断工具结果
+   - **建议：** 应用到 ripgrep/LSP 结果集
+
+### autoresearch：Git 作为内存 + 原子修改
+
+**关键模式：** 8 阶段自主迭代循环，Git commit log 作为记忆和回滚机制
+
+**借鉴价值：**
+
+1. **原子修改 + 一句话验证**（one-sentence test）
+   - autoresearch 要求每次迭代**恰好一个逻辑变更**
+   - **建议：** 应用到 Shirakami Worker 的每次搜索/LSP 调用
+
+2. **奔溃检测三恢复点**（uncommitted → unverified → clean）
+   - autoresearch checkpoint 设计：未 commit → commit 但未验证 → clean state
+   - **建议：** 应用到 Shirakami checkpoint
+
+3. **日志模式识别**（read last 10-20 entries for context）
+   - autoresearch 结果日志 TSV 格式
+   - **建议：** Shirakami Worker 的相似搜索可以参考上次成功的查询方式
+
+---
+
+## 第二轮汇总表：参考项目借鉴
+
+| 源项目 | 模式 | Shirakami 应用 | 优先级 | 预估工作量 |
+|--------|------|-------------|--------|----------|
+| GitNexus | DAG pipeline + 显式依赖 | Worker 派发前的循环检测（#4） | P1 | 0.5 天 |
+| GitNexus | 强类型阶段输出 | CallNode source 字段（#5） | P1 | 0.5 天 |
+| GitNexus | Binding lifecycle 管理 | Worker 结果 LRU cache（#9） | P3 | 1 天 |
+| claude-code | 预算级联阈值 | Token 预算分层管理 | P2 | 1 天 |
+| claude-code | 错误恢复栈 | 智能工具错误分类（#3） | P1 | 1 天 |
+| claude-code | 消息/结果预算 | 工具结果优先级截断 | P1 | 1 天 |
+| autoresearch | 原子修改 + 一句话验证 | Worker 迭代原子性约束 | P2 | 1 天 |
+| autoresearch | 奔溃恢复三点 | Checkpoint 防损坏恢复（#1） | P0 | 0.5 天 |
+| autoresearch | 日志模式识别 | Worker 历史查询提示 | P3 | 1.5 天 |
+
+---
+
+## 综合实施建议（第一 + 二轮）
+
+### 快速赢（Quick Wins）— 即刻开始（1-2 周）
+
+1. **Checkpoint 原子写 + 损坏自愈** ← autoresearch crash recovery（P0，0.5d）
+2. **工具错误结构化分类** ← claude-code error hints（P1，1d）
+3. **跨 repo 调用循环检测** ← GitNexus DAG（P1，0.5d）
+
+### 质量改进（Quality）— 2-3 周
+
+4. **消息历史滑动窗口** ← claude-code 五层压缩（P0，1d）
+5. **CallNode 可信度来源字段** ← GitNexus 强类型（P1，0.5d）
+6. **补充 Prometheus metrics**（P2，1d）
+
+### 长期投资（Long-term）— 4+ 周
+
+7. **OpenTelemetry 链路追踪**（P2，2d）
+8. **配置热重载**（P2，1d）
+9. **工具结果 LRU cache** ← GitNexus lifecycle（P3，1d）
+10. **Worker 结果回写 Layer1** ← autoresearch 记忆（P3，2d）
+
+**总工作量：** ~11 人·天（包括测试）
+
+**建议执行顺序：** P0 items 首先（稳定性 critical） → P1 items（质量显著提升） → P2 items（可观测性 + 运维） → P3 items（长期投资）
