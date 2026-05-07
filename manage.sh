@@ -16,6 +16,9 @@
 #   清理指定任务的缓存（下次相同 diff 会重新分析）：
 #     bash manage.sh cache clear <task_id>
 #
+#   持续监控单个任务状态（支持完整 ID 或前缀）：
+#     bash manage.sh watch <task_id_or_prefix>
+#
 #   查看任务详情：
 #     bash manage.sh task <task_id>
 #
@@ -56,7 +59,7 @@ case "$CMD" in
           .[]
           | select(.status == $f)
           | [
-              .id[:8],
+              .id,
               .status,
               (.progress // "—"),
               (.input_type // "—"),
@@ -71,7 +74,7 @@ case "$CMD" in
         (
           .[]
           | [
-              .id[:8],
+              .id,
               .status,
               (.progress // "—"),
               (.input_type // "—"),
@@ -100,6 +103,66 @@ case "$CMD" in
       exit 1
     fi
     curl -s "${API}/${TASK_ID}" | jq .
+    ;;
+
+  # ── watch（持续轮询单个任务）────────────────────────────────────────────────
+  watch)
+    PREFIX=${2:-""}
+    if [[ -z "$PREFIX" ]]; then
+      echo "用法：bash manage.sh watch <task_id_or_prefix>" >&2
+      exit 1
+    fi
+    POLL=${POLL_INTERVAL:-5}
+
+    # 如果传入的是前缀，从任务列表中找完整 ID
+    TASK_ID="$PREFIX"
+    if [[ ${#PREFIX} -lt 36 ]]; then
+      MATCHED=$(curl -s "$API" | jq -r --arg p "$PREFIX" '.[] | select(.id | startswith($p)) | .id' | head -1)
+      if [[ -z "$MATCHED" ]]; then
+        echo "错误：找不到前缀为 ${PREFIX} 的任务" >&2
+        exit 1
+      fi
+      TASK_ID="$MATCHED"
+      echo "→ 匹配到任务：$TASK_ID"
+    fi
+
+    echo "⏳ 持续监控任务（每 ${POLL}s 刷新，Ctrl-C 退出）..."
+    echo ""
+    last_status=""
+    while true; do
+      RESP=$(curl -s "${API}/${TASK_ID}" 2>/dev/null || true)
+      if [[ -z "$RESP" ]]; then
+        echo "[$(date '+%H:%M:%S')] 请求失败，重试..."
+        sleep "$POLL"
+        continue
+      fi
+      STATUS=$(echo "$RESP" | jq -r '.status // "unknown"')
+      PROGRESS=$(echo "$RESP" | jq -r '.progress // ""')
+      TS=$(date '+%H:%M:%S')
+
+      if [[ "$STATUS" != "$last_status" || -n "$PROGRESS" ]]; then
+        echo -n "[$TS] status=${STATUS}"
+        [[ -n "$PROGRESS" ]] && echo -n "  progress=${PROGRESS}"
+        echo ""
+        last_status=$STATUS
+      fi
+
+      if [[ "$STATUS" == "completed" || "$STATUS" == "failed" ]]; then
+        echo ""
+        if [[ "$STATUS" == "completed" ]]; then
+          echo "✅ 完成。查看结果："
+          echo "  bash manage.sh e2e   $TASK_ID"
+          echo "  bash manage.sh chain $TASK_ID"
+          echo "  bash manage.sh ut    $TASK_ID"
+        else
+          ERR=$(echo "$RESP" | jq -r '.error // .error_message // "unknown error"')
+          echo "❌ 失败：$ERR"
+        fi
+        break
+      fi
+
+      sleep "$POLL"
+    done
     ;;
 
   # ── 结果视图：e2e / chain / ut / all ────────────────────────────────────────
