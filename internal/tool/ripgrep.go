@@ -174,3 +174,53 @@ func (t *RipgrepTool) Execute(ctx context.Context, input json.RawMessage) (strin
 	}
 	return strings.Join(results, "\n"), nil
 }
+
+// SearchSymbol runs rg to find the first occurrence of exactPattern as a
+// fixed string (not a regex) inside dir.
+// Returns (relFile, lineNumber, true) on the first match, or ("", 0, false)
+// when there is no match or rg cannot be executed.
+// Caller is responsible for setting a context deadline/timeout.
+func SearchSymbol(ctx context.Context, exactPattern, dir string) (file string, line int, ok bool) {
+	if exactPattern == "" || dir == "" {
+		return "", 0, false
+	}
+	absDir, err := filepath.Abs(dir)
+	if err != nil {
+		return "", 0, false
+	}
+
+	args := []string{
+		"--json",
+		"--max-count", "1",
+		"--fixed-strings",
+		exactPattern,
+		absDir,
+	}
+	cmd := exec.CommandContext(ctx, "rg", args...)
+	var stdout bytes.Buffer
+	cmd.Stdout = &stdout
+	_ = cmd.Run()
+	if ctx.Err() != nil {
+		return "", 0, false
+	}
+
+	scanner := bufio.NewScanner(&stdout)
+	for scanner.Scan() {
+		var m struct {
+			Type string `json:"type"`
+			Data struct {
+				Path       struct{ Text string `json:"text"` } `json:"path"`
+				LineNumber int                                  `json:"line_number"`
+			} `json:"data"`
+		}
+		if err := json.Unmarshal(scanner.Bytes(), &m); err != nil || m.Type != "match" {
+			continue
+		}
+		rel, err := filepath.Rel(absDir, m.Data.Path.Text)
+		if err != nil {
+			rel = m.Data.Path.Text
+		}
+		return rel, m.Data.LineNumber, true
+	}
+	return "", 0, false
+}

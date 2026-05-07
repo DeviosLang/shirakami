@@ -12,6 +12,7 @@ import (
 
 	"github.com/DeviosLang/shirakami/internal/checkpoint"
 	"github.com/DeviosLang/shirakami/internal/logger"
+	"github.com/DeviosLang/shirakami/internal/tool"
 )
 
 // CallNode represents one function in a call chain.
@@ -1405,61 +1406,215 @@ func parseUTAnalyses(content string) []UTAnalysis {
 // Nodes with an empty File field are kept unconditionally: they are legitimate
 // results where the LLM correctly omitted a file path rather than guessing.
 //
-// Filtered paths are recorded in result.GhostFiles so the API layer can
-// surface actionable warnings to the caller.
+// Ghost nodes that belong to the current repo are first attempted for rescue
+// via deterministic ripgrep searches using naming variants of the function name
+// (exact → snake_case → partial keyword). Rescued nodes have their File/Line
+// updated to the real path found on disk. Only nodes that cannot be rescued
+// after all variants are tried are added to result.GhostFiles so the API
+// layer can surface actionable warnings to the caller.
 func filterGhostNodes(result *WorkerResult, repoPath string) {
 	log := logger.S()
+	repoBase := filepath.Base(repoPath)
 
-	seen := make(map[string]bool)
+	// cleanPath strips a leading "repoName/" prefix so we don't double-join.
+	// e.g. "cvm_api/api/Foo.py" under repoPath "/workspace/cvm_api"
+	//   → strip "cvm_api/" → "api/Foo.py"
+	//   → filepath.Join("/workspace/cvm_api", "api/Foo.py")
+	cleanPath := func(file string) string {
+		if idx := strings.Index(file, "/"); idx > 0 && file[:idx] == repoBase {
+			return file[idx+1:]
+		}
+		return file
+	}
 
-	check := func(file string) bool {
+	// fileExists checks whether a non-empty path resolves to a real file.
+	fileExists := func(file string) bool {
 		if file == "" {
 			return true // no path → keep
 		}
-		// Strip leading "repoName/" prefix if present so we don't double-join.
-		// e.g. "cvm_api/api/Foo.py" under repoPath "/workspace/cvm_api"
-		//   → strip "cvm_api/" → "api/Foo.py"
-		//   → filepath.Join("/workspace/cvm_api", "api/Foo.py")
-		cleanFile := file
-		if idx := strings.Index(cleanFile, "/"); idx > 0 {
-			// Check whether the first segment matches the last component of repoPath.
-			repoBase := filepath.Base(repoPath)
-			if cleanFile[:idx] == repoBase {
-				cleanFile = cleanFile[idx+1:]
-			}
-		}
-		abs := filepath.Join(repoPath, cleanFile)
-		if _, err := os.Stat(abs); err == nil {
-			return true // file exists → keep
-		}
-		// File does not exist — record as ghost (deduplicated).
-		if !seen[file] {
-			seen[file] = true
-			result.GhostFiles = append(result.GhostFiles, file)
-			log.Warnw("worker.ghost_file_filtered",
-				"repo", result.RepoName,
-				"file", file,
-				"repo_path", repoPath,
-			)
-		}
-		return false
+		abs := filepath.Join(repoPath, cleanPath(file))
+		_, err := os.Stat(abs)
+		return err == nil
 	}
 
-	// Filter nodes.
+	// --- Step 1: Separate valid nodes from ghost nodes ---
+
+	var ghostNodes []CallNode
 	filtered := result.Nodes[:0]
 	for _, n := range result.Nodes {
-		if check(n.File) {
+		if fileExists(n.File) {
 			filtered = append(filtered, n)
+		} else {
+			log.Warnw("worker.ghost_file_detected",
+				"repo", result.RepoName,
+				"func", n.Function,
+				"file", n.File,
+			)
+			// Only attempt rescue for same-repo nodes where we have a repoPath.
+			if n.Repo == "" || n.Repo == result.RepoName {
+				ghostNodes = append(ghostNodes, n)
+			} else {
+				// Cross-repo ghost: cannot rescue here — record directly.
+				result.GhostFiles = append(result.GhostFiles, n.File)
+			}
 		}
 	}
 	result.Nodes = filtered
 
-	// Filter entry points.
+	var ghostEPs []CallNode
 	filteredEP := result.EntryPoints[:0]
 	for _, ep := range result.EntryPoints {
-		if check(ep.File) {
+		if fileExists(ep.File) {
 			filteredEP = append(filteredEP, ep)
+		} else {
+			log.Warnw("worker.ghost_file_detected",
+				"repo", result.RepoName,
+				"func", ep.Function,
+				"file", ep.File,
+			)
+			if ep.Repo == "" || ep.Repo == result.RepoName {
+				ghostEPs = append(ghostEPs, ep)
+			} else {
+				result.GhostFiles = append(result.GhostFiles, ep.File)
+			}
 		}
 	}
 	result.EntryPoints = filteredEP
+
+	// --- Step 2: Rescue search ---
+	// Skip if nothing to rescue.
+	if len(ghostNodes)+len(ghostEPs) == 0 {
+		return
+	}
+
+	// Limit total rescue time to 10 seconds so we don't block the Worker.
+	rescueCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	// rescue attempts to find the real file for a ghost node by searching naming
+	// variants of the function name. Returns the updated node and true on success.
+	rescue := func(n CallNode) (CallNode, bool) {
+		for _, pattern := range namingVariants(n.Function) {
+			if rescueCtx.Err() != nil {
+				return n, false
+			}
+			file, line, ok := toolSearchSymbol(rescueCtx, pattern, repoPath)
+			if ok {
+				log.Infow("worker.ghost_rescued",
+					"repo", result.RepoName,
+					"func", n.Function,
+					"ghost_file", n.File,
+					"rescued_file", file,
+					"pattern", pattern,
+				)
+				n.File = filepath.Join(repoBase, file)
+				n.Line = line
+				return n, true
+			}
+		}
+		return n, false
+	}
+
+	for _, n := range ghostNodes {
+		if rescued, ok := rescue(n); ok {
+			result.Nodes = append(result.Nodes, rescued)
+		} else {
+			log.Warnw("worker.ghost_file_filtered",
+				"repo", result.RepoName,
+				"func", n.Function,
+				"file", n.File,
+				"repo_path", repoPath,
+			)
+			result.GhostFiles = append(result.GhostFiles, n.File)
+		}
+	}
+	for _, ep := range ghostEPs {
+		if rescued, ok := rescue(ep); ok {
+			result.EntryPoints = append(result.EntryPoints, rescued)
+		} else {
+			log.Warnw("worker.ghost_file_filtered",
+				"repo", result.RepoName,
+				"func", ep.Function,
+				"file", ep.File,
+				"repo_path", repoPath,
+			)
+			result.GhostFiles = append(result.GhostFiles, ep.File)
+		}
+	}
+}
+
+// camelToSnake converts CamelCase (or mixedCase) identifiers to snake_case.
+// e.g. "ResetInstanceNetType" → "reset_instance_net_type"
+func camelToSnake(s string) string {
+	var b strings.Builder
+	for i, r := range s {
+		if i > 0 && isUpperASCII(r) {
+			b.WriteByte('_')
+		}
+		b.WriteRune(toLowerASCII(r))
+	}
+	return b.String()
+}
+
+func isUpperASCII(r rune) bool { return r >= 'A' && r <= 'Z' }
+func toLowerASCII(r rune) rune {
+	if isUpperASCII(r) {
+		return r + ('a' - 'A')
+	}
+	return r
+}
+
+// namingVariants returns a prioritised list of search patterns for funcName.
+// Order: exact → snake_case → last-two-CamelCase-words → last-word-alone.
+// Duplicates are suppressed.
+func namingVariants(funcName string) []string {
+	if funcName == "" {
+		return nil
+	}
+	seen := map[string]bool{funcName: true}
+	out := []string{funcName}
+
+	add := func(s string) {
+		if s != "" && !seen[s] {
+			seen[s] = true
+			out = append(out, s)
+		}
+	}
+
+	// snake_case variant
+	add(camelToSnake(funcName))
+
+	// Split CamelCase into words for partial-keyword variants.
+	var words []string
+	start := 0
+	for i := 1; i < len(funcName); i++ {
+		if isUpperASCII(rune(funcName[i])) {
+			words = append(words, funcName[start:i])
+			start = i
+		}
+	}
+	words = append(words, funcName[start:])
+
+	if len(words) >= 2 {
+		// Last two CamelCase words joined (e.g. "NetType" from "ResetInstanceNetType")
+		add(strings.Join(words[len(words)-2:], ""))
+		// Last single word, only if meaningful (> 3 chars)
+		last := words[len(words)-1]
+		if len(last) > 3 {
+			add(last)
+		}
+	}
+	return out
+}
+
+// toolSearchSymbol is a thin wrapper around tool.SearchSymbol so that
+// worker_test.go can substitute it in tests without importing the tool package.
+// In production this simply delegates to tool.SearchSymbol.
+var toolSearchSymbol = func(ctx context.Context, pattern, dir string) (string, int, bool) {
+	return searchSymbolImpl(ctx, pattern, dir)
+}
+
+// searchSymbolImpl delegates to tool.SearchSymbol.
+func searchSymbolImpl(ctx context.Context, pattern, dir string) (string, int, bool) {
+	return tool.SearchSymbol(ctx, pattern, dir)
 }
