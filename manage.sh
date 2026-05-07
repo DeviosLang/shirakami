@@ -30,7 +30,7 @@
 
 set -euo pipefail
 
-API_BASE=${API_BASE:-"http://43.137.205.156:8080"}
+API_BASE=${API_BASE:-"http://localhost:8080"}
 API="${API_BASE}/api/v1/tasks"
 CACHE_API="${API_BASE}/api/v1/cache"
 
