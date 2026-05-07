@@ -638,8 +638,9 @@ func (o *Orchestrator) Run(ctx context.Context, input AnalysisInput) (*AnalysisO
 		)
 	}
 
-	// Deduplicate entry points.
+	// Deduplicate entry points, then filter out non-HTTP process-main entries.
 	output.EntryPoints = dedupeCallNodes(output.EntryPoints)
+	output.EntryPoints = filterSpuriousEntryPoints(output.EntryPoints)
 
 	// Supplemental scenario pass: for any entry-role repo whose Worker produced
 	// entry points but no scenarios (because its ChangedFunctions were cross-repo
@@ -1631,6 +1632,58 @@ func dedupeCallNodes(nodes []CallNode) []CallNode {
 	return out
 }
 
+// filterSpuriousEntryPoints removes entry points that are clearly process-level
+// main() / CLI entrypoints rather than HTTP API handlers. These occur when an
+// LLM Worker traces a cross-repo call into a framework entry module (e.g.
+// notify_frame/main.py) and labels it as an entry point.
+//
+// Heuristic: drop an entry whose file basename is "main.py" (or "main.go")
+// AND whose function description contains "CLI", "cli", "python main", or
+// "entry point" without an HTTP method prefix (GET/POST/PUT/DELETE/PATCH).
+func filterSpuriousEntryPoints(nodes []CallNode) []CallNode {
+	out := make([]CallNode, 0, len(nodes))
+	for _, n := range nodes {
+		if isSpuriousMainEntry(n) {
+			continue
+		}
+		out = append(out, n)
+	}
+	return out
+}
+
+// isSpuriousMainEntry returns true for process-main entries that are not
+// real HTTP/RPC entrypoints.
+func isSpuriousMainEntry(n CallNode) bool {
+	// Must be a main.py / main.go file.
+	file := strings.ToLower(n.File)
+	base := file
+	if idx := strings.LastIndex(file, "/"); idx >= 0 {
+		base = file[idx+1:]
+	}
+	if base != "main.py" && base != "main.go" {
+		return false
+	}
+	fn := n.Function
+	fnLower := strings.ToLower(fn)
+	// Keep if it has an explicit HTTP method prefix — it's a real handler.
+	for _, method := range []string{"get ", "post ", "put ", "delete ", "patch ", "http "} {
+		if strings.HasPrefix(fnLower, method) {
+			return false
+		}
+	}
+	// Drop if the description signals a CLI / process entry.
+	for _, marker := range []string{"cli", "python main", "entry point", "cli entry"} {
+		if strings.Contains(fnLower, marker) {
+			return true
+		}
+	}
+	// Drop bare "main" function in main.py with no other context.
+	if fn == "main" || fn == "Main" {
+		return true
+	}
+	return false
+}
+
 // tagCallNodes returns a copy of nodes with Source set to src.
 // Used to annotate whether nodes came from the deterministic graph ("graph")
 // or from LLM Workers ("worker").
@@ -2213,10 +2266,36 @@ func (o *Orchestrator) runSupplementalScenarios(ctx context.Context, output *Ana
 	var work []repoWork
 	for repo, eps := range epByRepo {
 		wo, exists := output.WorkerOutputs[repo]
-		if exists && len(wo.EntryScenarios) > 0 {
-			continue // already has scenarios
+		// Build a set of entry functions that already have scenarios.
+		coveredFuncs := make(map[string]bool)
+		if exists {
+			for _, sc := range wo.EntryScenarios {
+				coveredFuncs[sc.EntryFunction] = true
+			}
 		}
-		work = append(work, repoWork{repo: repo, eps: eps, wo: wo})
+		// Collect entry points not yet covered by any scenario.
+		// Cap at 20 to avoid excessive LLM cost for repos with many endpoints;
+		// de-duplicate by file so each source file contributes at most one entry.
+		var uncovered []CallNode
+		seenFile := make(map[string]bool)
+		const maxSupplementalPerRepo = 20
+		for _, ep := range eps {
+			if coveredFuncs[ep.Function] {
+				continue
+			}
+			if seenFile[ep.File] {
+				continue
+			}
+			seenFile[ep.File] = true
+			uncovered = append(uncovered, ep)
+			if len(uncovered) >= maxSupplementalPerRepo {
+				break
+			}
+		}
+		if len(uncovered) == 0 {
+			continue // all entry points already have scenarios
+		}
+		work = append(work, repoWork{repo: repo, eps: uncovered, wo: wo})
 	}
 	if len(work) == 0 {
 		return
