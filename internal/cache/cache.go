@@ -16,13 +16,15 @@ const defaultTTL = 72 * time.Hour
 
 // AnalysisResult is the cached result of an analysis task.
 type AnalysisResult struct {
-	TaskID        string          `json:"task_id"`
-	CallChain     json.RawMessage `json:"call_chain,omitempty"`
-	TestScenarios string          `json:"test_scenarios,omitempty"`
-	EntryPoints   json.RawMessage `json:"entry_points,omitempty"`
-	TokenUsage    int             `json:"token_usage"`
-	StepCount     int             `json:"step_count"`
-	CreatedAt     time.Time       `json:"created_at"`
+	TaskID           string          `json:"task_id"`
+	CallChain        json.RawMessage `json:"call_chain,omitempty"`
+	TestScenarios    string          `json:"test_scenarios,omitempty"`
+	EntryPoints      json.RawMessage `json:"entry_points,omitempty"`
+	FunctionAnalyses json.RawMessage `json:"function_analyses,omitempty"`
+	ImpactSummary    string          `json:"impact_summary,omitempty"`
+	TokenUsage       int             `json:"token_usage"`
+	StepCount        int             `json:"step_count"`
+	CreatedAt        time.Time       `json:"created_at"`
 }
 
 // Cache wraps a Redis client for analysis result caching.

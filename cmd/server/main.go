@@ -895,10 +895,12 @@ func (s *apiServer) runAnalysis(taskID, inputDiff, inputDesc, cacheKey, sourceRe
 	// Check cache first.
 	if cached, ok := s.cache.Get(ctx, cacheKey); ok {
 		_ = s.store.SaveResult(ctx, &storage.TaskResult{
-			TaskID:      taskID,
-			CallChain:   cached.CallChain,
-			EntryPoints: cached.EntryPoints,
-			Modes:       modes,
+			TaskID:           taskID,
+			CallChain:        cached.CallChain,
+			EntryPoints:      cached.EntryPoints,
+			FunctionAnalyses: cached.FunctionAnalyses,
+			ImpactSummary:    cached.ImpactSummary,
+			Modes:            modes,
 		})
 		_ = s.store.UpdateTaskStatus(ctx, taskID, storage.TaskStatusCompleted)
 		return
@@ -1075,10 +1077,12 @@ func (s *apiServer) runAnalysis(taskID, inputDiff, inputDesc, cacheKey, sourceRe
 	_ = s.store.UpdateTaskStatus(ctx, taskID, storage.TaskStatusCompleted)
 
 	cacheResult := &cache.AnalysisResult{
-		TaskID:      taskID,
-		CallChain:   callChainJSON,
-		EntryPoints: entryPointsJSON,
-		CreatedAt:   time.Now(),
+		TaskID:           taskID,
+		CallChain:        callChainJSON,
+		EntryPoints:      entryPointsJSON,
+		FunctionAnalyses: funcAnalysesJSON,
+		ImpactSummary:    impactSummaryStr,
+		CreatedAt:        time.Now(),
 	}
 	_ = s.cache.Set(ctx, cacheKey, cacheResult, 0)
 
