@@ -911,9 +911,9 @@ func dedupeStrings(ss []string) []string {
 }
 
 // maxWorkerConcurrency limits how many Worker goroutines run in parallel.
-// High concurrency triggers LLM rate-limits and queueing; 6 is a safe value
-// for this LLM backend and keeps context-tokens-in-flight bounded.
-const maxWorkerConcurrency = 6
+// High concurrency triggers LLM rate-limits and queueing; 10 balances
+// throughput with rate-limit headroom for the current LLM backend.
+const maxWorkerConcurrency = 10
 
 // runWorkerBatch launches WorkerAgents for each pending batch and collects results.
 //
