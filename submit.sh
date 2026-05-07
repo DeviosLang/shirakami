@@ -18,9 +18,107 @@
 
 set -euo pipefail
 
+# ── --help ────────────────────────────────────────────────────────────────────
+if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+  grep '^#' "$0" | grep -v '^#!/' | sed 's/^# \{0,2\}//'
+  exit 0
+fi
+
 API_BASE=${API_BASE:-"http://43.137.205.156:8080"}
 API="${API_BASE}/api/v1/tasks"
 SOURCE_REPO=${SOURCE_REPO:-"vstation_network"}
+
+# ── 轮询并展示 e2e 结果 ────────────────────────────────────────────────────────
+# 用法：_wait_and_show <task_id>
+# 环境变量：
+#   WAIT=0          — 跳过等待，仅打印 task_id 后退出
+#   POLL_INTERVAL   — 轮询间隔秒数，默认 15
+#   TIMEOUT         — 最长等待秒数，默认 1800（30 分钟）
+_wait_and_show() {
+  local task_id=$1
+  local poll=${POLL_INTERVAL:-15}
+  local timeout=${TIMEOUT:-1800}
+  local deadline=$(( $(date +%s) + timeout ))
+
+  if [[ "${WAIT:-1}" == "0" ]]; then
+    return
+  fi
+
+  echo "⏳ 等待任务完成（每 ${poll}s 轮询，最长 ${timeout}s）..."
+  local last_status=""
+  while [[ $(date +%s) -lt $deadline ]]; do
+    sleep "$poll"
+    local resp
+    resp=$(curl -s "${API}/${task_id}" 2>/dev/null || true)
+    local status
+    status=$(echo "$resp" | jq -r '.status // "unknown"')
+    local progress
+    progress=$(echo "$resp" | jq -r '.progress // ""')
+
+    local ts
+    ts=$(date '+%H:%M:%S')
+    if [[ "$status" != "$last_status" || -n "$progress" ]]; then
+      echo -n "[$ts] status=${status}"
+      [[ -n "$progress" ]] && echo -n "  progress=${progress}"
+      echo ""
+      last_status=$status
+    fi
+
+    if [[ "$status" == "completed" ]]; then
+      break
+    fi
+    if [[ "$status" == "failed" ]]; then
+      local err
+      err=$(echo "$resp" | jq -r '.error // .error_message // "unknown error"')
+      echo "❌ 任务失败：$err" >&2
+      exit 1
+    fi
+  done
+
+  if [[ "$last_status" != "completed" ]]; then
+    echo "⚠️  超时（${timeout}s），任务仍未完成，task_id=${task_id}" >&2
+    exit 1
+  fi
+
+  echo ""
+  echo "✅ 分析完成，获取 e2e 结果..."
+  echo ""
+
+  local e2e
+  e2e=$(curl -s "${API}/${task_id}/e2e" 2>/dev/null)
+
+  # 显示 impact_summary（e2e 场景正文）
+  local impact
+  impact=$(echo "$e2e" | jq -r '.impact_summary // ""')
+  if [[ -n "$impact" ]]; then
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo "  E2E 测试场景（impact_summary）"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo "$impact"
+    echo ""
+  fi
+
+  # 显示 entry_points 汇总
+  local ep_count
+  ep_count=$(echo "$e2e" | jq '.entry_points | length')
+  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+  echo "  Entry Points（共 ${ep_count} 个）"
+  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+  echo "$e2e" | jq -r '.entry_points[]? | "  [\(.Repo)] \(.Function)  \(.File):\(.Line)"'
+  echo ""
+
+  # warnings
+  local warnings
+  warnings=$(echo "$e2e" | jq -r '.warnings[]? // empty')
+  if [[ -n "$warnings" ]]; then
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo "  ⚠️  分析警告"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo "$warnings" | sed 's/^/  /'
+    echo ""
+  fi
+}
+
 MODES=${MODES:-'["chain","e2e"]'}
 
 # ── 方式 1：repo + branch (input_branch 模式) ────────────────────────────────
@@ -64,6 +162,8 @@ if [[ -n "${BRANCH:-}" || -n "${BRANCHES:-}" ]]; then
   echo ""
   echo "查看 e2e 场景："
   echo "  curl -s ${API}/$TASK_ID/e2e | jq ."
+
+  _wait_and_show "$TASK_ID"
   exit 0
 fi
 
@@ -177,3 +277,5 @@ echo "  curl -s ${API}/$TASK_ID/chain | jq ."
 echo ""
 echo "查看 e2e 场景："
 echo "  curl -s ${API}/$TASK_ID/e2e | jq ."
+
+_wait_and_show "$TASK_ID"
