@@ -597,6 +597,11 @@ func (s *apiServer) getTask(w http.ResponseWriter, r *http.Request, id string, m
 		}
 	}
 
+	// Inject failure warnings when task failed.
+	if task.Status == storage.TaskStatusFailed {
+		resp.Warnings = buildFailedWarnings(task.ErrorMsg)
+	}
+
 	jsonOK(w, resp)
 }
 
@@ -732,7 +737,7 @@ func (s *apiServer) runAnalysis(taskID, inputDiff, inputDesc, cacheKey, sourceRe
 	cp, err := checkpoint.NewFileCheckpointer(cpDir)
 	if err != nil {
 		log.Errorw("checkpoint init failed", "task_id", taskID, "err", err)
-		_ = s.store.UpdateTaskStatus(ctx, taskID, storage.TaskStatusFailed)
+		_ = s.store.UpdateTaskStatusWithError(ctx, taskID, fmt.Sprintf("checkpoint init failed: %s", err.Error()))
 		return
 	}
 
@@ -763,7 +768,7 @@ func (s *apiServer) runAnalysis(taskID, inputDiff, inputDesc, cacheKey, sourceRe
 	})
 	if err != nil {
 		log.Errorw("analysis failed", "task_id", taskID, "err", err)
-		_ = s.store.UpdateTaskStatus(ctx, taskID, storage.TaskStatusFailed)
+		_ = s.store.UpdateTaskStatusWithError(ctx, taskID, err.Error())
 		return
 	}
 
@@ -1145,4 +1150,62 @@ func buildEmptyResultWarnings(inputDiff string) []string {
 	}
 
 	return nil
+}
+
+// buildFailedWarnings generates human-readable diagnostic hints for a failed task.
+// It inspects the stored error message and returns actionable guidance for the caller.
+func buildFailedWarnings(errMsg string) []string {
+	if errMsg == "" {
+		return []string{"分析任务失败，原因未知。请重新提交任务重试。"}
+	}
+
+	lower := strings.ToLower(errMsg)
+
+	// Rate-limit / quota errors (HTTP 429, "rate limit", "quota", "too many requests").
+	if strings.Contains(lower, "429") ||
+		strings.Contains(lower, "rate limit") ||
+		strings.Contains(lower, "too many requests") ||
+		strings.Contains(lower, "quota") {
+		return []string{
+			"LLM API 请求频率超限（429 Too Many Requests）。" +
+				"请等待约 1 分钟后重新提交任务。" +
+				"如频繁出现此错误，请联系管理员提升 API 配额或降低并发分析数量。",
+		}
+	}
+
+	// Timeout errors.
+	if strings.Contains(lower, "timeout") ||
+		strings.Contains(lower, "deadline exceeded") ||
+		strings.Contains(lower, "context deadline") {
+		return []string{
+			"分析超时。diff 变更量可能过大，或 LLM 响应延迟较高。" +
+				"建议拆分 diff 为更小的变更单元后重试，或稍后重新提交。",
+		}
+	}
+
+	// Network / connection errors.
+	if strings.Contains(lower, "connection refused") ||
+		strings.Contains(lower, "no such host") ||
+		strings.Contains(lower, "network") ||
+		strings.Contains(lower, "dial") {
+		return []string{
+			"无法连接到 LLM API（网络错误）。请检查服务网络配置后重新提交任务。",
+		}
+	}
+
+	// Authentication errors (401/403).
+	if strings.Contains(lower, "401") ||
+		strings.Contains(lower, "403") ||
+		strings.Contains(lower, "unauthorized") ||
+		strings.Contains(lower, "forbidden") ||
+		strings.Contains(lower, "invalid api key") {
+		return []string{
+			"LLM API 认证失败（401/403）。请检查 API Key 配置是否正确，然后重新提交任务。",
+		}
+	}
+
+	// Fallback: surface raw error with retry hint.
+	return []string{
+		fmt.Sprintf("分析任务失败：%s。请重新提交任务重试，若问题持续请联系管理员。", errMsg),
+	}
 }

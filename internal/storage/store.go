@@ -43,6 +43,9 @@ type Task struct {
 	Modes         []string
 	SourceRepo    string
 	QueuePosition *int
+	// ErrorMsg holds the failure reason when Status == "failed".
+	// Empty for non-failed tasks.
+	ErrorMsg string
 }
 
 // TaskResult represents an analysis result record.
@@ -109,7 +112,7 @@ func (s *Store) CreateTask(ctx context.Context, inputType InputType, inputDiff, 
 func (s *Store) GetTask(ctx context.Context, id string) (*Task, error) {
 	row := s.db.QueryRow(ctx,
 		`SELECT id, input_type, input_diff, input_desc, cache_key, status, created_at, completed_at,
-		        modes, source_repo, queue_position
+		        modes, source_repo, queue_position, COALESCE(error_message, '')
 		   FROM analysis_tasks WHERE id = $1`,
 		id,
 	)
@@ -119,7 +122,7 @@ func (s *Store) GetTask(ctx context.Context, id string) (*Task, error) {
 	err := row.Scan(
 		&task.ID, &itStr, &task.InputDiff, &task.InputDesc,
 		&task.CacheKey, &statusStr, &task.CreatedAt, &task.CompletedAt,
-		&task.Modes, &task.SourceRepo, &task.QueuePosition,
+		&task.Modes, &task.SourceRepo, &task.QueuePosition, &task.ErrorMsg,
 	)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrNotFound
@@ -139,7 +142,7 @@ func (s *Store) ListTasks(ctx context.Context, limit int) ([]Task, error) {
 	}
 	rows, err := s.db.Query(ctx,
 		`SELECT id, input_type, input_diff, input_desc, cache_key, status, created_at, completed_at,
-		        modes, source_repo, queue_position
+		        modes, source_repo, queue_position, COALESCE(error_message, '')
 		   FROM analysis_tasks
 		  ORDER BY created_at DESC
 		  LIMIT $1`,
@@ -157,7 +160,7 @@ func (s *Store) ListTasks(ctx context.Context, limit int) ([]Task, error) {
 		if err := rows.Scan(
 			&task.ID, &itStr, &task.InputDiff, &task.InputDesc,
 			&task.CacheKey, &statusStr, &task.CreatedAt, &task.CompletedAt,
-			&task.Modes, &task.SourceRepo, &task.QueuePosition,
+			&task.Modes, &task.SourceRepo, &task.QueuePosition, &task.ErrorMsg,
 		); err != nil {
 			return nil, fmt.Errorf("scan task: %w", err)
 		}
@@ -184,6 +187,19 @@ func (s *Store) UpdateTaskStatus(ctx context.Context, id string, status TaskStat
 	}
 	if err != nil {
 		return fmt.Errorf("update task status: %w", err)
+	}
+	return nil
+}
+
+// UpdateTaskStatusWithError sets the task status to failed, records completed_at,
+// and stores the error message so API callers can surface a diagnostic hint.
+func (s *Store) UpdateTaskStatusWithError(ctx context.Context, id string, errMsg string) error {
+	_, err := s.db.Exec(ctx,
+		`UPDATE analysis_tasks SET status = 'failed', completed_at = NOW(), error_message = $1 WHERE id = $2`,
+		errMsg, id,
+	)
+	if err != nil {
+		return fmt.Errorf("update task status with error: %w", err)
 	}
 	return nil
 }
