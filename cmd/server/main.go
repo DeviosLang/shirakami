@@ -593,6 +593,9 @@ func (s *apiServer) getTask(w http.ResponseWriter, r *http.Request, id string, m
 			// Inject diagnostic warnings when result is empty.
 			if isEmptyResult(result) {
 				resp.Warnings = buildEmptyResultWarnings(task.InputDiff)
+			} else {
+				// Inject ghost-file warnings when LLM hallucinated file paths.
+				resp.Warnings = append(resp.Warnings, extractGhostWarnings(result.ImpactSummary)...)
 			}
 		}
 	}
@@ -868,13 +871,22 @@ func (s *apiServer) runAnalysis(taskID, inputDiff, inputDesc, cacheKey, sourceRe
 	crossRepoHops := len(output.CrossRepoHops)
 	indexCoverageJSON, _ := json.Marshal(output.IndexCoverage)
 
+	// Append ghost-files sentinel line to ImpactSummary so it can be surfaced
+	// as actionable warnings when the task result is fetched. We embed it as a
+	// hidden HTML comment so it does not affect Markdown rendering.
+	impactSummaryStr := impactSummary.String()
+	if len(output.GhostFiles) > 0 {
+		ghostJSON, _ := json.Marshal(output.GhostFiles)
+		impactSummaryStr += "\n<!-- ghost_files: " + string(ghostJSON) + " -->"
+	}
+
 	_ = s.store.SaveResult(ctx, &storage.TaskResult{
 		TaskID:           taskID,
 		CallChain:        callChainJSON,
 		EntryPoints:      entryPointsJSON,
 		FunctionAnalyses: funcAnalysesJSON,
 		UTSuggestions:    utSuggestions.String(),
-		ImpactSummary:    impactSummary.String(),
+		ImpactSummary:    impactSummaryStr,
 		CrossRepoHops:    crossRepoHops,
 		Risk:             risk,
 		IndexCoverage:    indexCoverageJSON,
@@ -1208,4 +1220,40 @@ func buildFailedWarnings(errMsg string) []string {
 	return []string{
 		fmt.Sprintf("分析任务失败：%s。请重新提交任务重试，若问题持续请联系管理员。", errMsg),
 	}
+}
+
+// extractGhostWarnings parses the ghost_files sentinel line embedded in ImpactSummary
+// and converts each hallucinated file path into a human-readable warning string.
+//
+// Format of the sentinel line (appended by runAnalysis):
+//
+//	<!-- ghost_files: ["cvm_api/api/Foo.py","cvm_api/entry/instance/Foo.py"] -->
+func extractGhostWarnings(impactSummary string) []string {
+	const prefix = "<!-- ghost_files: "
+	const suffix = " -->"
+	idx := strings.Index(impactSummary, prefix)
+	if idx < 0 {
+		return nil
+	}
+	start := idx + len(prefix)
+	end := strings.Index(impactSummary[start:], suffix)
+	if end < 0 {
+		return nil
+	}
+	raw := impactSummary[start : start+end]
+
+	var paths []string
+	if err := json.Unmarshal([]byte(raw), &paths); err != nil || len(paths) == 0 {
+		return nil
+	}
+
+	warns := make([]string, 0, len(paths))
+	for _, p := range paths {
+		warns = append(warns, fmt.Sprintf(
+			"分析结果中检测到幻觉路径（文件不存在）：%s — 该节点已被过滤。"+
+				"如需完整追踪，请确认函数命名风格（驼峰/蛇形）或通过 dispatch 机制调用。",
+			p,
+		))
+	}
+	return warns
 }

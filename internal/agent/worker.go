@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"time"
@@ -82,6 +84,10 @@ type WorkerResult struct {
 	SearchResults []SearchResult
 	// RawContent holds the full LLM text output for display / debugging.
 	RawContent string
+	// GhostFiles holds file paths that were referenced by the LLM output but
+	// do not exist on disk. Populated by filterGhostNodes after parseWorkerOutput.
+	// Used to emit actionable warnings in API responses.
+	GhostFiles []string
 }
 
 // UTAnalysis is the unit-test suggestion for one changed function, produced
@@ -437,6 +443,21 @@ func (w *WorkerAgent) Analyse(ctx context.Context, task WorkerTask) (*WorkerResu
 			"DO NOT record cross_repo_calls for repos you did not see in ripgrep results (no guessing about\n"+
 			"aurora, vstation_nano, or other hypothetical repos). If a repo is only mentioned in comments or\n"+
 			"documentation, do NOT record it.\n\n"+
+			"## CRITICAL RULES FOR nodes[] and entry_points[]:\n"+
+			"The \"file\" field MUST be a verbatim path you actually saw in a ripgrep result.\n"+
+			"NEVER guess or invent file paths based on function-name conventions\n"+
+			"(e.g. do NOT write \"api/ResetInstanceNetType.py\" just because the function is named that).\n"+
+			"If you did not see a file path in ripgrep output, leave \"file\": \"\" and \"line\": 0.\n\n"+
+			"## WHEN ripgrep returns 0 results — mandatory fallback sequence (DO NOT skip):\n"+
+			"Before recording any node with a guessed file path, exhaust ALL steps below:\n"+
+			"  1. Naming-style conversion: try both CamelCase and snake_case variants.\n"+
+			"     e.g. \"ResetInstanceNetType\" → also try \"reset_instance_net_type\", \"reset_net_type\"\n"+
+			"  2. Partial keyword search: extract the most distinctive 1-2 words from the function name.\n"+
+			"     e.g. \"ResetInstanceNetType\" → try \"NetType\", \"reset_net\", \"ResetNet\"\n"+
+			"  3. Remove the repo restriction — search ALL repos:\n"+
+			"     ripgrep({\"pattern\": \"<keyword>\"})  ← no \"repo\" param\n"+
+			"  4. Only if ALL steps above return 0 results: record the node with \"file\": \"\", \"line\": 0.\n"+
+			"     DO NOT invent a path. The system will handle the gap.\n\n"+
 			"## STEP 2 — Output single JSON block (NO file_reader calls needed)\n"+
 			"```json\n"+
 			"{\n"+
@@ -518,12 +539,22 @@ func (w *WorkerAgent) Analyse(ctx context.Context, task WorkerTask) (*WorkerResu
 	// Parse the structured JSON output from the LLM.
 	workerResult := parseWorkerOutput(task.RepoName, result.Content)
 	workerResult.RawContent = result.Content
+
+	// Filter hallucinated file paths: any node whose File field points to a path
+	// that does not exist on disk is almost certainly an LLM fabrication.
+	// filterGhostNodes records the ghost paths in workerResult.GhostFiles so
+	// the API layer can surface actionable warnings, then removes those nodes.
+	if task.RepoPath != "" {
+		filterGhostNodes(workerResult, task.RepoPath)
+	}
+
 	log.Infow("worker.parsed",
 		"repo", task.RepoName,
 		"nodes", len(workerResult.Nodes),
 		"cross_repo_calls", len(workerResult.CrossRepoCalls),
 		"entry_points", len(workerResult.EntryPoints),
 		"search_results", len(workerResult.SearchResults),
+		"ghost_files_filtered", len(workerResult.GhostFiles),
 	)
 
 	// Scenario follow-up: if entry points were found, ask the LLM to generate
@@ -1363,4 +1394,72 @@ func parseUTAnalyses(content string) []UTAnalysis {
 		out = append(out, ut)
 	}
 	return out
+}
+
+// filterGhostNodes removes CallNode entries whose File field refers to a path
+// that does not exist under repoPath on disk. Such entries are almost always
+// LLM hallucinations — the model invented a plausible-sounding file path
+// (e.g. "api/ResetInstanceNetType.py") instead of admitting it could not find
+// the function via ripgrep.
+//
+// Nodes with an empty File field are kept unconditionally: they are legitimate
+// results where the LLM correctly omitted a file path rather than guessing.
+//
+// Filtered paths are recorded in result.GhostFiles so the API layer can
+// surface actionable warnings to the caller.
+func filterGhostNodes(result *WorkerResult, repoPath string) {
+	log := logger.S()
+
+	seen := make(map[string]bool)
+
+	check := func(file string) bool {
+		if file == "" {
+			return true // no path → keep
+		}
+		// Strip leading "repoName/" prefix if present so we don't double-join.
+		// e.g. "cvm_api/api/Foo.py" under repoPath "/workspace/cvm_api"
+		//   → strip "cvm_api/" → "api/Foo.py"
+		//   → filepath.Join("/workspace/cvm_api", "api/Foo.py")
+		cleanFile := file
+		if idx := strings.Index(cleanFile, "/"); idx > 0 {
+			// Check whether the first segment matches the last component of repoPath.
+			repoBase := filepath.Base(repoPath)
+			if cleanFile[:idx] == repoBase {
+				cleanFile = cleanFile[idx+1:]
+			}
+		}
+		abs := filepath.Join(repoPath, cleanFile)
+		if _, err := os.Stat(abs); err == nil {
+			return true // file exists → keep
+		}
+		// File does not exist — record as ghost (deduplicated).
+		if !seen[file] {
+			seen[file] = true
+			result.GhostFiles = append(result.GhostFiles, file)
+			log.Warnw("worker.ghost_file_filtered",
+				"repo", result.RepoName,
+				"file", file,
+				"repo_path", repoPath,
+			)
+		}
+		return false
+	}
+
+	// Filter nodes.
+	filtered := result.Nodes[:0]
+	for _, n := range result.Nodes {
+		if check(n.File) {
+			filtered = append(filtered, n)
+		}
+	}
+	result.Nodes = filtered
+
+	// Filter entry points.
+	filteredEP := result.EntryPoints[:0]
+	for _, ep := range result.EntryPoints {
+		if check(ep.File) {
+			filteredEP = append(filteredEP, ep)
+		}
+	}
+	result.EntryPoints = filteredEP
 }

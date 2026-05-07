@@ -79,6 +79,10 @@ type AnalysisOutput struct {
 	// Each hop represents a call from one repo to another. Only populated in
 	// hybrid/deterministic mode (resolver path); empty when pure LLM or shadow mode.
 	CrossRepoHops []resolve.CrossRepoHop
+	// GhostFiles collects file paths that were referenced by LLM Worker outputs but
+	// did not exist on disk. Populated by filterGhostNodes in each WorkerAgent.
+	// Surfaced as actionable warnings in API responses.
+	GhostFiles []string
 }
 
 // ShadowParityReport holds the shadow mode comparison result (embedded in AnalysisOutput).
@@ -444,6 +448,9 @@ func (o *Orchestrator) Run(ctx context.Context, input AnalysisInput) (*AnalysisO
 
 			// Collect constraint and test scenario analyses.
 			output.FunctionAnalyses = append(output.FunctionAnalyses, result.FunctionAnalyses...)
+
+			// Collect ghost files (LLM-hallucinated paths filtered by filterGhostNodes).
+			output.GhostFiles = append(output.GhostFiles, result.GhostFiles...)
 
 			repoVisited[repoName] = true
 
