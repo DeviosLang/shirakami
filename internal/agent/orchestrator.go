@@ -605,6 +605,18 @@ func (o *Orchestrator) Run(ctx context.Context, input AnalysisInput) (*AnalysisO
 	// Deduplicate entry points.
 	output.EntryPoints = dedupeCallNodes(output.EntryPoints)
 
+	// Supplemental scenario pass: for any entry-role repo whose Worker produced
+	// entry points but no scenarios (because its ChangedFunctions were cross-repo
+	// tracker functions rather than the original diff functions), run a lightweight
+	// scenario-generation pass now using the full output.ChangedFunctions as context.
+	//
+	// This fixes the common case where cvm_api / cxm_api Workers are triggered by
+	// cross-repo tracing and find entry points but lack the original diff context
+	// needed to generate meaningful test scenarios.
+	if workerModeEnabled(o.modes, "e2e") && len(output.ChangedFunctions) > 0 && len(output.EntryPoints) > 0 {
+		o.runSupplementalScenarios(ctx, output)
+	}
+
 	log.Infow("analyse.done",
 		"total_nodes", len(output.CallGraph),
 		"entry_points", len(output.EntryPoints),
@@ -2021,4 +2033,100 @@ func (o *Orchestrator) buildShadowReport(llmOutput *AnalysisOutput, graphResult 
 	)
 
 	return report
+}
+
+// runSupplementalScenarios runs a scenario-generation pass for any entry-role
+// repo that has entry points but produced no scenarios during the main Worker
+// run. This happens when the repo was reached via cross-repo tracing: the Worker
+// that ran for that repo received cross-repo tracker functions (not the original
+// diff functions) as its ChangedFunctions, so it either skipped scenario
+// generation entirely or generated empty/useless scenarios.
+//
+// To fix this, we create a lightweight WorkerAgent (no analysis, follow-up only)
+// and call runScenarioAnalysis with:
+//   - changedFunctions = output.ChangedFunctions (the real diff-changed functions)
+//   - entryPoints      = the subset of output.EntryPoints for this repo
+//
+// The resulting scenarios are stored back into output.WorkerOutputs[repo].EntryScenarios
+// so that the existing impactSummary aggregation in main.go picks them up.
+func (o *Orchestrator) runSupplementalScenarios(ctx context.Context, output *AnalysisOutput) {
+	log := logger.S()
+
+	// Group output.EntryPoints by repo.
+	epByRepo := make(map[string][]CallNode)
+	for _, ep := range output.EntryPoints {
+		epByRepo[ep.Repo] = append(epByRepo[ep.Repo], ep)
+	}
+
+	for repo, eps := range epByRepo {
+		// Check whether this repo already has scenarios.
+		wo, exists := output.WorkerOutputs[repo]
+		if exists && len(wo.EntryScenarios) > 0 {
+			// Already has scenarios — nothing to do.
+			continue
+		}
+
+		log.Infow("orchestrator.supplemental_scenarios",
+			"repo", repo,
+			"entry_points", len(eps),
+			"changed_functions", len(output.ChangedFunctions),
+		)
+
+		// Build a minimal WorkerAgent (tools list is unused — RunFollowUpNoTools
+		// does not execute any tool calls).
+		w := NewWorkerAgentWithBudget(
+			o.llmClient, o.tools, o.cp, o.repos, o.workspaceDir, 0,
+		)
+
+		// Use a minimal "prior content" that gives the LLM enough context to
+		// generate meaningful scenarios without a real analysis transcript.
+		// We describe the call chain direction and what was changed.
+		var sb strings.Builder
+		sb.WriteString("Call-chain analysis summary:\n")
+		sb.WriteString("The following functions were changed by the diff:\n")
+		for _, fn := range output.ChangedFunctions {
+			fmt.Fprintf(&sb, "  - %s\n", fn)
+		}
+		sb.WriteString("\nCall chain traversal found the following entry points (external API endpoints / RPC handlers):\n")
+		for _, ep := range eps {
+			fmt.Fprintf(&sb, "  - %s (repo: %s, file: %s, line: %d)\n",
+				ep.Function, ep.Repo, ep.File, ep.Line)
+		}
+		// Include any call graph nodes for this repo as additional context.
+		if wo != nil {
+			for _, n := range wo.Nodes {
+				fmt.Fprintf(&sb, "  [call graph node] %s (%s)\n", n.Function, n.File)
+			}
+		}
+		priorContent := sb.String()
+
+		// Generate task ID for logging (reuse repo name as pseudo-ID).
+		taskID := "supplemental-" + repo
+
+		scenarios := w.runScenarioAnalysis(
+			ctx, taskID, priorContent, output.ChangedFunctions, eps, o.extraPrompt,
+		)
+
+		log.Infow("orchestrator.supplemental_scenarios_done",
+			"repo", repo,
+			"entry_points", len(eps),
+			"scenarios", len(scenarios),
+		)
+
+		if len(scenarios) == 0 {
+			continue
+		}
+
+		// Store results back in WorkerOutputs so the existing aggregation picks them up.
+		if wo == nil {
+			// No WorkerResult exists for this repo (e.g. it was purely graph-discovered).
+			// Create a minimal one.
+			wo = &WorkerResult{
+				RepoName:   repo,
+				EntryPoints: eps,
+			}
+			output.WorkerOutputs[repo] = wo
+		}
+		wo.EntryScenarios = append(wo.EntryScenarios, scenarios...)
+	}
 }
