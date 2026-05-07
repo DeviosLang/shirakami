@@ -85,9 +85,10 @@ type Usage struct {
 
 // Client wraps an OpenAI-compatible API client.
 type Client struct {
-	openai    *openai.Client
-	model     string
-	maxTokens int
+	openai         *openai.Client
+	model          string
+	maxTokens      int
+	requestTimeout time.Duration // per-request deadline; 0 means no extra deadline
 }
 
 // Config holds configuration for creating a Client.
@@ -96,6 +97,10 @@ type Config struct {
 	APIKey    string
 	Model     string
 	MaxTokens int
+	// RequestTimeout is applied as a per-request deadline on top of the caller's
+	// context. Values ≤ 0 mean no additional deadline (rely on caller context only).
+	// Recommended: 120 seconds (prevents stuck requests from blocking Workers).
+	RequestTimeout int // seconds
 }
 
 // NewClient creates a new LLM client using the OpenAI-compatible API.
@@ -108,16 +113,24 @@ func NewClient(cfg Config) *Client {
 	if maxTokens == 0 {
 		maxTokens = 4096
 	}
+	var reqTimeout time.Duration
+	if cfg.RequestTimeout > 0 {
+		reqTimeout = time.Duration(cfg.RequestTimeout) * time.Second
+	}
 	return &Client{
-		openai:    openai.NewClientWithConfig(ocfg),
-		model:     cfg.Model,
-		maxTokens: maxTokens,
+		openai:         openai.NewClientWithConfig(ocfg),
+		model:          cfg.Model,
+		maxTokens:      maxTokens,
+		requestTimeout: reqTimeout,
 	}
 }
 
 // Complete sends messages to the LLM and returns the response.
 // It automatically retries on transient errors (429 rate limit, 503 unavailable)
 // using exponential backoff: 2s, 4s, 8s (3 attempts total).
+//
+// If c.requestTimeout > 0, each individual HTTP call is wrapped with an additional
+// deadline so a stalled LLM server cannot hold a Worker goroutine indefinitely.
 func (c *Client) Complete(ctx context.Context, messages []Message, tools []ToolDefinition) (*Response, error) {
 	req, err := c.buildRequest(messages, tools, false)
 	if err != nil {
@@ -128,7 +141,16 @@ func (c *Client) Complete(ctx context.Context, messages []Message, tools []ToolD
 	backoff := 2 * time.Second
 
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
-		resp, err := c.openai.CreateChatCompletion(ctx, req)
+		callCtx := ctx
+		var cancel context.CancelFunc
+		if c.requestTimeout > 0 {
+			callCtx, cancel = context.WithTimeout(ctx, c.requestTimeout)
+		}
+
+		resp, err := c.openai.CreateChatCompletion(callCtx, req)
+		if cancel != nil {
+			cancel()
+		}
 		if err == nil {
 			return parseResponse(resp)
 		}

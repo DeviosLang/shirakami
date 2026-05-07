@@ -957,6 +957,18 @@ func (o *Orchestrator) runWorkerBatch(ctx context.Context, pending map[string][]
 			go func() {
 				defer wg.Done()
 				defer func() { <-sem }()
+				defer func() {
+					if r := recover(); r != nil {
+						log.Errorw("orchestrator.worker_panic",
+							"repo", j.repo,
+							"batch_key", j.batchKey,
+							"panic", fmt.Sprintf("%v", r),
+						)
+						mu.Lock()
+						batchResults[j.batchKey] = nil
+						mu.Unlock()
+					}
+				}()
 
 				repoPath := o.repoPath(j.repo)
 				worker := NewWorkerAgentWithBudget(
@@ -2049,6 +2061,9 @@ func (o *Orchestrator) buildShadowReport(llmOutput *AnalysisOutput, graphResult 
 //
 // The resulting scenarios are stored back into output.WorkerOutputs[repo].EntryScenarios
 // so that the existing impactSummary aggregation in main.go picks them up.
+//
+// Up to 3 repos are processed concurrently. The whole pass is capped at 3 minutes
+// so a slow LLM endpoint cannot block the caller indefinitely.
 func (o *Orchestrator) runSupplementalScenarios(ctx context.Context, output *AnalysisOutput) {
 	log := logger.S()
 
@@ -2058,75 +2073,117 @@ func (o *Orchestrator) runSupplementalScenarios(ctx context.Context, output *Ana
 		epByRepo[ep.Repo] = append(epByRepo[ep.Repo], ep)
 	}
 
+	// Collect repos that need supplemental scenarios.
+	type repoWork struct {
+		repo string
+		eps  []CallNode
+		wo   *WorkerResult
+	}
+	var work []repoWork
 	for repo, eps := range epByRepo {
-		// Check whether this repo already has scenarios.
 		wo, exists := output.WorkerOutputs[repo]
 		if exists && len(wo.EntryScenarios) > 0 {
-			// Already has scenarios — nothing to do.
-			continue
+			continue // already has scenarios
 		}
+		work = append(work, repoWork{repo: repo, eps: eps, wo: wo})
+	}
+	if len(work) == 0 {
+		return
+	}
 
-		log.Infow("orchestrator.supplemental_scenarios",
-			"repo", repo,
-			"entry_points", len(eps),
-			"changed_functions", len(output.ChangedFunctions),
-		)
+	// Apply a 3-minute hard cap to the entire supplemental pass.
+	suppCtx, cancel := context.WithTimeout(ctx, 3*time.Minute)
+	defer cancel()
 
-		// Build a minimal WorkerAgent (tools list is unused — RunFollowUpNoTools
-		// does not execute any tool calls).
-		w := NewWorkerAgentWithBudget(
-			o.llmClient, o.tools, o.cp, o.repos, o.workspaceDir, 0,
-		)
+	const maxConcurrency = 3
+	sem := make(chan struct{}, maxConcurrency)
 
-		// Use a minimal "prior content" that gives the LLM enough context to
-		// generate meaningful scenarios without a real analysis transcript.
-		// We describe the call chain direction and what was changed.
-		var sb strings.Builder
-		sb.WriteString("Call-chain analysis summary:\n")
-		sb.WriteString("The following functions were changed by the diff:\n")
-		for _, fn := range output.ChangedFunctions {
-			fmt.Fprintf(&sb, "  - %s\n", fn)
-		}
-		sb.WriteString("\nCall chain traversal found the following entry points (external API endpoints / RPC handlers):\n")
-		for _, ep := range eps {
-			fmt.Fprintf(&sb, "  - %s (repo: %s, file: %s, line: %d)\n",
-				ep.Function, ep.Repo, ep.File, ep.Line)
-		}
-		// Include any call graph nodes for this repo as additional context.
-		if wo != nil {
-			for _, n := range wo.Nodes {
-				fmt.Fprintf(&sb, "  [call graph node] %s (%s)\n", n.Function, n.File)
+	type result struct {
+		repo      string
+		wo        *WorkerResult // may be nil (newly created)
+		scenarios []EntryPointScenario
+	}
+	resultCh := make(chan result, len(work))
+
+	var wg sync.WaitGroup
+	for _, w := range work {
+		w := w
+		wg.Add(1)
+		sem <- struct{}{}
+		go func() {
+			defer wg.Done()
+			defer func() { <-sem }()
+			defer func() {
+				if r := recover(); r != nil {
+					log.Errorw("orchestrator.supplemental_panic",
+						"repo", w.repo,
+						"panic", fmt.Sprintf("%v", r),
+					)
+					resultCh <- result{repo: w.repo, wo: w.wo, scenarios: nil}
+				}
+			}()
+
+			log.Infow("orchestrator.supplemental_scenarios",
+				"repo", w.repo,
+				"entry_points", len(w.eps),
+				"changed_functions", len(output.ChangedFunctions),
+			)
+
+			worker := NewWorkerAgentWithBudget(
+				o.llmClient, o.tools, o.cp, o.repos, o.workspaceDir, 0,
+			)
+
+			var sb strings.Builder
+			sb.WriteString("Call-chain analysis summary:\n")
+			sb.WriteString("The following functions were changed by the diff:\n")
+			for _, fn := range output.ChangedFunctions {
+				fmt.Fprintf(&sb, "  - %s\n", fn)
 			}
-		}
-		priorContent := sb.String()
+			sb.WriteString("\nCall chain traversal found the following entry points (external API endpoints / RPC handlers):\n")
+			for _, ep := range w.eps {
+				fmt.Fprintf(&sb, "  - %s (repo: %s, file: %s, line: %d)\n",
+					ep.Function, ep.Repo, ep.File, ep.Line)
+			}
+			if w.wo != nil {
+				for _, n := range w.wo.Nodes {
+					fmt.Fprintf(&sb, "  [call graph node] %s (%s)\n", n.Function, n.File)
+				}
+			}
+			priorContent := sb.String()
+			taskID := "supplemental-" + w.repo
 
-		// Generate task ID for logging (reuse repo name as pseudo-ID).
-		taskID := "supplemental-" + repo
+			scenarios := worker.runScenarioAnalysis(
+				suppCtx, taskID, priorContent, output.ChangedFunctions, w.eps, o.extraPrompt,
+			)
 
-		scenarios := w.runScenarioAnalysis(
-			ctx, taskID, priorContent, output.ChangedFunctions, eps, o.extraPrompt,
-		)
+			log.Infow("orchestrator.supplemental_scenarios_done",
+				"repo", w.repo,
+				"entry_points", len(w.eps),
+				"scenarios", len(scenarios),
+			)
+			resultCh <- result{repo: w.repo, wo: w.wo, scenarios: scenarios}
+		}()
+	}
 
-		log.Infow("orchestrator.supplemental_scenarios_done",
-			"repo", repo,
-			"entry_points", len(eps),
-			"scenarios", len(scenarios),
-		)
+	// Close channel when all goroutines finish.
+	go func() {
+		wg.Wait()
+		close(resultCh)
+	}()
 
-		if len(scenarios) == 0 {
+	// Collect results and merge back into output.WorkerOutputs (single-threaded — safe).
+	for r := range resultCh {
+		if len(r.scenarios) == 0 {
 			continue
 		}
-
-		// Store results back in WorkerOutputs so the existing aggregation picks them up.
+		wo := r.wo
 		if wo == nil {
-			// No WorkerResult exists for this repo (e.g. it was purely graph-discovered).
-			// Create a minimal one.
 			wo = &WorkerResult{
-				RepoName:   repo,
-				EntryPoints: eps,
+				RepoName:    r.repo,
+				EntryPoints: epByRepo[r.repo],
 			}
-			output.WorkerOutputs[repo] = wo
+			output.WorkerOutputs[r.repo] = wo
 		}
-		wo.EntryScenarios = append(wo.EntryScenarios, scenarios...)
+		wo.EntryScenarios = append(wo.EntryScenarios, r.scenarios...)
 	}
 }

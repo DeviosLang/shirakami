@@ -43,6 +43,11 @@ type LLMConfig struct {
 	APIKey    string `mapstructure:"api_key"`
 	Model     string `mapstructure:"model"`
 	MaxTokens int    `mapstructure:"max_tokens"`
+	// RequestTimeout is the per-request timeout for LLM calls in seconds.
+	// A new context with this deadline is applied to each CreateChatCompletion call.
+	// Default: 120 (2 minutes). Set to 0 to disable (inherit caller context only).
+	// Environment variable: SHIRAKAMI_LLM_REQUEST_TIMEOUT
+	RequestTimeout int `mapstructure:"request_timeout"`
 }
 
 type DBConfig struct {
@@ -128,6 +133,7 @@ func Load(cfgFile string) (*Config, error) {
 	_ = viper.BindEnv("llm.api_key", "SHIRAKAMI_LLM_API_KEY")
 	_ = viper.BindEnv("llm.endpoint", "SHIRAKAMI_LLM_ENDPOINT")
 	_ = viper.BindEnv("llm.model", "SHIRAKAMI_LLM_MODEL")
+	_ = viper.BindEnv("llm.request_timeout", "SHIRAKAMI_LLM_REQUEST_TIMEOUT")
 	_ = viper.BindEnv("db.dsn", "SHIRAKAMI_DB_DSN")
 	_ = viper.BindEnv("redis.addr", "SHIRAKAMI_REDIS_ADDR")
 	_ = viper.BindEnv("redis.password", "SHIRAKAMI_REDIS_PASSWORD")
@@ -145,6 +151,7 @@ func Load(cfgFile string) (*Config, error) {
 	viper.SetDefault("llm.model", "gpt-4o")
 	viper.SetDefault("llm.endpoint", "https://api.openai.com/v1")
 	viper.SetDefault("llm.max_tokens", 128000)
+	viper.SetDefault("llm.request_timeout", 120)
 	viper.SetDefault("index_mode", "off")
 	viper.SetDefault("server.addr", ":8080")
 	viper.SetDefault("server.max_concurrent_analyses", 1)

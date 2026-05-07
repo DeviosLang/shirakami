@@ -907,9 +907,10 @@ func (s *apiServer) runAnalysis(taskID, inputDiff, inputDesc, cacheKey, sourceRe
 	_ = s.store.UpdateTaskStatus(ctx, taskID, storage.TaskStatusRunning)
 
 	llmClient := llm.NewClient(llm.Config{
-		BaseURL: s.cfg.LLM.Endpoint,
-		APIKey:  s.cfg.LLM.APIKey,
-		Model:   s.cfg.LLM.Model,
+		BaseURL:        s.cfg.LLM.Endpoint,
+		APIKey:         s.cfg.LLM.APIKey,
+		Model:          s.cfg.LLM.Model,
+		RequestTimeout: s.cfg.LLM.RequestTimeout,
 	})
 
 	tools := defaultTools(s.cfg.Workspace.Dir)

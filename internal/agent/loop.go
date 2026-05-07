@@ -247,11 +247,24 @@ func (a *AgentLoop) executeTools(ctx context.Context, toolCalls []llm.ToolCall) 
 	results := make([]llm.Message, len(toolCalls))
 	var wg sync.WaitGroup
 
+	log := logger.S()
 	for i, tc := range toolCalls {
 		i, tc := i, tc // capture loop vars
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
+			defer func() {
+				if r := recover(); r != nil {
+					log.Errorw("loop.tool_panic",
+						"tool", tc.Name,
+						"panic", fmt.Sprintf("%v", r),
+					)
+					results[i] = llm.ToolResultMessage{
+						ToolCallID: tc.ID,
+						Content:    fmt.Sprintf("error: tool %s panicked: %v", tc.Name, r),
+					}
+				}
+			}()
 			content, err := a.runTool(ctx, tc)
 			if err != nil {
 				content = fmt.Sprintf("error: %s", err.Error())

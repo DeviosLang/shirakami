@@ -257,9 +257,10 @@ func buildAnalyzeCmd() *cobra.Command {
 
 			// Build LLM client.
 			llmClient := llm.NewClient(llm.Config{
-				BaseURL: cfg.LLM.Endpoint,
-				APIKey:  cfg.LLM.APIKey,
-				Model:   cfg.LLM.Model,
+				BaseURL:        cfg.LLM.Endpoint,
+				APIKey:         cfg.LLM.APIKey,
+				Model:          cfg.LLM.Model,
+				RequestTimeout: cfg.LLM.RequestTimeout,
 			})
 
 			// Build repos from config.
