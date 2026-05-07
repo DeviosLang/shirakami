@@ -12,6 +12,7 @@
 - 自动识别集成测试入口（HTTP / gRPC / MQ / Cron / CLI），生成测试场景建议
 - 输出格式：终端树状图 / JSON / Markdown
 - **Golden Test 基准框架**：人工标注的 expected.json 覆盖 Go/Python 多种场景，CI 门禁自动校验
+- **Ghost Node Rescue**：LLM 产生幻觉文件路径时，自动用 ripgrep 按函数名变体回搜真实位置，完成节点恢复；彻底找不到时才降级为 `warnings[]` 字段提示调用方
 
 ## 系统要求
 
@@ -222,6 +223,9 @@ server:
 | `SHIRAKAMI_WEBHOOK_SECRET` | Webhook 验签密钥（GitLab token / GitHub HMAC key） | `server.webhook_secret` |
 | `SHIRAKAMI_GITLAB_TOKEN` | GitLab API Token（用于 Webhook 回写 MR 评论） | `server.gitlab_token` |
 | `SHIRAKAMI_GITHUB_TOKEN` | GitHub API Token（用于 Webhook 回写 PR 评论） | `server.github_token` |
+| `SHIRAKAMI_METRICS_PUSHGATEWAY_URL` | Prometheus Pushgateway 地址（可选，用于短生命周期任务指标推送） | `metrics.pushgateway_url` |
+| `SHIRAKAMI_METRICS_PUSH_INTERVAL` | 指标推送间隔（秒，默认 `15`） | `metrics.push_interval_seconds` |
+| `SHIRAKAMI_METRICS_JOB_NAME` | Pushgateway job 名称（默认 `shirakami`） | `metrics.job_name` |
 
 环境变量优先级高于配置文件。
 
@@ -617,6 +621,7 @@ GET /api/v1/tasks/{id}/ut       # 仅 UT 建议
 | `risk` | string | 风险等级 |
 | `token_usage` | int | 消耗 token 数 |
 | `step_count` | int | agent 执行步数 |
+| `warnings` | string[] | 诊断提示（仅在结果为空、分析失败、或 LLM 产生幻觉路径时出现） |
 
 ---
 
@@ -701,11 +706,15 @@ GET /healthz    # 健康检查，返回 200 ok
   ┌─────────────────────────────────────────────────────────┐
   │  Orchestrator + Worker（Layer C — LLM Agent Loop）       │
   │                                                         │
-  │  WorkerAgent × N（每个 repo 一个）                       │
+  │  WorkerAgent × N（每个 repo 一个，最大 10 并发）          │
   │  ┌────────────────────────────────────────────────────┐ │
-  │  │  AgentLoop (end_turn 状态机，最大 100 步)           │ │
+  │  │  AgentLoop (end_turn 状态机，最大 300 步)           │ │
   │  │  Tools: ripgrep / file_read / glob / lsp / gitdiff │ │
   │  └────────────────────────────────────────────────────┘ │
+  │                                                         │
+  │  Ghost Node Rescue:                                     │
+  │    LLM 幻觉路径自动补救（rg 按函数名变体回搜）             │
+  │    只有真正找不到的路径才降级为 warnings[]                 │
   │                                                         │
   │  Memory:                                                │
   │    Layer1: PostgreSQL 长期知识库                         │
