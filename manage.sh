@@ -19,8 +19,11 @@
 #   查看任务详情：
 #     bash manage.sh task <task_id>
 #
-#   查看任务 e2e 结果：
-#     bash manage.sh e2e <task_id>
+#   查看任务结果（模式可选 e2e / chain / ut / all）：
+#     bash manage.sh e2e   <task_id>   # E2E 测试场景 + 入口点
+#     bash manage.sh chain <task_id>   # 调用链 + 入口点
+#     bash manage.sh ut    <task_id>   # UT 建议
+#     bash manage.sh all   <task_id>   # 完整结果（原始 JSON）
 
 set -euo pipefail
 
@@ -99,37 +102,91 @@ case "$CMD" in
     curl -s "${API}/${TASK_ID}" | jq .
     ;;
 
-  # ── e2e 结果 ────────────────────────────────────────────────────────────────
-  e2e)
+  # ── 结果视图：e2e / chain / ut / all ────────────────────────────────────────
+  e2e|chain|ut|all)
     TASK_ID=${2:-""}
     if [[ -z "$TASK_ID" ]]; then
-      echo "用法：bash manage.sh e2e <task_id>" >&2
+      echo "用法：bash manage.sh ${CMD} <task_id>" >&2
       exit 1
     fi
-    E2E=$(curl -s "${API}/${TASK_ID}/e2e")
 
-    IMPACT=$(echo "$E2E" | jq -r '.impact_summary // ""')
-    if [[ -n "$IMPACT" ]]; then
-      echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-      echo "  E2E 测试场景（impact_summary）"
-      echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-      echo "$IMPACT"
-      echo ""
+    # all → 无子路径，其他 → /{mode}
+    if [[ "$CMD" == "all" ]]; then
+      URL="${API}/${TASK_ID}"
+    else
+      URL="${API}/${TASK_ID}/${CMD}"
     fi
 
-    EP_COUNT=$(echo "$E2E" | jq '.entry_points | length')
-    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-    echo "  Entry Points（共 ${EP_COUNT} 个）"
-    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-    echo "$E2E" | jq -r '.entry_points[]? | "  [\(.Repo)] \(.Function)  \(.File):\(.Line)"'
-    echo ""
+    RESP=$(curl -s "$URL")
 
-    WARNINGS=$(echo "$E2E" | jq -r '.warnings[]? // empty')
-    if [[ -n "$WARNINGS" ]]; then
+    # ── e2e ──────────────────────────────────────────────────────────────────
+    if [[ "$CMD" == "e2e" ]]; then
+      IMPACT=$(echo "$RESP" | jq -r '.impact_summary // ""')
+      if [[ -n "$IMPACT" ]]; then
+        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        echo "  E2E 测试场景（impact_summary）"
+        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        echo "$IMPACT"
+        echo ""
+      fi
+
+      EP_COUNT=$(echo "$RESP" | jq '.entry_points | length')
       echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-      echo "  ⚠️  分析警告"
+      echo "  Entry Points（共 ${EP_COUNT} 个）"
       echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-      echo "$WARNINGS" | sed 's/^/  /'
+      echo "$RESP" | jq -r '.entry_points[]? | "  [\(.Repo)] \(.Function)  \(.File):\(.Line)"'
+      echo ""
+
+      WARNINGS=$(echo "$RESP" | jq -r '.warnings[]? // empty')
+      if [[ -n "$WARNINGS" ]]; then
+        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        echo "  ⚠️  分析警告"
+        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        echo "$WARNINGS" | sed 's/^/  /'
+        echo ""
+      fi
+
+    # ── chain ─────────────────────────────────────────────────────────────────
+    elif [[ "$CMD" == "chain" ]]; then
+      EP_COUNT=$(echo "$RESP" | jq '.entry_points | length')
+      echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+      echo "  Entry Points（共 ${EP_COUNT} 个）"
+      echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+      echo "$RESP" | jq -r '.entry_points[]? | "  [\(.Repo)] \(.Function)  \(.File):\(.Line)"'
+      echo ""
+
+      NODE_COUNT=$(echo "$RESP" | jq '.call_chain | length')
+      echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+      echo "  调用链节点（共 ${NODE_COUNT} 个）"
+      echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+      echo "$RESP" | jq -r '.call_chain[]? | "  [\(.Repo)] \(.Function)  \(.File):\(.Line)"'
+      echo ""
+
+    # ── ut ────────────────────────────────────────────────────────────────────
+    elif [[ "$CMD" == "ut" ]]; then
+      UT=$(echo "$RESP" | jq -r '.ut_suggestions // ""')
+      if [[ -n "$UT" && "$UT" != "null" ]]; then
+        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        echo "  UT 建议"
+        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        echo "$UT"
+        echo ""
+      else
+        echo "（暂无 UT 建议）"
+      fi
+
+      FA_COUNT=$(echo "$RESP" | jq '.function_analyses | length // 0')
+      if [[ "$FA_COUNT" -gt 0 ]]; then
+        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        echo "  函数分析（共 ${FA_COUNT} 个）"
+        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        echo "$RESP" | jq -r '.function_analyses[]? | "  \(.entry_function // .function // "—")  scenarios=\(.entry_scenarios | length)"'
+        echo ""
+      fi
+
+    # ── all ───────────────────────────────────────────────────────────────────
+    else
+      echo "$RESP" | jq .
     fi
     ;;
 
