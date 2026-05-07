@@ -257,7 +257,7 @@ index abc123..def456 100644
 	cacheKey := cache.CacheKey(diff, []string{wsDir})
 
 	// Create task record.
-	task, err := store.CreateTask(ctx, storage.InputTypeDiff, diff, "", cacheKey)
+	task, err := store.CreateTask(ctx, storage.InputTypeDiff, diff, "", cacheKey, "", []string{"chain", "e2e"})
 	if err != nil {
 		t.Fatalf("create task: %v", err)
 	}
@@ -352,7 +352,7 @@ func TestE2E_DescriptionInput_FindFunctions(t *testing.T) {
 	cacheKey := cache.CacheKey(description, []string{wsDir})
 
 	// Create task.
-	task, err := store.CreateTask(ctx, storage.InputTypeDescription, "", description, cacheKey)
+	task, err := store.CreateTask(ctx, storage.InputTypeDescription, "", description, cacheKey, "", []string{"chain", "e2e"})
 	if err != nil {
 		t.Fatalf("create task: %v", err)
 	}
@@ -467,7 +467,7 @@ func TestE2E_CacheHit_NoRerun(t *testing.T) {
 	}
 
 	// Create a new task pointing to the cached result.
-	task, err := store.CreateTask(ctx, storage.InputTypeDiff, diff, "", cacheKey)
+	task, err := store.CreateTask(ctx, storage.InputTypeDiff, diff, "", cacheKey, "", []string{"chain", "e2e"})
 	if err != nil {
 		t.Fatalf("create task: %v", err)
 	}
@@ -553,7 +553,7 @@ func TestE2E_CheckpointResume(t *testing.T) {
 	// Create task record.
 	diff := "--- a/payment.go\n+++ b/payment.go\n@@ -6 +6 @@ timeout change"
 	cacheKey := cache.CacheKey(diff, []string{wsDir})
-	dbTask, err := store.CreateTask(ctx, storage.InputTypeDiff, diff, "", cacheKey)
+	dbTask, err := store.CreateTask(ctx, storage.InputTypeDiff, diff, "", cacheKey, "", []string{"chain", "e2e"})
 	if err != nil {
 		t.Fatalf("create task: %v", err)
 	}

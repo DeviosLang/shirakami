@@ -108,7 +108,7 @@ func TestStorage_CreateAndGetTask(t *testing.T) {
 	store := storage.New(pool)
 	ctx := context.Background()
 
-	task, err := store.CreateTask(ctx, storage.InputTypeDiff, "--- a/foo.go\n+++ b/foo.go", "fix payment retry", "cache-key-123")
+	task, err := store.CreateTask(ctx, storage.InputTypeDiff, "--- a/foo.go\n+++ b/foo.go", "fix payment retry", "cache-key-123", "", []string{"chain"})
 	if err != nil {
 		t.Fatalf("CreateTask: %v", err)
 	}
@@ -141,7 +141,7 @@ func TestStorage_UpdateTaskStatus(t *testing.T) {
 	store := storage.New(pool)
 	ctx := context.Background()
 
-	task, err := store.CreateTask(ctx, storage.InputTypeDescription, "", "desc", "key-456")
+	task, err := store.CreateTask(ctx, storage.InputTypeDescription, "", "desc", "key-456", "", []string{"chain"})
 	if err != nil {
 		t.Fatalf("CreateTask: %v", err)
 	}
@@ -187,7 +187,7 @@ func TestStorage_ListTasks(t *testing.T) {
 	ctx := context.Background()
 
 	for i := 0; i < 3; i++ {
-		_, err := store.CreateTask(ctx, storage.InputTypeDiff, fmt.Sprintf("diff-%d", i), "", fmt.Sprintf("key-%d", i))
+		_, err := store.CreateTask(ctx, storage.InputTypeDiff, fmt.Sprintf("diff-%d", i), "", fmt.Sprintf("key-%d", i), "", []string{"chain"})
 		if err != nil {
 			t.Fatalf("CreateTask %d: %v", i, err)
 		}

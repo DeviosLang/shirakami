@@ -66,7 +66,7 @@ func TestAnalyzePipeline_StorageCacheCheckpointLayer1(t *testing.T) {
 	diff := "--- a/payment.go\n+++ b/payment.go\n@@ -5,0 +6 @@ func Pay() {\n+\tlog.Println(\"pay\")\n }"
 	cacheKey := cache.CacheKey(diff, []string{})
 
-	task, err := store.CreateTask(ctx, storage.InputTypeDiff, diff, "", cacheKey)
+	task, err := store.CreateTask(ctx, storage.InputTypeDiff, diff, "", cacheKey, "", []string{"chain", "e2e"})
 	if err != nil {
 		t.Fatalf("CreateTask: %v", err)
 	}

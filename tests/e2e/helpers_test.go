@@ -104,7 +104,7 @@ func (s *testAPIServer) submitTask(w http.ResponseWriter, r *http.Request) {
 	}
 
 	cacheKey := cache.CacheKey(req.InputDiff+req.InputDesc, []string{s.cfg.Workspace.Dir})
-	task, err := s.store.CreateTask(r.Context(), inputType, req.InputDiff, req.InputDesc, cacheKey)
+	task, err := s.store.CreateTask(r.Context(), inputType, req.InputDiff, req.InputDesc, cacheKey, "", []string{"chain", "e2e"})
 	if err != nil {
 		jsonError(w, err.Error(), http.StatusInternalServerError)
 		return

@@ -199,7 +199,7 @@ func TestRunScenarioAnalysis_SingleChunk(t *testing.T) {
 		{Function: "handler_b", File: "svc/b.py"},
 		{Function: "handler_c", File: "svc/c.py"},
 	}
-	got := w.runScenarioAnalysis(context.Background(), "t1", "", nil, eps)
+	got := w.runScenarioAnalysis(context.Background(), "t1", "", nil, eps, "")
 	if len(got) != 3 {
 		t.Errorf("expected 3 scenarios, got %d", len(got))
 	}
@@ -226,7 +226,7 @@ func TestRunScenarioAnalysis_MultipleChunks(t *testing.T) {
 	for i := range eps {
 		eps[i] = CallNode{Function: fmt.Sprintf("handler_%d", i), File: fmt.Sprintf("svc/%d.py", i)}
 	}
-	got := w.runScenarioAnalysis(context.Background(), "t2", "", nil, eps)
+	got := w.runScenarioAnalysis(context.Background(), "t2", "", nil, eps, "")
 	if len(got) != 7 {
 		t.Errorf("expected 7 scenarios, got %d", len(got))
 	}
@@ -247,7 +247,7 @@ func TestRunScenarioAnalysis_DeduplicateAcrossChunks(t *testing.T) {
 	for i := range eps {
 		eps[i] = CallNode{Function: "handler_dup", File: "svc/dup.py"}
 	}
-	got := w.runScenarioAnalysis(context.Background(), "t3", "", nil, eps)
+	got := w.runScenarioAnalysis(context.Background(), "t3", "", nil, eps, "")
 	if len(got) != 1 {
 		t.Errorf("expected 1 deduplicated scenario, got %d", len(got))
 	}
@@ -262,7 +262,7 @@ func TestRunScenarioAnalysis_RetriesOnEmpty(t *testing.T) {
 	})
 
 	eps := []CallNode{{Function: "handler_retry", File: "svc/r.py"}}
-	got := w.runScenarioAnalysis(context.Background(), "t4", "", nil, eps)
+	got := w.runScenarioAnalysis(context.Background(), "t4", "", nil, eps, "")
 	if len(got) != 1 {
 		t.Errorf("expected 1 scenario after retry, got %d", len(got))
 	}
@@ -270,7 +270,7 @@ func TestRunScenarioAnalysis_RetriesOnEmpty(t *testing.T) {
 
 func TestRunScenarioAnalysis_EmptyEntryPoints(t *testing.T) {
 	w := makeWorkerAgentWithMock(nil)
-	got := w.runScenarioAnalysis(context.Background(), "t5", "", nil, nil)
+	got := w.runScenarioAnalysis(context.Background(), "t5", "", nil, nil, "")
 	if got == nil {
 		t.Error("expected non-nil empty slice")
 	}
