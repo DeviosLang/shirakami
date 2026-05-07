@@ -252,6 +252,7 @@
       "title": "Agent Loop 步数分布（P50/P95/P99）",
       "type": "timeseries"
     },
+
     {
       "collapsed": false,
       "gridPos": { "h": 1, "w": 24, "x": 0, "y": 13 },
@@ -285,7 +286,7 @@
           "refId": "B"
         }
       ],
-      "title": "LLM Token 用量（P50/P95，按 task_type）",
+      "title": "单步 Token 用量（P50/P95，按 task_type）",
       "type": "timeseries"
     },
     {
@@ -308,12 +309,114 @@
           "refId": "A"
         }
       ],
-      "title": "LLM Token 消耗速率（token/s，按 task_type）",
+      "title": "单步 Token 消耗速率（token/s，按 task_type）",
       "type": "timeseries"
     },
     {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": {
+        "defaults": { "unit": "short", "color": { "mode": "palette-classic" } },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 22 },
+      "id": 22,
+      "options": {
+        "tooltip": { "mode": "multi" },
+        "legend": { "displayMode": "list", "placement": "bottom" }
+      },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+          "expr": "histogram_quantile(0.50, sum by (le, task_type) (rate(shirakami_task_tokens_total_bucket{job=\"shirakami\"}[10m])))",
+          "legendFormat": "P50 - {{task_type}}",
+          "refId": "A"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+          "expr": "histogram_quantile(0.95, sum by (le, task_type) (rate(shirakami_task_tokens_total_bucket{job=\"shirakami\"}[10m])))",
+          "legendFormat": "P95 - {{task_type}}",
+          "refId": "B"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+          "expr": "histogram_quantile(0.99, sum by (le, task_type) (rate(shirakami_task_tokens_total_bucket{job=\"shirakami\"}[10m])))",
+          "legendFormat": "P99 - {{task_type}}",
+          "refId": "C"
+        }
+      ],
+      "title": "每次任务 Token 总量（P50/P95/P99，按 task_type）",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "min": 0,
+          "max": 1,
+          "color": { "mode": "palette-classic" }
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 22 },
+      "id": 23,
+      "options": {
+        "tooltip": { "mode": "multi" },
+        "legend": { "displayMode": "list", "placement": "bottom" }
+      },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+          "expr": "sum by (model, task_type) (rate(shirakami_llm_cache_tokens_total{job=\"shirakami\",cache=\"hit\"}[5m])) / (sum by (model, task_type) (rate(shirakami_llm_cache_tokens_total{job=\"shirakami\",cache=\"hit\"}[5m])) + sum by (model, task_type) (rate(shirakami_llm_cache_tokens_total{job=\"shirakami\",cache=\"miss\"}[5m])))",
+          "legendFormat": "命中率 {{model}} / {{task_type}}",
+          "refId": "A"
+        }
+      ],
+      "title": "LLM Prompt Cache 命中率（按 model + task_type）",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": {
+        "defaults": { "unit": "short", "color": { "mode": "palette-classic" } },
+        "overrides": [
+          {
+            "matcher": { "id": "byFrameRefID", "options": "A" },
+            "properties": [{ "id": "custom.stacking", "value": { "group": "A", "mode": "normal" } }]
+          },
+          {
+            "matcher": { "id": "byFrameRefID", "options": "B" },
+            "properties": [{ "id": "custom.stacking", "value": { "group": "A", "mode": "normal" } }]
+          }
+        ]
+      },
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 30 },
+      "id": 24,
+      "options": {
+        "tooltip": { "mode": "multi" },
+        "legend": { "displayMode": "list", "placement": "bottom" }
+      },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+          "expr": "sum by (model, task_type) (rate(shirakami_llm_cache_tokens_total{job=\"shirakami\",cache=\"hit\"}[5m]))",
+          "legendFormat": "hit {{model}} / {{task_type}}",
+          "refId": "A"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+          "expr": "sum by (model, task_type) (rate(shirakami_llm_cache_tokens_total{job=\"shirakami\",cache=\"miss\"}[5m]))",
+          "legendFormat": "miss {{model}} / {{task_type}}",
+          "refId": "B"
+        }
+      ],
+      "title": "LLM Prompt Cache Token 量（hit vs miss，token/s）",
+      "type": "timeseries"
+    },
+
+    {
       "collapsed": false,
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 22 },
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 38 },
       "id": 102,
       "title": "Worker 性能",
       "type": "row"
@@ -324,7 +427,7 @@
         "defaults": { "unit": "s", "color": { "mode": "palette-classic" } },
         "overrides": []
       },
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 23 },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 39 },
       "id": 30,
       "options": {
         "tooltip": { "mode": "multi" },
@@ -353,7 +456,7 @@
         "defaults": { "unit": "s", "color": { "mode": "palette-classic" } },
         "overrides": []
       },
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 23 },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 39 },
       "id": 31,
       "options": {
         "tooltip": { "mode": "multi" },
@@ -370,9 +473,10 @@
       "title": "Worker P95 耗时（按 repo）",
       "type": "timeseries"
     },
+
     {
       "collapsed": false,
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 31 },
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 47 },
       "id": 103,
       "title": "Ghost Node（LLM 幻觉路径）",
       "type": "row"
@@ -399,7 +503,7 @@
           }
         ]
       },
-      "gridPos": { "h": 6, "w": 8, "x": 0, "y": 32 },
+      "gridPos": { "h": 6, "w": 8, "x": 0, "y": 48 },
       "id": 40,
       "options": {
         "reduceOptions": { "calcs": ["lastNotNull"] },
@@ -436,7 +540,7 @@
         },
         "overrides": []
       },
-      "gridPos": { "h": 6, "w": 8, "x": 8, "y": 32 },
+      "gridPos": { "h": 6, "w": 8, "x": 8, "y": 48 },
       "id": 41,
       "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "orientation": "auto", "showThresholdLabels": false, "showThresholdMarkers": true },
       "targets": [
@@ -456,7 +560,7 @@
         "defaults": { "unit": "short", "color": { "mode": "palette-classic" } },
         "overrides": []
       },
-      "gridPos": { "h": 6, "w": 8, "x": 16, "y": 32 },
+      "gridPos": { "h": 6, "w": 8, "x": 16, "y": 48 },
       "id": 42,
       "options": {
         "tooltip": { "mode": "multi" },
@@ -483,5 +587,5 @@
   "timezone": "browser",
   "title": "Shirakami — LLM Code Analysis",
   "uid": "shirakami-main",
-  "version": 1
+  "version": 2
 }
