@@ -138,6 +138,9 @@ func (a *AgentLoop) Run(ctx context.Context, taskID string, task string) (*Resul
 		a.metrics.RecordCheckpointResumed()
 	}
 
+	// Accumulates total tokens across all steps for the per-run histogram.
+	totalTokens := 0
+
 	// Main loop.
 	log := logger.S()
 	for {
@@ -147,6 +150,9 @@ func (a *AgentLoop) Run(ctx context.Context, taskID string, task string) (*Resul
 				"step", stepCount,
 				"limit", limit,
 			)
+			if a.metrics != nil && totalTokens > 0 {
+				a.metrics.RecordTaskTokens(a.metricsModel, a.metricsTaskType, totalTokens)
+			}
 			return &Result{
 				Content:   lastContent(messages),
 				StepCount: stepCount,
@@ -208,6 +214,12 @@ func (a *AgentLoop) Run(ctx context.Context, taskID string, task string) (*Resul
 		if a.metrics != nil && resp.Usage.TotalTokens > 0 {
 			a.metrics.RecordLLMTokens(a.metricsModel, a.metricsTaskType, resp.Usage.TotalTokens)
 		}
+		// Accumulate for per-task total and record prompt-cache hit/miss split.
+		totalTokens += resp.Usage.TotalTokens
+		if a.metrics != nil && resp.Usage.PromptTokens > 0 {
+			uncached := resp.Usage.PromptTokens - resp.Usage.CachedTokens
+			a.metrics.RecordCacheTokens(a.metricsModel, a.metricsTaskType, resp.Usage.CachedTokens, uncached)
+		}
 
 		// Append assistant turn to history.
 		assistantMsg := llm.AssistantMessage{
@@ -235,6 +247,9 @@ func (a *AgentLoop) Run(ctx context.Context, taskID string, task string) (*Resul
 			if a.checkpointer != nil {
 				_ = a.checkpointer.Delete(taskID)
 			}
+			if a.metrics != nil && totalTokens > 0 {
+				a.metrics.RecordTaskTokens(a.metricsModel, a.metricsTaskType, totalTokens)
+			}
 			return &Result{
 				Content:   resp.Content,
 				StepCount: stepCount,
@@ -250,6 +265,9 @@ func (a *AgentLoop) Run(ctx context.Context, taskID string, task string) (*Resul
 			// Unknown stop reason – treat as end_turn.
 			if a.checkpointer != nil {
 				_ = a.checkpointer.Delete(taskID)
+			}
+			if a.metrics != nil && totalTokens > 0 {
+				a.metrics.RecordTaskTokens(a.metricsModel, a.metricsTaskType, totalTokens)
 			}
 			return &Result{
 				Content:   resp.Content,

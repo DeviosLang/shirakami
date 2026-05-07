@@ -81,6 +81,10 @@ type Usage struct {
 	PromptTokens     int
 	CompletionTokens int
 	TotalTokens      int
+	// CachedTokens is the number of prompt tokens served from the provider's
+	// KV-cache (i.e. not re-processed). Non-zero only when the provider supports
+	// prompt caching (OpenAI, DeepSeek, etc.) and a cache hit occurred.
+	CachedTokens int
 }
 
 // Client wraps an OpenAI-compatible API client.
@@ -313,6 +317,11 @@ func parseResponse(resp openai.ChatCompletionResponse) (*Response, error) {
 			CompletionTokens: resp.Usage.CompletionTokens,
 			TotalTokens:      resp.Usage.TotalTokens,
 		},
+	}
+	// Populate cache hit tokens when the provider returns them
+	// (OpenAI PromptTokensDetails.CachedTokens, present since openai-go v1.41+).
+	if resp.Usage.PromptTokensDetails != nil {
+		result.Usage.CachedTokens = resp.Usage.PromptTokensDetails.CachedTokens
 	}
 
 	// Map finish reason

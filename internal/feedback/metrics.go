@@ -44,6 +44,18 @@ type Metrics struct {
 
 	// StepsHistogram tracks the distribution of analysis step counts per task.
 	StepsHistogram prometheus.Histogram
+
+	// TaskTokensTotal is a histogram of the total token consumption per complete
+	// agent run (sum of all per-step tokens), labelled by model and task_type.
+	// Use this to understand per-task cost rather than per-step distribution.
+	TaskTokensTotal *prometheus.HistogramVec
+
+	// LLMCacheTokensTotal counts prompt tokens broken down by cache outcome:
+	//   label cache="hit"  — tokens served from provider KV-cache (not re-billed at full rate)
+	//   label cache="miss" — tokens that were actually processed (billed at full rate)
+	// labelled by model and task_type. Only meaningful when the LLM provider
+	// supports prompt caching (OpenAI, DeepSeek, etc.).
+	LLMCacheTokensTotal *prometheus.CounterVec
 }
 
 // NewMetrics registers all Prometheus metrics and returns a Metrics instance.
@@ -122,6 +134,24 @@ func NewMetrics() *Metrics {
 				Buckets: prometheus.LinearBuckets(1, 5, 20), // 1, 6, 11, … 96
 			},
 		),
+
+		TaskTokensTotal: promauto.NewHistogramVec(
+			prometheus.HistogramOpts{
+				Name: "shirakami_task_tokens_total",
+				Help: "Total token consumption per complete agent run (sum of all steps), labelled by model and task_type.",
+				// 1k → ~4M, covers single-worker runs up to very large tasks.
+				Buckets: prometheus.ExponentialBuckets(1024, 2, 12), // 1k, 2k, 4k … ~4M
+			},
+			[]string{"model", "task_type"},
+		),
+
+		LLMCacheTokensTotal: promauto.NewCounterVec(
+			prometheus.CounterOpts{
+				Name: "shirakami_llm_cache_tokens_total",
+				Help: "Cumulative prompt tokens by cache outcome (hit=served from cache, miss=re-processed), labelled by model and task_type.",
+			},
+			[]string{"model", "task_type", "cache"}, // cache: "hit" | "miss"
+		),
 	}
 }
 
@@ -177,4 +207,22 @@ func (m *Metrics) SetCacheHitRatio(ratio float64) {
 // SetFalsePositiveRate updates the false-positive-rate gauge.
 func (m *Metrics) SetFalsePositiveRate(rate float64) {
 	m.FalsePositiveRate.Set(rate)
+}
+
+// RecordTaskTokens records the total token consumption for one complete agent run.
+// totalTokens should be the sum of all per-step TotalTokens values.
+func (m *Metrics) RecordTaskTokens(model, taskType string, totalTokens int) {
+	m.TaskTokensTotal.WithLabelValues(model, taskType).Observe(float64(totalTokens))
+}
+
+// RecordCacheTokens records cache hit/miss token counts for one LLM step.
+// cachedTokens is the number of tokens served from the provider KV-cache;
+// uncachedTokens is the remainder that was actually processed.
+func (m *Metrics) RecordCacheTokens(model, taskType string, cachedTokens, uncachedTokens int) {
+	if cachedTokens > 0 {
+		m.LLMCacheTokensTotal.WithLabelValues(model, taskType, "hit").Add(float64(cachedTokens))
+	}
+	if uncachedTokens > 0 {
+		m.LLMCacheTokensTotal.WithLabelValues(model, taskType, "miss").Add(float64(uncachedTokens))
+	}
 }

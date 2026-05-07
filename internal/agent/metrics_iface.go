@@ -16,4 +16,11 @@ type MetricsRecorder interface {
 	RecordCheckpointResumed()
 	// RecordSteps records the agent loop step count for one analysis task.
 	RecordSteps(steps float64)
+	// RecordTaskTokens records the total token consumption for one complete agent run
+	// (sum of all per-step tokens). labelled by model and task_type.
+	RecordTaskTokens(model, taskType string, totalTokens int)
+	// RecordCacheTokens records prompt-cache token counts for one LLM step.
+	// cachedTokens is the number of tokens served from cache;
+	// uncachedTokens is the remainder (prompt_tokens - cached_tokens).
+	RecordCacheTokens(model, taskType string, cachedTokens, uncachedTokens int)
 }
