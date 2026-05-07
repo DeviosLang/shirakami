@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/DeviosLang/shirakami/internal/logger"
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/push"
 )
 
@@ -33,7 +34,7 @@ type Pusher struct {
 func NewPusher(url, jobName string, interval time.Duration) (*Pusher, error) {
 	log := logger.S()
 
-	p := push.New(url, jobName)
+	p := push.New(url, jobName).Gatherer(prometheus.DefaultGatherer)
 
 	// Validate connectivity with an immediate push.
 	if err := p.Push(); err != nil {
