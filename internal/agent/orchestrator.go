@@ -953,6 +953,7 @@ func (o *Orchestrator) runWorkerBatch(ctx context.Context, pending map[string][]
 				res, err := worker.Analyse(ctx, WorkerTask{
 					RepoName:         j.repo,
 					RepoPath:         repoPath,
+					WorkspaceDir:     o.workspaceDir,
 					ChangedFunctions: j.funcs,
 					Priority:         j.priority,
 					ContractHints:    o.contractHints,

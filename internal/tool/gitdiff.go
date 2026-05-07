@@ -9,6 +9,23 @@ import (
 	"strings"
 )
 
+// classContextRE matches a Python class definition line used as @@ hunk context,
+// e.g. "class CDfwUpdateVmNetType(CDfwOp):" or "class Foo:".
+// When the @@ context is a class rather than a function, we need to scan
+// the hunk's context lines to find the enclosing method (def xxx).
+var classContextRE = regexp.MustCompile(`^\s*class\s+(\w+)`)
+
+// contextDefRE extracts a method/function name from a context line (no +/- prefix).
+// Matches Python "def name(" and similar patterns.
+var contextDefRE = regexp.MustCompile(`^\s+(?:async\s+)?def\s+(\w+)\s*\(`)
+
+// isClassOnlyContext returns true when the @@ context string looks like a class
+// definition rather than a function/method definition. Used to trigger
+// method-context scanning in the diff body.
+func isClassOnlyContext(ctx string) bool {
+	return classContextRE.MatchString(ctx)
+}
+
 // DiffHunk represents a contiguous block of changed lines in one file.
 // Used by the deterministic diff parser (Layer A) to map diff hunks to
 // symbol definitions without LLM involvement.
@@ -38,6 +55,14 @@ func ParseDiffHunks(diff string) []DiffHunk {
 	hunkEnd := 0         // end of current contiguous changed block
 	hunkFuncCtx := ""    // FuncContext for current contiguous block
 	inChange := false    // tracking a contiguous block of + lines
+
+	// currentContextMethod tracks the most recently seen "def xxx" in hunk
+	// context lines. Used to resolve the enclosing method when the @@ context
+	// is a class name (Python template-method / multi-level inheritance pattern).
+	currentContextMethod := ""
+	// hunkCtxIsClass is true when the current @@ context string looks like a
+	// class definition rather than a function/method definition.
+	hunkCtxIsClass := false
 
 	flushHunk := func() {
 		if inChange && currentFile != "" && hunkStart > 0 {
@@ -69,6 +94,8 @@ func ParseDiffHunks(diff string) []DiffHunk {
 			}
 			currentNewLine = 0
 			currentFuncCtx = ""
+			currentContextMethod = ""
+			hunkCtxIsClass = false
 			continue
 		}
 
@@ -80,6 +107,8 @@ func ParseDiffHunks(diff string) []DiffHunk {
 				currentNewLine = newStart - 1
 			}
 			currentFuncCtx = parseHunkFuncContext(line)
+			currentContextMethod = ""
+			hunkCtxIsClass = isClassOnlyContext(currentFuncCtx)
 			continue
 		}
 
@@ -101,7 +130,14 @@ func ParseDiffHunks(diff string) []DiffHunk {
 			if !inChange {
 				inChange = true
 				hunkStart = currentNewLine
-				hunkFuncCtx = currentFuncCtx
+				// Resolve effective function context:
+				// When @@ context is a class and we've seen a "def xxx" in
+				// preceding context lines, use "ClassName.method_name".
+				if hunkCtxIsClass && currentContextMethod != "" {
+					hunkFuncCtx = currentFuncCtx + "." + currentContextMethod
+				} else {
+					hunkFuncCtx = currentFuncCtx
+				}
 			}
 			hunkEnd = currentNewLine
 			continue
@@ -114,9 +150,16 @@ func ParseDiffHunks(diff string) []DiffHunk {
 			continue
 		}
 
-		// Context line: breaks a contiguous change block, advances line counter
+		// Context line: breaks a contiguous change block, advances line counter.
+		// When @@ context is a class, scan for the nearest enclosing "def xxx"
+		// so that subsequent added lines can resolve "ClassName.method_name".
 		flushHunk()
 		currentNewLine++
+		if hunkCtxIsClass {
+			if m := contextDefRE.FindStringSubmatch(line); len(m) > 1 {
+				currentContextMethod = m[1]
+			}
+		}
 	}
 
 	// Flush any trailing hunk
@@ -223,6 +266,15 @@ func parseDiff(diff string) []ChangedFunction {
 	currentHunkFuncCtx := "" // function name from current @@ line
 	hunkFuncEmitted := false // whether we've already emitted a "modified" entry for this hunk
 
+	// currentContextMethod tracks the most recently seen "def xxx" line in hunk
+	// context lines (lines without +/- prefix). Used to resolve the enclosing
+	// method when the @@ context is a class name (template-method / multi-level
+	// inheritance pattern, common in Python).
+	currentContextMethod := ""
+	// hunkCtxIsClass is true when the current @@ context string looks like a
+	// class definition rather than a function/method definition.
+	hunkCtxIsClass := false
+
 	for scanner.Scan() {
 		line := scanner.Text()
 
@@ -240,6 +292,8 @@ func parseDiff(diff string) []ChangedFunction {
 			currentNewLine = 0
 			currentHunkFuncCtx = ""
 			hunkFuncEmitted = false
+			currentContextMethod = ""
+			hunkCtxIsClass = false
 			continue
 		}
 
@@ -251,6 +305,8 @@ func parseDiff(diff string) []ChangedFunction {
 			}
 			currentHunkFuncCtx = parseHunkFuncContext(line)
 			hunkFuncEmitted = false
+			currentContextMethod = ""
+			hunkCtxIsClass = isClassOnlyContext(currentHunkFuncCtx)
 			continue
 		}
 
@@ -266,6 +322,15 @@ func parseDiff(diff string) []ChangedFunction {
 				continue
 			}
 
+			// Resolve the effective function context:
+			// - When @@ context is a class and we've seen a "def xxx" in context
+			//   lines, use "ClassName.method_name" to be precise.
+			// - Otherwise fall back to the raw @@ context name.
+			effectiveCtx := currentHunkFuncCtx
+			if hunkCtxIsClass && currentContextMethod != "" {
+				effectiveCtx = currentHunkFuncCtx + "." + currentContextMethod
+			}
+
 			// Strategy 2: emit the @@ context function as "modified" on first
 			// added line in the hunk (if no explicit declaration found yet).
 			// We defer to strategy 1 if this added line itself is a declaration.
@@ -279,12 +344,12 @@ func parseDiff(diff string) []ChangedFunction {
 					ChangeType: "added",
 				})
 				hunkFuncEmitted = true // declaration supersedes the @@ context entry
-			} else if !hunkFuncEmitted && currentHunkFuncCtx != "" {
-				// No declaration on this line; emit the @@ context as "modified".
+			} else if !hunkFuncEmitted && effectiveCtx != "" {
+				// No declaration on this line; emit the resolved context as "modified".
 				results = append(results, ChangedFunction{
 					File:       currentFile,
 					Line:       currentNewLine,
-					FuncName:   currentHunkFuncCtx,
+					FuncName:   effectiveCtx,
 					ChangeType: "modified",
 				})
 				hunkFuncEmitted = true
@@ -297,10 +362,20 @@ func parseDiff(diff string) []ChangedFunction {
 			continue
 		}
 
-		// Context line: advance new line counter
+		// Context line: advance new line counter, and track enclosing def for
+		// class-context resolution.
 		if !strings.HasPrefix(line, "diff ") && !strings.HasPrefix(line, "index ") &&
 			!strings.HasPrefix(line, "new file") && !strings.HasPrefix(line, "deleted file") {
 			currentNewLine++
+			// When the hunk @@ context is a class, scan context lines for the
+			// nearest enclosing method definition ("def xxx").
+			// This resolves the Class.method name even when only internal
+			// statements are changed (no +def line appears in the hunk).
+			if hunkCtxIsClass && !hunkFuncEmitted {
+				if m := contextDefRE.FindStringSubmatch(line); len(m) > 1 {
+					currentContextMethod = m[1]
+				}
+			}
 		}
 	}
 

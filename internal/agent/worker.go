@@ -33,6 +33,10 @@ type CallNode struct {
 type WorkerTask struct {
 	RepoName         string
 	RepoPath         string
+	// WorkspaceDir is the root directory containing all cloned repositories.
+	// When set, filterGhostNodes can rescue cross-repo ghost nodes by searching
+	// any repo directory under this root (e.g. /workspace/cvm_api/).
+	WorkspaceDir     string
 	ChangedFunctions []string
 	ExternalCallers  []string
 	// Priority is the triage classification ("P0", "P1", "P2"); empty = default.
@@ -546,7 +550,7 @@ func (w *WorkerAgent) Analyse(ctx context.Context, task WorkerTask) (*WorkerResu
 	// filterGhostNodes records the ghost paths in workerResult.GhostFiles so
 	// the API layer can surface actionable warnings, then removes those nodes.
 	if task.RepoPath != "" {
-		filterGhostNodes(workerResult, task.RepoPath)
+		filterGhostNodes(workerResult, task.RepoPath, task.WorkspaceDir)
 	}
 
 	log.Infow("worker.parsed",
@@ -1406,13 +1410,19 @@ func parseUTAnalyses(content string) []UTAnalysis {
 // Nodes with an empty File field are kept unconditionally: they are legitimate
 // results where the LLM correctly omitted a file path rather than guessing.
 //
-// Ghost nodes that belong to the current repo are first attempted for rescue
-// via deterministic ripgrep searches using naming variants of the function name
-// (exact → snake_case → partial keyword). Rescued nodes have their File/Line
-// updated to the real path found on disk. Only nodes that cannot be rescued
-// after all variants are tried are added to result.GhostFiles so the API
-// layer can surface actionable warnings to the caller.
-func filterGhostNodes(result *WorkerResult, repoPath string) {
+// Ghost nodes are first attempted for rescue via deterministic ripgrep searches
+// using naming variants of the function name (exact → snake_case → partial keyword).
+// The search covers:
+//  1. The current repo directory (repoPath) for same-repo ghost nodes.
+//  2. The full workspace directory (workspaceDir) for cross-repo ghost nodes,
+//     which lets us recover hallucinated paths like "cvm_api/api/Foo.py" whose
+//     function actually lives in a different subdirectory under the workspace.
+//
+// Rescued nodes have their File/Line updated to the real path found on disk.
+// Only nodes that cannot be rescued after all variants are tried are added to
+// result.GhostFiles so the API layer can surface actionable warnings.
+// GhostFiles is deduplicated so each path appears at most once.
+func filterGhostNodes(result *WorkerResult, repoPath, workspaceDir string) {
 	log := logger.S()
 	repoBase := filepath.Base(repoPath)
 
@@ -1428,13 +1438,22 @@ func filterGhostNodes(result *WorkerResult, repoPath string) {
 	}
 
 	// fileExists checks whether a non-empty path resolves to a real file.
+	// It checks both under repoPath and (when workspaceDir is set) under workspaceDir.
 	fileExists := func(file string) bool {
 		if file == "" {
 			return true // no path → keep
 		}
-		abs := filepath.Join(repoPath, cleanPath(file))
-		_, err := os.Stat(abs)
-		return err == nil
+		// Check under current repo first.
+		if _, err := os.Stat(filepath.Join(repoPath, cleanPath(file))); err == nil {
+			return true
+		}
+		// Also check as a workspace-relative path (covers cross-repo prefixed paths).
+		if workspaceDir != "" {
+			if _, err := os.Stat(filepath.Join(workspaceDir, file)); err == nil {
+				return true
+			}
+		}
+		return false
 	}
 
 	// --- Step 1: Separate valid nodes from ghost nodes ---
@@ -1450,13 +1469,8 @@ func filterGhostNodes(result *WorkerResult, repoPath string) {
 				"func", n.Function,
 				"file", n.File,
 			)
-			// Only attempt rescue for same-repo nodes where we have a repoPath.
-			if n.Repo == "" || n.Repo == result.RepoName {
-				ghostNodes = append(ghostNodes, n)
-			} else {
-				// Cross-repo ghost: cannot rescue here — record directly.
-				result.GhostFiles = append(result.GhostFiles, n.File)
-			}
+			// All ghost nodes are eligible for rescue; cross-repo nodes use workspaceDir.
+			ghostNodes = append(ghostNodes, n)
 		}
 	}
 	result.Nodes = filtered
@@ -1472,11 +1486,7 @@ func filterGhostNodes(result *WorkerResult, repoPath string) {
 				"func", ep.Function,
 				"file", ep.File,
 			)
-			if ep.Repo == "" || ep.Repo == result.RepoName {
-				ghostEPs = append(ghostEPs, ep)
-			} else {
-				result.GhostFiles = append(result.GhostFiles, ep.File)
-			}
+			ghostEPs = append(ghostEPs, ep)
 		}
 	}
 	result.EntryPoints = filteredEP
@@ -1493,26 +1503,67 @@ func filterGhostNodes(result *WorkerResult, repoPath string) {
 
 	// rescue attempts to find the real file for a ghost node by searching naming
 	// variants of the function name. Returns the updated node and true on success.
+	// Search order: repoPath first (most likely), then workspaceDir (cross-repo).
 	rescue := func(n CallNode) (CallNode, bool) {
+		// Determine which search roots to try. Cross-repo nodes (prefixed with a
+		// different repo name or owned by another repo) need workspaceDir.
+		searchDirs := []string{repoPath}
+		if workspaceDir != "" && workspaceDir != repoPath {
+			// Infer the owning repo from the file path prefix when available.
+			// e.g. "cvm_api/api/Foo.py" → try workspaceDir (covers all repos).
+			if n.Repo != "" && n.Repo != result.RepoName {
+				// Known cross-repo: skip current repoPath, go straight to workspace.
+				searchDirs = []string{workspaceDir}
+			} else if strings.Contains(n.File, "/") {
+				prefix := n.File[:strings.Index(n.File, "/")]
+				if prefix != repoBase {
+					// File has a different repo prefix: add workspaceDir as secondary search.
+					searchDirs = append(searchDirs, workspaceDir)
+				}
+			}
+		}
+
 		for _, pattern := range namingVariants(n.Function) {
 			if rescueCtx.Err() != nil {
 				return n, false
 			}
-			file, line, ok := toolSearchSymbol(rescueCtx, pattern, repoPath)
-			if ok {
-				log.Infow("worker.ghost_rescued",
-					"repo", result.RepoName,
-					"func", n.Function,
-					"ghost_file", n.File,
-					"rescued_file", file,
-					"pattern", pattern,
-				)
-				n.File = filepath.Join(repoBase, file)
-				n.Line = line
-				return n, true
+			for _, dir := range searchDirs {
+				file, line, ok := toolSearchSymbol(rescueCtx, pattern, dir)
+				if ok {
+					// Build a workspace-relative path so it is consistent across repos.
+					relFile := file
+					if dir == workspaceDir {
+						relFile = file // already relative to workspaceDir = workspace-relative
+					} else {
+						// repoPath search returns path relative to repoPath; prefix with repoBase.
+						relFile = filepath.Join(repoBase, file)
+					}
+					log.Infow("worker.ghost_rescued",
+						"repo", result.RepoName,
+						"func", n.Function,
+						"ghost_file", n.File,
+						"rescued_file", relFile,
+						"pattern", pattern,
+					)
+					n.File = relFile
+					n.Line = line
+					return n, true
+				}
 			}
 		}
 		return n, false
+	}
+
+	// ghostFilesSet deduplicates GhostFiles entries.
+	ghostFilesSet := make(map[string]bool, len(result.GhostFiles))
+	for _, f := range result.GhostFiles {
+		ghostFilesSet[f] = true
+	}
+	addGhost := func(file string) {
+		if !ghostFilesSet[file] {
+			ghostFilesSet[file] = true
+			result.GhostFiles = append(result.GhostFiles, file)
+		}
 	}
 
 	for _, n := range ghostNodes {
@@ -1525,7 +1576,7 @@ func filterGhostNodes(result *WorkerResult, repoPath string) {
 				"file", n.File,
 				"repo_path", repoPath,
 			)
-			result.GhostFiles = append(result.GhostFiles, n.File)
+			addGhost(n.File)
 		}
 	}
 	for _, ep := range ghostEPs {
@@ -1538,7 +1589,7 @@ func filterGhostNodes(result *WorkerResult, repoPath string) {
 				"file", ep.File,
 				"repo_path", repoPath,
 			)
-			result.GhostFiles = append(result.GhostFiles, ep.File)
+			addGhost(ep.File)
 		}
 	}
 }

@@ -204,6 +204,59 @@ func (s *Store) UpdateTaskStatusWithError(ctx context.Context, id string, errMsg
 	return nil
 }
 
+// FailOrphanedTasks marks all tasks that are still in "running" state as
+// "failed". This is called once at server startup to clean up tasks that were
+// interrupted by a previous crash or pod restart and would otherwise remain
+// stuck in "running" forever.
+// Returns the number of tasks that were recovered.
+func (s *Store) FailOrphanedTasks(ctx context.Context) (int, error) {
+	tag, err := s.db.Exec(ctx,
+		`UPDATE analysis_tasks
+		    SET status = 'failed',
+		        completed_at = NOW(),
+		        error_message = 'Server restarted while task was running (orphan recovery)'
+		  WHERE status = 'running'`,
+	)
+	if err != nil {
+		return 0, fmt.Errorf("fail orphaned tasks: %w", err)
+	}
+	return int(tag.RowsAffected()), nil
+}
+
+// RequeueOrphanedTasks resets all tasks that are stuck in "running" state back
+// to "pending" and returns them so the caller can re-launch analysis goroutines.
+// This is called once at server startup after the apiServer is ready.
+func (s *Store) RequeueOrphanedTasks(ctx context.Context) ([]Task, error) {
+	rows, err := s.db.Query(ctx,
+		`UPDATE analysis_tasks
+		    SET status = 'pending', completed_at = NULL, error_message = NULL
+		  WHERE status = 'running'
+		  RETURNING id, input_type, input_diff, input_desc, cache_key, status, created_at, completed_at,
+		            modes, source_repo, queue_position, COALESCE(error_message, '')`,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("requeue orphaned tasks: %w", err)
+	}
+	defer rows.Close()
+
+	var tasks []Task
+	for rows.Next() {
+		var task Task
+		var itStr, statusStr string
+		if err := rows.Scan(
+			&task.ID, &itStr, &task.InputDiff, &task.InputDesc,
+			&task.CacheKey, &statusStr, &task.CreatedAt, &task.CompletedAt,
+			&task.Modes, &task.SourceRepo, &task.QueuePosition, &task.ErrorMsg,
+		); err != nil {
+			return nil, fmt.Errorf("scan requeued task: %w", err)
+		}
+		task.InputType = InputType(itStr)
+		task.Status = TaskStatus(statusStr)
+		tasks = append(tasks, task)
+	}
+	return tasks, rows.Err()
+}
+
 // SaveResult inserts an analysis result for a task.
 func (s *Store) SaveResult(ctx context.Context, result *TaskResult) error {
 	_, err := s.db.Exec(ctx,

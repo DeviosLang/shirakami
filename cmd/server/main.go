@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"path"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -155,10 +156,25 @@ func runServer(cmd *cobra.Command, args []string) error {
 	mux.HandleFunc("/healthz", handleHealthz)
 	mux.Handle("/metrics", feedback.Handler())
 	mux.HandleFunc("/api/v1/repos", srv.handleRepos)
+	mux.HandleFunc("/api/v1/repos/register", srv.handleReposRegister)
 	mux.HandleFunc("/api/v1/tasks", srv.handleTasks)
 	mux.HandleFunc("/api/v1/tasks/", srv.handleTaskByID)
 	mux.HandleFunc("/api/v1/cache", srv.handleCache)
 	mux.Handle("/api/v1/webhook", webhookHandler)
+
+	// Recover orphaned tasks: any task left in "running" state from a previous
+	// server run (crash or pod restart) will never complete on their own.
+	// Reset them to "pending" and re-launch their analysis goroutines so they
+	// run again automatically — callers do not need to resubmit.
+	if orphans, reqErr := store.RequeueOrphanedTasks(ctx); reqErr != nil {
+		log.Sugar().Warnw("orphan requeue failed", "err", reqErr)
+	} else if len(orphans) > 0 {
+		log.Sugar().Infow("orphaned tasks requeued", "count", len(orphans))
+		for _, t := range orphans {
+			t := t // capture
+			go srv.runAnalysis(t.ID, t.InputDiff, t.InputDesc, t.CacheKey, t.SourceRepo, t.Modes, "")
+		}
+	}
 
 	log.Sugar().Infof("listening on %s", listenAddr)
 	return http.ListenAndServe(listenAddr, mux)
@@ -306,6 +322,167 @@ func (s *apiServer) handleRepos(w http.ResponseWriter, r *http.Request) {
 		"repos": repos,
 		"hint":  "Use 'name' as source_repo or branches[].repo when submitting tasks. Use 'branch' as the base branch reference.",
 	})
+}
+
+// handleReposRegister resolves one or more git repository URLs and returns
+// structured RepoInfo for each — including the canonical name derived from the
+// URL, the inferred default branch, and whether the repo is already registered
+// in the server config.
+//
+// POST /api/v1/repos/register
+//
+//	{"urls": ["https://gitlab.example.com/cvm/vstation_compute.git",
+//	           "https://gitlab.example.com/cvm/vstation_api.git"]}
+//
+// A single URL may be passed as a convenience:
+//
+//	{"url": "https://gitlab.example.com/cvm/vstation_compute.git"}
+//
+// Response:
+//
+//	{"repos": [
+//	  {"url": "...", "name": "vstation_compute", "branch": "master",
+//	   "registered": true, "local_path": "/workspace/vstation_compute"}
+//	]}
+func (s *apiServer) handleReposRegister(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var body struct {
+		URL  string   `json:"url"`  // single-URL convenience field
+		URLs []string `json:"urls"` // batch
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		jsonError(w, "invalid request body: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	// Merge single + batch into one list.
+	rawURLs := body.URLs
+	if body.URL != "" {
+		rawURLs = append(rawURLs, body.URL)
+	}
+	if len(rawURLs) == 0 {
+		jsonError(w, "provide at least one URL in 'url' or 'urls'", http.StatusBadRequest)
+		return
+	}
+
+	// Build a quick lookup of already-registered repos by URL (credentials stripped).
+	type registeredEntry struct {
+		name      string
+		branch    string
+		localPath string
+	}
+	registered := make(map[string]registeredEntry, len(s.cfg.Workspace.Repos))
+	for _, r := range s.cfg.Workspace.Repos {
+		cleanURL := r.URL
+		if parsed, err := url.Parse(r.URL); err == nil {
+			parsed.User = nil
+			cleanURL = parsed.String()
+		}
+		branch := r.Branch
+		if branch == "" {
+			branch = "master"
+		}
+		registered[cleanURL] = registeredEntry{
+			name:      r.Name,
+			branch:    branch,
+			localPath: path.Join(s.cfg.Workspace.Dir, r.Name),
+		}
+	}
+
+	type repoResult struct {
+		URL        string `json:"url"`
+		Name       string `json:"name"`
+		Branch     string `json:"branch"`
+		Registered bool   `json:"registered"`
+		LocalPath  string `json:"local_path,omitempty"`
+		Error      string `json:"error,omitempty"`
+	}
+
+	results := make([]repoResult, len(rawURLs))
+	var wg sync.WaitGroup
+
+	for i, raw := range rawURLs {
+		i, raw := i, raw
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			res := repoResult{URL: raw}
+
+			parsed, err := url.Parse(raw)
+			if err != nil {
+				res.Error = "invalid URL: " + err.Error()
+				results[i] = res
+				return
+			}
+
+			// Derive canonical name: last path segment, strip .git suffix.
+			// e.g. "gitlab.com/cvm/vstation_compute.git" → "vstation_compute"
+			segment := path.Base(parsed.Path)
+			segment = strings.TrimSuffix(segment, ".git")
+			if segment == "" || segment == "." {
+				res.Error = "cannot derive repo name from URL path"
+				results[i] = res
+				return
+			}
+			res.Name = segment
+
+			// Strip credentials for the lookup key.
+			parsed.User = nil
+			cleanURL := parsed.String()
+
+			// Check if already registered.
+			if entry, ok := registered[cleanURL]; ok {
+				res.Registered = true
+				res.Branch = entry.branch
+				res.LocalPath = entry.localPath
+				// Use the registered canonical name (operator may have overridden it).
+				res.Name = entry.name
+				results[i] = res
+				return
+			}
+
+			// Not yet registered: probe remote for default branch.
+			// Use a short timeout so the endpoint stays responsive.
+			ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
+			defer cancel()
+			res.Branch = probeDefaultBranch(ctx, raw)
+			res.LocalPath = path.Join(s.cfg.Workspace.Dir, res.Name)
+			results[i] = res
+		}()
+	}
+	wg.Wait()
+
+	jsonOK(w, map[string]any{"repos": results})
+}
+
+// probeDefaultBranch runs `git ls-remote --symref <url> HEAD` to read the
+// remote's default branch without cloning. Falls back to "master" on any error.
+// The URL may contain credentials (https://user:token@host/…) so they are
+// forwarded verbatim to git; they are never logged or returned to the caller.
+func probeDefaultBranch(ctx context.Context, repoURL string) string {
+	cmd := exec.CommandContext(ctx, "git", "ls-remote", "--symref", repoURL, "HEAD")
+	out, err := cmd.Output()
+	if err != nil {
+		return "master"
+	}
+	// Output looks like:
+	//   ref: refs/heads/main	HEAD
+	//   <sha>	HEAD
+	for _, line := range strings.Split(string(out), "\n") {
+		if strings.HasPrefix(line, "ref: refs/heads/") {
+			// "ref: refs/heads/main\tHEAD" → "main"
+			branch := strings.TrimPrefix(line, "ref: refs/heads/")
+			branch = strings.Fields(branch)[0]
+			if branch != "" {
+				return branch
+			}
+		}
+	}
+	return "master"
 }
 
 func (s *apiServer) handleTasks(w http.ResponseWriter, r *http.Request) {
@@ -1094,9 +1271,91 @@ func (s *apiServer) fetchBranchDiff(repoName, featureBranch string) (diff, baseB
 
 	diffStr := strings.TrimSpace(string(out))
 	if diffStr == "" {
-		return "", baseBranch, fmt.Errorf("branch %q has no diff against %s/%s — nothing to analyze", featureBranch, repoName, baseBranch)
+		// The branch may have already been merged into baseBranch.
+		// Try to recover the diff from the merge commit on origin/<baseBranch>.
+		recovered, mergeErr := recoverMergedBranchDiff(ctx, repoDir, baseBranch, featureBranch)
+		if mergeErr == nil && recovered != "" {
+			return recovered, baseBranch, nil
+		}
+		hint := ""
+		if mergeErr != nil {
+			hint = fmt.Sprintf(" (merge-commit search: %v)", mergeErr)
+		}
+		return "", baseBranch, fmt.Errorf("branch %q has no diff against %s/%s — branch may not exist or diff is empty%s", featureBranch, repoName, baseBranch, hint)
 	}
 	return diffStr, baseBranch, nil
+}
+
+// recoverMergedBranchDiff searches for a merge commit on origin/<baseBranch>
+// that incorporated featureBranch, then returns the diff introduced by that commit.
+// This handles the common case where a feature branch has already been merged.
+func recoverMergedBranchDiff(ctx context.Context, repoDir, baseBranch, featureBranch string) (string, error) {
+	// Deepen the base branch history so we can find the merge commit.
+	fetchBase := exec.CommandContext(ctx, "git", "-C", repoDir, "fetch", "--depth=200", "origin", baseBranch)
+	if out, err := fetchBase.CombinedOutput(); err != nil {
+		return "", fmt.Errorf("fetch base branch: %w\n%s", err, out)
+	}
+
+	// List merge commits on origin/<baseBranch>, most recent first.
+	// --merges restricts to commits with ≥2 parents (actual merges).
+	logCmd := exec.CommandContext(ctx, "git", "-C", repoDir,
+		"log", fmt.Sprintf("origin/%s", baseBranch),
+		"--merges", "--format=%H %s", "--max-count=500",
+	)
+	logOut, err := logCmd.Output()
+	if err != nil {
+		return "", fmt.Errorf("git log --merges: %w", err)
+	}
+
+	// Strip refs/heads/ prefix for matching against commit subjects.
+	shortBranch := featureBranch
+	if strings.HasPrefix(shortBranch, "refs/heads/") {
+		shortBranch = shortBranch[len("refs/heads/"):]
+	}
+	// Also prepare a shorter variant: last segment after the final slash
+	// (e.g. "feature/fix-abc" → "fix-abc") for more permissive matching.
+	branchTail := shortBranch
+	if idx := strings.LastIndex(shortBranch, "/"); idx >= 0 {
+		branchTail = shortBranch[idx+1:]
+	}
+
+	var mergeHash string
+	for _, line := range strings.Split(strings.TrimSpace(string(logOut)), "\n") {
+		if line == "" {
+			continue
+		}
+		parts := strings.SplitN(line, " ", 2)
+		if len(parts) != 2 {
+			continue
+		}
+		hash, subject := parts[0], parts[1]
+		if strings.Contains(subject, shortBranch) ||
+			(len(branchTail) > 5 && strings.Contains(subject, branchTail)) {
+			mergeHash = hash
+			break
+		}
+	}
+
+	if mergeHash == "" {
+		return "", fmt.Errorf("no merge commit found for branch %q in last 500 merges on %s", shortBranch, baseBranch)
+	}
+
+	// Compute diff introduced by the merge commit: compare merge commit against its first parent.
+	diffCmd := exec.CommandContext(ctx, "git", "-C", repoDir,
+		"diff", mergeHash+"^1", mergeHash,
+	)
+	diffOut, err := diffCmd.Output()
+	if err != nil {
+		if exitErr, ok := err.(*exec.ExitError); !ok || exitErr.ExitCode() != 1 {
+			return "", fmt.Errorf("git diff merge commit %s: %w", mergeHash, err)
+		}
+	}
+
+	result := strings.TrimSpace(string(diffOut))
+	if result == "" {
+		return "", fmt.Errorf("merge commit %s has empty diff", mergeHash)
+	}
+	return result, nil
 }
 
 // isEmptyResult reports whether a completed TaskResult has no meaningful output.

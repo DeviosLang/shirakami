@@ -282,6 +282,7 @@ SHIRAKAMI_SERVER_ADDR=:8080 ./bin/shirakami-server --config shirakami.yaml
 |------|------|------|
 | `GET` | `/healthz` | 健康检查 |
 | `GET` | `/api/v1/repos` | 查询所有可用代码仓 |
+| `POST` | `/api/v1/repos/register` | 探测远端仓库信息（名称、默认分支），支持批量 |
 | `POST` | `/api/v1/tasks` | 提交分析任务 |
 | `GET` | `/api/v1/tasks` | 查询最近任务列表（最多 20 条） |
 | `GET` | `/api/v1/tasks/{id}` | 查询任务状态 / 完整结果 |
@@ -316,6 +317,99 @@ curl http://localhost:8080/api/v1/repos
 | `role` | `"entry"`（入口仓）或空 |
 | `url` | Git 仓库地址（已隐匿认证信息） |
 | `local_path` | NFS 上的本地克隆路径 |
+
+---
+
+#### 探测并注册代码仓
+
+在将仓库加入配置之前，可以先用该接口探测远端仓库的基本信息（名称、默认分支），确认连通性和凭据有效。
+
+```
+POST /api/v1/repos/register
+Content-Type: application/json
+```
+
+请求字段：
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `url` | string | 单个仓库 Git 地址（与 `urls` 二选一） |
+| `urls` | string[] | 批量仓库 Git 地址列表（与 `url` 二选一） |
+
+响应字段（每个仓库一条记录）：
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `url` | string | 原始输入地址（认证信息已隐匿） |
+| `name` | string | 自动派生的仓库短名（URL 最后一段，去掉 `.git`） |
+| `branch` | string | 探测到的默认分支（如 `main` 或 `master`），探测失败时返回 `"master"` |
+| `registered` | bool | 该仓库是否已在服务端配置中注册 |
+| `local_path` | string | 已注册时，服务端的本地克隆路径（仅 `registered: true` 时出现） |
+| `error` | string | 探测失败时的错误信息（探测成功时字段不出现） |
+
+**单仓库探测示例**
+
+```bash
+curl -X POST http://localhost:8080/api/v1/repos/register \
+  -H "Content-Type: application/json" \
+  -d '{"url": "https://gitlab.example.com/org/myservice.git"}'
+```
+
+响应：
+
+```json
+{
+  "results": [
+    {
+      "url": "https://gitlab.example.com/org/myservice.git",
+      "name": "myservice",
+      "branch": "main",
+      "registered": false
+    }
+  ]
+}
+```
+
+**批量探测示例**
+
+```bash
+curl -X POST http://localhost:8080/api/v1/repos/register \
+  -H "Content-Type: application/json" \
+  -d '{
+    "urls": [
+      "https://gitlab.example.com/org/service-a.git",
+      "https://gitlab.example.com/org/service-b.git"
+    ]
+  }'
+```
+
+响应：
+
+```json
+{
+  "results": [
+    {
+      "url": "https://gitlab.example.com/org/service-a.git",
+      "name": "service-a",
+      "branch": "main",
+      "registered": true,
+      "local_path": "/data/repos/service-a"
+    },
+    {
+      "url": "https://gitlab.example.com/org/service-b.git",
+      "name": "service-b",
+      "branch": "master",
+      "registered": false
+    }
+  ]
+}
+```
+
+**使用流程**
+
+1. 调用 `POST /api/v1/repos/register` 探测仓库，获取 `name` 和 `branch`。
+2. 若 `registered: true`，该仓库已可用，直接用 `name` 字段提交分析任务。
+3. 若 `registered: false`，需请管理员将仓库信息添加到服务端配置文件（`shirakami.yaml` 的 `repos` 列表），然后执行 `workspace sync` 完成克隆，之后再提交任务。
 
 ---
 
