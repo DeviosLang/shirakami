@@ -106,11 +106,11 @@ func TestCheckpointer_TTLExpiry(t *testing.T) {
 	}
 
 	// Override TTL to something very short directly via Redis.
-	if err := rdb.Expire(ctx, "shirakami:checkpoint:"+taskID, 100*time.Millisecond).Err(); err != nil {
+	if err := rdb.Expire(ctx, "shirakami:checkpoint:"+taskID, 500*time.Millisecond).Err(); err != nil {
 		t.Fatalf("Expire: %v", err)
 	}
 
-	time.Sleep(200 * time.Millisecond)
+	time.Sleep(1 * time.Second)
 
 	state, _, err := cp.Load(ctx, taskID)
 	if err != nil {

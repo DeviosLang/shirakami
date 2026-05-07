@@ -121,9 +121,9 @@ func TestGenerateMarkdown(t *testing.T) {
 	}
 	checks := []string{
 		"# Shirakami 分析报告",
-		"## 向下追踪",
-		"## 向上追踪",
-		"## 集成测试场景",
+		"## 调用链节点",
+		"## 向上追踪 → 集成测试入口",
+		"## 集成测试入口",
 		"## 影响范围",
 		"POST /api/v1/payment/process",
 		"gRPC",

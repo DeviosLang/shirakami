@@ -84,8 +84,9 @@ func TestMigrations_GooseDown(t *testing.T) {
 	if err := goose.UpContext(ctx, db, "../../migrations"); err != nil {
 		t.Fatalf("goose up: %v", err)
 	}
-	if err := goose.DownContext(ctx, db, "../../migrations"); err != nil {
-		t.Fatalf("goose down: %v", err)
+	// Roll back all migrations to version 0.
+	if err := goose.DownToContext(ctx, db, "../../migrations", 0); err != nil {
+		t.Fatalf("goose down to 0: %v", err)
 	}
 
 	// All tables should be gone after down

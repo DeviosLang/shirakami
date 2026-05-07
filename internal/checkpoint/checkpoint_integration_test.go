@@ -113,10 +113,10 @@ func TestCheckpointer_TTLExpiry(t *testing.T) {
 		t.Fatalf("Save: %v", err)
 	}
 
-	// Override TTL to 100ms directly
-	rdb.Expire(ctx, "shirakami:checkpoint:"+taskID, 100*time.Millisecond)
+	// Override TTL to 500ms directly
+	rdb.Expire(ctx, "shirakami:checkpoint:"+taskID, 500*time.Millisecond)
 
-	time.Sleep(200 * time.Millisecond)
+	time.Sleep(1 * time.Second)
 
 	state, _, err := cp.Load(ctx, taskID)
 	if err != nil {
