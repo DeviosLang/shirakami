@@ -243,6 +243,13 @@ type apiServer struct {
 	progressMu sync.RWMutex
 	// progress maps taskID → step count for in-flight analyses.
 	progress map[string]int
+
+	// repoFetchMu serialises concurrent git-fetch operations per repository.
+	// Key: repo name string → *sync.Mutex.
+	// Using sync.Map avoids a global lock on the map itself while still
+	// preventing two goroutines from running git-fetch on the same repo
+	// concurrently (which causes "shallow.lock: File exists" failures).
+	repoFetchMu sync.Map
 }
 
 // SubmitTaskRequest is the JSON body for POST /api/v1/tasks.
@@ -1379,9 +1386,18 @@ func (s *apiServer) fetchBranchDiff(repoName, featureBranch string) (diff, baseB
 		return "", "", fmt.Errorf("repo %q not found on NFS workspace (%s) — run `shirakami workspace sync` first", repoName, repoDir)
 	}
 
-	// Remove any stale git lock files left by a crashed previous process.
+	// Serialise all git operations on this repo to prevent concurrent fetches
+	// racing for the same lock files (shallow.lock, FETCH_HEAD.lock, etc.).
+	// sync.Map.LoadOrStore is used to lazily create one mutex per repo name.
+	muVal, _ := s.repoFetchMu.LoadOrStore(repoName, &sync.Mutex{})
+	mu := muVal.(*sync.Mutex)
+	mu.Lock()
+	defer mu.Unlock()
+
+	// Remove any stale git lock files left by a previously crashed process.
 	// These are safe to delete: git creates them transiently during fetch/pack
 	// operations, and a leftover lock always means the prior process is gone.
+	// This runs inside the per-repo mutex, so it never races with a live fetch.
 	for _, lockFile := range []string{
 		filepath.Join(repoDir, ".git", "shallow.lock"),
 		filepath.Join(repoDir, ".git", "FETCH_HEAD.lock"),
