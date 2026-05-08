@@ -142,6 +142,53 @@ func SyncAll(ctx context.Context, workspaceDir string, repos []RepoConfig) map[s
 	return results
 }
 
+// gitInfoAttributes is written to {repoDir}/.git/info/attributes after every
+// clone or pull. It activates git's built-in language-specific diff drivers so
+// that `git diff` appends the enclosing function name after the closing @@ on
+// hunk headers (e.g. "@@ -5,6 +5,6 @@ def foo():"). Without this file,
+// repositories that lack a top-level .gitattributes produce bare @@ lines and
+// ParseDiffFunctions cannot identify which functions were modified.
+const gitInfoAttributes = `# Shirakami: activate built-in diff drivers for function-context hunk headers.
+# git built-in drivers: python, java, golang, cpp, ruby, bibtex, fortran, html, matlab, objc, pascal, perl, php, python, ruby, rust, tex
+*.py   diff=python
+*.go   diff=golang
+*.java diff=java
+*.cpp  diff=cpp
+*.cc   diff=cpp
+*.cxx  diff=cpp
+*.c    diff=cpp
+*.h    diff=cpp
+*.ts   diff=javascript
+*.js   diff=javascript
+*.jsx  diff=javascript
+*.tsx  diff=javascript
+*.rb   diff=ruby
+*.rs   diff=rust
+*.php  diff=php
+`
+
+// WriteGitInfoAttributes writes the language-specific diff driver mappings
+// into {repoDir}/.git/info/attributes (exported for use by callers that
+// clone repos outside of SyncAll, e.g. on-demand clone in the HTTP server).
+func WriteGitInfoAttributes(repoDir string) {
+	writeGitInfoAttributes(repoDir)
+}
+
+// writeGitInfoAttributes is the unexported implementation.
+func writeGitInfoAttributes(repoDir string) {
+	attrDir := filepath.Join(repoDir, ".git", "info")
+	if err := os.MkdirAll(attrDir, 0o755); err != nil {
+		return
+	}
+	attrFile := filepath.Join(attrDir, "attributes")
+	// Only write if file is missing or does not already contain our marker.
+	existing, err := os.ReadFile(attrFile)
+	if err == nil && strings.Contains(string(existing), "Shirakami:") {
+		return // already written
+	}
+	_ = os.WriteFile(attrFile, []byte(gitInfoAttributes), 0o644)
+}
+
 // syncRepo clones the repo if it doesn't exist locally, otherwise pulls it.
 func syncRepo(ctx context.Context, workspaceDir string, repo RepoConfig) SyncResult {
 	repoDir := filepath.Join(workspaceDir, repo.Name)
@@ -165,6 +212,10 @@ func syncRepo(ctx context.Context, workspaceDir string, repo RepoConfig) SyncRes
 			}
 		}
 	}
+
+	// Ensure .git/info/attributes exists so that `git diff` emits function names
+	// in @@ hunk headers regardless of whether the repo ships a .gitattributes.
+	writeGitInfoAttributes(repoDir)
 
 	hash, err := currentCommit(ctx, repoDir)
 	if err != nil {

@@ -162,6 +162,12 @@ func runServer(cmd *cobra.Command, args []string) error {
 	// NFS PVC persists across pod restarts, so this is mandatory (not just best-effort).
 	workspace.CleanupWorktrees(cfg.Workspace.Dir, 0)
 
+	// Backfill .git/info/attributes for repos already cloned on the NFS workspace
+	// (e.g. repos cloned before this feature was added). This is idempotent.
+	for _, r := range cfg.Workspace.Repos {
+		workspace.WriteGitInfoAttributes(filepath.Join(cfg.Workspace.Dir, r.Name))
+	}
+
 	// L3: periodic GC — removes worktrees older than 2 hours (defense in depth).
 	go func() {
 		ticker := time.NewTicker(30 * time.Minute)
@@ -1532,6 +1538,7 @@ func (s *apiServer) fetchBranchDiff(repoName, featureBranch string) (diff, baseB
 			return "", "", fmt.Errorf("repo %q not found on NFS workspace and auto-clone failed: %w\n%s", repoName, cloneErr, out)
 		}
 		cloneLog.Infow("workspace.clone_on_demand_done", "repo", repoName)
+		workspace.WriteGitInfoAttributes(repoDir)
 	}
 
 	// Serialise all git operations on this repo to prevent concurrent fetches
@@ -1582,6 +1589,9 @@ func (s *apiServer) fetchBranchDiff(repoName, featureBranch string) (diff, baseB
 
 	// 3. Compute three-dot diff: changes on featureBranch not yet in baseBranch.
 	//    Using FETCH_HEAD (just fetched) vs origin/<baseBranch> keeps it self-contained.
+	//    git will append enclosing function names to @@ hunk headers because
+	//    WriteGitInfoAttributes has already wired up the built-in diff drivers
+	//    (python, golang, cpp, …) via .git/info/attributes.
 	diffRef := fmt.Sprintf("origin/%s...FETCH_HEAD", baseBranch)
 	diffCmd := exec.CommandContext(ctx, "git", "-C", repoDir, "diff", diffRef)
 	out, derr := diffCmd.Output()
