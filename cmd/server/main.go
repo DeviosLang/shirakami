@@ -575,7 +575,9 @@ func (s *apiServer) submitTask(w http.ResponseWriter, r *http.Request) {
 	if req.InputBranch != "" && req.SourceRepo != "" && req.InputDiff == "" {
 		diff, baseBranch, err := s.fetchBranchDiff(req.SourceRepo, req.InputBranch)
 		if err != nil {
-			jsonError(w, fmt.Sprintf("branch diff failed for %s@%s: %s", req.SourceRepo, req.InputBranch, err.Error()), http.StatusBadRequest)
+			errMsg := fmt.Sprintf("branch diff failed for %s@%s: %s", req.SourceRepo, req.InputBranch, err.Error())
+			s.recordFailedSubmit(r.Context(), req, errMsg)
+			jsonError(w, errMsg, http.StatusBadRequest)
 			return
 		}
 		req.InputDiff = diff
@@ -589,11 +591,11 @@ func (s *apiServer) submitTask(w http.ResponseWriter, r *http.Request) {
 	// concatenate, and use the first repo as source_repo.
 	if len(req.Branches) > 0 && req.InputDiff == "" {
 		type branchResult struct {
-			repo      string
-			branch    string
-			diff      string
+			repo       string
+			branch     string
+			diff       string
 			baseBranch string
-			err       error
+			err        error
 		}
 		results := make([]branchResult, len(req.Branches))
 		var wg sync.WaitGroup
@@ -612,7 +614,9 @@ func (s *apiServer) submitTask(w http.ResponseWriter, r *http.Request) {
 		var firstRepo string
 		for _, res := range results {
 			if res.err != nil {
-				jsonError(w, fmt.Sprintf("branch diff failed for %s@%s: %s", res.repo, res.branch, res.err.Error()), http.StatusBadRequest)
+				errMsg := fmt.Sprintf("branch diff failed for %s@%s: %s", res.repo, res.branch, res.err.Error())
+				s.recordFailedSubmit(r.Context(), req, errMsg)
+				jsonError(w, errMsg, http.StatusBadRequest)
 				return
 			}
 			// Prefix each repo's diff with a header so the LLM knows which repo it belongs to.
@@ -674,6 +678,30 @@ func (s *apiServer) submitTask(w http.ResponseWriter, r *http.Request) {
 		Modes:      task.Modes,
 		CreatedAt:  task.CreatedAt,
 	})
+}
+
+// recordFailedSubmit creates a failed task record in the DB so that pre-analysis
+// errors (e.g. git fetch failures) are visible in task history and queryable via
+// GET /tasks. It is best-effort: logging on error rather than surfacing to the caller.
+func (s *apiServer) recordFailedSubmit(ctx context.Context, req SubmitTaskRequest, errMsg string) {
+	inputType := storage.InputType(req.InputType)
+	if inputType == "" {
+		inputType = storage.InputTypeDiff
+	}
+	modes := req.Modes
+	if len(modes) == 0 {
+		modes = s.cfg.Server.DefaultModes
+	}
+	// Use the raw request diff (may be empty for branch-mode failures).
+	cacheKey := cache.CacheKey(req.InputDiff+req.InputDesc, []string{s.cfg.Workspace.Dir, req.SourceRepo})
+	task, err := s.store.CreateTask(ctx, inputType, req.InputDiff, req.InputDesc, cacheKey, req.SourceRepo, modes)
+	if err != nil {
+		logger.S().Warnw("recordFailedSubmit.create_task_failed", "err", err)
+		return
+	}
+	if err := s.store.UpdateTaskStatusWithError(ctx, task.ID, errMsg); err != nil {
+		logger.S().Warnw("recordFailedSubmit.update_failed", "task_id", task.ID, "err", err)
+	}
 }
 
 func (s *apiServer) listTasks(w http.ResponseWriter, r *http.Request) {
@@ -1349,6 +1377,22 @@ func (s *apiServer) fetchBranchDiff(repoName, featureBranch string) (diff, baseB
 	repoDir := filepath.Join(s.cfg.Workspace.Dir, repoName)
 	if _, statErr := os.Stat(filepath.Join(repoDir, ".git")); os.IsNotExist(statErr) {
 		return "", "", fmt.Errorf("repo %q not found on NFS workspace (%s) — run `shirakami workspace sync` first", repoName, repoDir)
+	}
+
+	// Remove any stale git lock files left by a crashed previous process.
+	// These are safe to delete: git creates them transiently during fetch/pack
+	// operations, and a leftover lock always means the prior process is gone.
+	for _, lockFile := range []string{
+		filepath.Join(repoDir, ".git", "shallow.lock"),
+		filepath.Join(repoDir, ".git", "FETCH_HEAD.lock"),
+		filepath.Join(repoDir, ".git", "index.lock"),
+	} {
+		if removeErr := os.Remove(lockFile); removeErr == nil {
+			logger.S().Warnw("fetchBranchDiff.stale_lock_removed",
+				"repo", repoName,
+				"lock_file", lockFile,
+			)
+		}
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
