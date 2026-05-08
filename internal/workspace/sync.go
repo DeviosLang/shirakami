@@ -8,7 +8,84 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 )
+
+// WorktreesSubdir is the subdirectory under workspace.dir where all task worktrees live.
+// Keeping it inside workspace.dir (a shirakami-owned NFS PVC mount) ensures cleanup
+// never touches other directories on the shared /tmp filesystem.
+const WorktreesSubdir = ".worktrees"
+
+// WorktreeBase returns the absolute path to the worktree root for this workspace.
+func WorktreeBase(workspaceDir string) string {
+	return filepath.Join(workspaceDir, WorktreesSubdir)
+}
+
+// CreateWorktree creates a detached git worktree at worktreeDir checked out to ref.
+// ref must already be fetchable in the repo at repoDir (e.g. "origin/feature/xxx").
+// Any stale worktree registration or directory at worktreeDir is forcibly removed first.
+func CreateWorktree(ctx context.Context, repoDir, worktreeDir, ref string) error {
+	// Prune stale worktree registrations before adding a new one.
+	_ = exec.CommandContext(ctx, "git", "-C", repoDir, "worktree", "prune").Run()
+	// Force-remove any existing worktree entry for this path.
+	_ = exec.CommandContext(ctx, "git", "-C", repoDir, "worktree", "remove", "--force", worktreeDir).Run()
+	_ = os.RemoveAll(worktreeDir)
+
+	if err := os.MkdirAll(filepath.Dir(worktreeDir), 0o755); err != nil {
+		return fmt.Errorf("mkdir worktree parent: %w", err)
+	}
+	cmd := exec.CommandContext(ctx, "git", "-C", repoDir, "worktree", "add", "--detach", worktreeDir, ref)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("git worktree add %s %s: %w\n%s", worktreeDir, ref, err, out)
+	}
+	return nil
+}
+
+// RemoveWorktree removes the git worktree at worktreeDir and prunes stale registrations.
+// Errors are intentionally swallowed — cleanup is best-effort.
+func RemoveWorktree(ctx context.Context, repoDir, worktreeDir string) {
+	_ = exec.CommandContext(ctx, "git", "-C", repoDir, "worktree", "remove", "--force", worktreeDir).Run()
+	_ = os.RemoveAll(worktreeDir)
+	_ = exec.CommandContext(ctx, "git", "-C", repoDir, "worktree", "prune").Run()
+}
+
+// CleanupWorktrees removes task worktree directories under {workspaceDir}/.worktrees/
+// that are older than maxAge. Pass maxAge=0 to remove everything (used at startup).
+// Only operates inside workspace.dir — never touches other directories on /tmp.
+func CleanupWorktrees(workspaceDir string, maxAge time.Duration) {
+	wtBase := WorktreeBase(workspaceDir)
+	entries, err := os.ReadDir(wtBase)
+	if err != nil {
+		return // directory doesn't exist yet — nothing to clean
+	}
+	now := time.Now()
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		taskDir := filepath.Join(wtBase, e.Name())
+		if maxAge > 0 {
+			info, infoErr := e.Info()
+			if infoErr != nil || now.Sub(info.ModTime()) < maxAge {
+				continue
+			}
+		}
+		// Gracefully remove each repo worktree, then the task directory.
+		repoEntries, _ := os.ReadDir(taskDir)
+		for _, re := range repoEntries {
+			if !re.IsDir() {
+				continue
+			}
+			repoName := re.Name()
+			repoDir := filepath.Join(workspaceDir, repoName)
+			wtDir := filepath.Join(taskDir, repoName)
+			wtCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			RemoveWorktree(wtCtx, repoDir, wtDir)
+			cancel()
+		}
+		_ = os.RemoveAll(taskDir)
+	}
+}
 
 // RepoConfig describes a single repository to clone/pull.
 type RepoConfig struct {

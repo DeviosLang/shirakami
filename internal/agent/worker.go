@@ -61,6 +61,12 @@ type WorkerTask struct {
 	// prompt includes "(around line N)" hints so the LLM can distinguish between
 	// multiple same-named functions in the same file.
 	LineHints map[string]int
+	// NewFunctions lists function names that are brand-new additions in the diff
+	// (ChangeType == "added" from ParseDiffFunctions). These functions do not exist
+	// in the master workspace but ARE present in a feature-branch worktree.
+	// When non-empty, they are injected into the prompt so the LLM treats them as
+	// real, and their nodes are exempted from the filterGhostNodes disk check.
+	NewFunctions []string
 }
 
 // SearchResult holds one raw ripgrep hit — file path, line, and caller name.
@@ -410,11 +416,25 @@ func (w *WorkerAgent) Analyse(ctx context.Context, task WorkerTask) (*WorkerResu
 			"then A is a direct caller — record it in nodes[] without needing to search.\n\n"
 	}
 
+	// Build newly-added functions section (Plan B fallback for bare diff or worktree failure).
+	// These functions are brand-new in the diff — they do NOT exist in the master workspace,
+	// but may exist in a feature-branch worktree (if worktree was created successfully).
+	// The section tells the LLM to treat them as real even if ripgrep returns 0 results.
+	newFunctionsSection := ""
+	if len(task.NewFunctions) > 0 {
+		newFunctionsSection = "NEWLY ADDED FUNCTIONS (exist only in this feature branch, NOT in master):\n" +
+			formatList(task.NewFunctions) +
+			"These functions are brand-new ('+def'/'+func' in diff). They may not appear in ripgrep\n" +
+			"results if the master workspace is used. Still include them as nodes[] in your output\n" +
+			"(with file/line from the diff or empty if unknown) — do NOT skip them.\n\n"
+	}
+
 	prompt := fmt.Sprintf(
 		"SOURCE REPOSITORY: %s\n"+
 			"REPOSITORY PATH: %s\n"+
 			"CHANGED FUNCTIONS TO TRACE:\n%s"+
 			"EXTERNAL CALLERS (from other repos calling into this repo):\n%s\n"+
+			"%s"+
 			"%s"+
 			"%s"+
 			"ENTRY-ROLE REPOSITORIES (stop tracing when you reach these): %s\n\n"+
@@ -492,6 +512,7 @@ func (w *WorkerAgent) Analyse(ctx context.Context, task WorkerTask) (*WorkerResu
 		formatList(task.ExternalCallers),
 		contractHintsSection,
 		importContextSection,
+		newFunctionsSection,
 		entryRepoList,
 		task.RepoName,
 		task.RepoName,
@@ -565,7 +586,7 @@ func (w *WorkerAgent) Analyse(ctx context.Context, task WorkerTask) (*WorkerResu
 	// filterGhostNodes records the ghost paths in workerResult.GhostFiles so
 	// the API layer can surface actionable warnings, then removes those nodes.
 	if task.RepoPath != "" {
-		filterGhostNodes(workerResult, task.RepoPath, task.WorkspaceDir)
+		filterGhostNodes(workerResult, task.RepoPath, task.WorkspaceDir, task.NewFunctions)
 	}
 
 	log.Infow("worker.parsed",
@@ -1437,9 +1458,29 @@ func parseUTAnalyses(content string) []UTAnalysis {
 // Only nodes that cannot be rescued after all variants are tried are added to
 // result.GhostFiles so the API layer can surface actionable warnings.
 // GhostFiles is deduplicated so each path appears at most once.
-func filterGhostNodes(result *WorkerResult, repoPath, workspaceDir string) {
+func filterGhostNodes(result *WorkerResult, repoPath, workspaceDir string, newFuncNames []string) {
 	log := logger.S()
 	repoBase := filepath.Base(repoPath)
+
+	// Build a set of newly-added function names so we can exempt them from the ghost
+	// check. These functions exist only in a feature-branch worktree (or may have an
+	// empty file path), so they must not be silently dropped.
+	newFuncSet := make(map[string]bool, len(newFuncNames))
+	for _, fn := range newFuncNames {
+		newFuncSet[fn] = true
+	}
+	// isNewFunc returns true when the node's Function field is a newly-added function.
+	// We strip any "file::funcname" qualifier to match the bare function name.
+	isNewFunc := func(funcName string) bool {
+		if len(newFuncSet) == 0 {
+			return false
+		}
+		bare := funcName
+		if idx := strings.LastIndex(funcName, "::"); idx >= 0 {
+			bare = funcName[idx+2:]
+		}
+		return newFuncSet[bare] || newFuncSet[funcName]
+	}
 
 	// cleanPath strips a leading "repoName/" prefix so we don't double-join.
 	// e.g. "cvm_api/api/Foo.py" under repoPath "/workspace/cvm_api"
@@ -1476,8 +1517,15 @@ func filterGhostNodes(result *WorkerResult, repoPath, workspaceDir string) {
 	var ghostNodes []CallNode
 	filtered := result.Nodes[:0]
 	for _, n := range result.Nodes {
-		if fileExists(n.File) {
+		if fileExists(n.File) || isNewFunc(n.Function) {
 			filtered = append(filtered, n)
+			if !fileExists(n.File) && isNewFunc(n.Function) {
+				log.Debugw("worker.ghost_exempt_new_func",
+					"repo", result.RepoName,
+					"func", n.Function,
+					"file", n.File,
+				)
+			}
 		} else {
 			log.Warnw("worker.ghost_file_detected",
 				"repo", result.RepoName,
@@ -1493,8 +1541,15 @@ func filterGhostNodes(result *WorkerResult, repoPath, workspaceDir string) {
 	var ghostEPs []CallNode
 	filteredEP := result.EntryPoints[:0]
 	for _, ep := range result.EntryPoints {
-		if fileExists(ep.File) {
+		if fileExists(ep.File) || isNewFunc(ep.Function) {
 			filteredEP = append(filteredEP, ep)
+			if !fileExists(ep.File) && isNewFunc(ep.Function) {
+				log.Debugw("worker.ghost_exempt_new_func",
+					"repo", result.RepoName,
+					"func", ep.Function,
+					"file", ep.File,
+				)
+			}
 		} else {
 			log.Warnw("worker.ghost_file_detected",
 				"repo", result.RepoName,

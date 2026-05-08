@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -157,6 +158,19 @@ func runServer(cmd *cobra.Command, args []string) error {
 		}
 	}
 
+	// L2: clean up any worktrees left by a previous crashed process.
+	// NFS PVC persists across pod restarts, so this is mandatory (not just best-effort).
+	workspace.CleanupWorktrees(cfg.Workspace.Dir, 0)
+
+	// L3: periodic GC — removes worktrees older than 2 hours (defense in depth).
+	go func() {
+		ticker := time.NewTicker(30 * time.Minute)
+		defer ticker.Stop()
+		for range ticker.C {
+			workspace.CleanupWorktrees(cfg.Workspace.Dir, 2*time.Hour)
+		}
+	}()
+
 	// Build webhook handler.
 	var commenter webhook.Commenter
 	if cfg.Webhook.CommentOnMR {
@@ -177,7 +191,7 @@ func runServer(cmd *cobra.Command, args []string) error {
 			Secret:    cfg.Webhook.Secret,
 			Commenter: commenter,
 			Launch: func(taskID, inputDiff, inputDesc, cacheKey string) {
-				go srv.runAnalysis(taskID, inputDiff, inputDesc, cacheKey, "", cfg.Server.DefaultModes, "")
+				go srv.runAnalysis(taskID, inputDiff, inputDesc, cacheKey, "", cfg.Server.DefaultModes, "", nil)
 			},
 		},
 	)
@@ -202,7 +216,7 @@ func runServer(cmd *cobra.Command, args []string) error {
 		log.Sugar().Infow("orphaned tasks requeued", "count", len(orphans))
 		for _, t := range orphans {
 			t := t // capture
-			go srv.runAnalysis(t.ID, t.InputDiff, t.InputDesc, t.CacheKey, t.SourceRepo, t.Modes, "")
+			go srv.runAnalysis(t.ID, t.InputDiff, t.InputDesc, t.CacheKey, t.SourceRepo, t.Modes, "", nil)
 		}
 	}
 
@@ -418,7 +432,36 @@ func (s *apiServer) handleReposRegister(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	// Build a quick lookup of already-registered repos by URL (credentials stripped).
+	// Build a quick lookup of already-registered repos.
+	// Key is a normalized form of the URL: scheme-less, credential-less, .git-stripped,
+	// lower-cased host — so that http/https/SSH variants all match the same entry.
+	// e.g. "http://oauth2:token@git.woa.com/vstation/api.git"
+	//      "https://git.woa.com/vstation/api"
+	//      "git@git.woa.com:vstation/api"
+	// all normalize to "git.woa.com/vstation/api".
+	normalizeRepoURL := func(raw string) string {
+		raw = strings.TrimSpace(raw)
+		// SSH format: git@host:path[.git]
+		if strings.HasPrefix(raw, "git@") {
+			rest := raw[len("git@"):]
+			if idx := strings.LastIndex(rest, "@"); idx >= 0 {
+				rest = rest[idx+1:]
+			}
+			rest = strings.Replace(rest, ":", "/", 1) // host:path → host/path
+			rest = strings.TrimSuffix(rest, ".git")
+			return strings.ToLower(rest)
+		}
+		// HTTP(S): strip scheme, credentials, .git
+		if parsed, err := url.Parse(raw); err == nil {
+			parsed.User = nil
+			parsed.Scheme = ""
+			p := strings.TrimPrefix(parsed.String(), "//")
+			p = strings.TrimSuffix(p, ".git")
+			return strings.ToLower(p)
+		}
+		return strings.ToLower(raw)
+	}
+
 	type registeredEntry struct {
 		name      string
 		branch    string
@@ -426,16 +469,12 @@ func (s *apiServer) handleReposRegister(w http.ResponseWriter, r *http.Request) 
 	}
 	registered := make(map[string]registeredEntry, len(s.cfg.Workspace.Repos))
 	for _, r := range s.cfg.Workspace.Repos {
-		cleanURL := r.URL
-		if parsed, err := url.Parse(r.URL); err == nil {
-			parsed.User = nil
-			cleanURL = parsed.String()
-		}
+		key := normalizeRepoURL(r.URL)
 		branch := r.Branch
 		if branch == "" {
 			branch = "master"
 		}
-		registered[cleanURL] = registeredEntry{
+		registered[key] = registeredEntry{
 			name:      r.Name,
 			branch:    branch,
 			localPath: path.Join(s.cfg.Workspace.Dir, r.Name),
@@ -483,8 +522,9 @@ func (s *apiServer) handleReposRegister(w http.ResponseWriter, r *http.Request) 
 			parsed.User = nil
 			cleanURL := parsed.String()
 
-			// Check if already registered.
-			if entry, ok := registered[cleanURL]; ok {
+			// Check if already registered (normalized match: scheme/credentials/.git agnostic).
+			normKey := normalizeRepoURL(raw)
+			if entry, ok := registered[normKey]; ok {
 				res.Registered = true
 				res.Branch = entry.branch
 				res.LocalPath = entry.localPath
@@ -493,13 +533,12 @@ func (s *apiServer) handleReposRegister(w http.ResponseWriter, r *http.Request) 
 				results[i] = res
 				return
 			}
+			_ = cleanURL // kept for potential future use
 
-			// Not yet registered: probe remote for default branch.
-			// Use a short timeout so the endpoint stays responsive.
-			ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
-			defer cancel()
-			res.Branch = probeDefaultBranch(ctx, raw)
-			res.LocalPath = path.Join(s.cfg.Workspace.Dir, res.Name)
+			// Not registered in shirakami workspace — return an error so callers
+			// can skip this repo instead of submitting with a wrong inferred name.
+			res.Error = "repo not registered in shirakami workspace; add it to shirakami.yaml and run workspace sync"
+			res.Name = ""
 			results[i] = res
 		}()
 	}
@@ -596,6 +635,7 @@ func (s *apiServer) submitTask(w http.ResponseWriter, r *http.Request) {
 	// ── Multi-repo branches mode ──────────────────────────────────────────────
 	// When branches[] is provided, fetch diffs from all repos in parallel,
 	// concatenate, and use the first repo as source_repo.
+	var submitWarnings []string // repos skipped due to branch-not-found
 	if len(req.Branches) > 0 && req.InputDiff == "" {
 		type branchResult struct {
 			repo       string
@@ -621,6 +661,16 @@ func (s *apiServer) submitTask(w http.ResponseWriter, r *http.Request) {
 		var firstRepo string
 		for _, res := range results {
 			if res.err != nil {
+				var notFound *errBranchNotFound
+				if errors.As(res.err, &notFound) {
+					// Branch doesn't exist on remote — skip this repo and warn.
+					// The task still runs for the remaining repos.
+					warnMsg := fmt.Sprintf("branch %q not found for repo %q — skipped (no diff contribution)", res.branch, res.repo)
+					submitWarnings = append(submitWarnings, warnMsg)
+					logger.S().Warnw("fetchBranchDiff.branch_not_found_skipped",
+						"repo", res.repo, "branch", res.branch)
+					continue
+				}
 				errMsg := fmt.Sprintf("branch diff failed for %s@%s: %s", res.repo, res.branch, res.err.Error())
 				s.recordFailedSubmit(r.Context(), req, errMsg)
 				jsonError(w, errMsg, http.StatusBadRequest)
@@ -635,12 +685,25 @@ func (s *apiServer) submitTask(w http.ResponseWriter, r *http.Request) {
 				firstRepo = res.repo
 			}
 		}
+		if len(descParts) == 0 {
+			// Every repo was skipped (all branches missing). Nothing to analyse.
+			errMsg := "all branches not found on remote: " + strings.Join(submitWarnings, "; ")
+			s.recordFailedSubmit(r.Context(), req, errMsg)
+			jsonError(w, errMsg, http.StatusBadRequest)
+			return
+		}
 		req.InputDiff = combinedDiff.String()
 		if req.SourceRepo == "" {
 			req.SourceRepo = firstRepo
 		}
 		if req.InputDesc == "" {
 			req.InputDesc = "multi-repo branch analysis: " + strings.Join(descParts, ", ")
+		}
+		// Attach skip warnings to ExtraPrompt so the LLM is aware.
+		if len(submitWarnings) > 0 {
+			note := "\n[NOTE: the following repos were skipped because their branch was not found on remote: " +
+				strings.Join(submitWarnings, "; ") + "]"
+			req.ExtraPrompt += note
 		}
 	}
 
@@ -671,7 +734,12 @@ func (s *apiServer) submitTask(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Launch analysis in background (semaphore controls concurrency).
-	go s.runAnalysis(task.ID, req.InputDiff, req.InputDesc, cacheKey, req.SourceRepo, modes, req.ExtraPrompt)
+	// activeBranches: prefer multi-repo branches list; fall back to single InputBranch wrap.
+	activeBranches := req.Branches
+	if len(activeBranches) == 0 && req.InputBranch != "" && req.SourceRepo != "" {
+		activeBranches = []BranchEntry{{Repo: req.SourceRepo, Branch: req.InputBranch}}
+	}
+	go s.runAnalysis(task.ID, req.InputDiff, req.InputDesc, cacheKey, req.SourceRepo, modes, req.ExtraPrompt, activeBranches)
 
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(http.StatusAccepted)
@@ -684,6 +752,7 @@ func (s *apiServer) submitTask(w http.ResponseWriter, r *http.Request) {
 		SourceRepo: task.SourceRepo,
 		Modes:      task.Modes,
 		CreatedAt:  task.CreatedAt,
+		Warnings:   submitWarnings,
 	})
 }
 
@@ -954,7 +1023,10 @@ func (s *apiServer) clearProgress(taskID string) {
 }
 
 // runAnalysis runs the analysis respecting the semaphore concurrency limit.
-func (s *apiServer) runAnalysis(taskID, inputDiff, inputDesc, cacheKey, sourceRepo string, modes []string, extraPrompt string) {
+// activeBranches lists the {repo, branch} pairs whose worktrees should be created
+// before analysis so ripgrep searches the feature-branch code (not just master).
+// Pass nil when no branch input is available (bare diff / orphan requeue).
+func (s *apiServer) runAnalysis(taskID, inputDiff, inputDesc, cacheKey, sourceRepo string, modes []string, extraPrompt string, activeBranches []BranchEntry) {
 	ctx := context.Background()
 	log := logger.S()
 
@@ -988,6 +1060,39 @@ func (s *apiServer) runAnalysis(taskID, inputDiff, inputDesc, cacheKey, sourceRe
 			}
 		}
 	}
+
+	// ── Worktree setup: checkout feature branches so ripgrep searches branch code ─
+	// Must happen AFTER SyncAll (master pulled) so we can base worktrees on fresh refs.
+	// Only created when activeBranches is non-empty (branch-mode requests).
+	wtBase := filepath.Join(s.cfg.Workspace.Dir, workspace.WorktreesSubdir, taskID)
+	activeWorktrees := make(map[string]string) // repoName → worktreeDir
+
+	for _, be := range activeBranches {
+		repoDir := filepath.Join(s.cfg.Workspace.Dir, be.Repo)
+		wtDir := filepath.Join(wtBase, be.Repo)
+		ref := "origin/" + be.Branch
+		wtCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
+		if err := workspace.CreateWorktree(wtCtx, repoDir, wtDir, ref); err != nil {
+			log.Warnw("worktree.create_failed (falling back to master)",
+				"task_id", taskID, "repo", be.Repo, "branch", be.Branch, "err", err)
+			cancel()
+			continue
+		}
+		cancel()
+		activeWorktrees[be.Repo] = wtDir
+		log.Infow("worktree.created",
+			"task_id", taskID, "repo", be.Repo, "branch", be.Branch, "path", wtDir)
+	}
+
+	// Cleanup worktrees when runAnalysis exits (normal completion, error, or ctx cancellation).
+	defer func() {
+		for repoName, wtDir := range activeWorktrees {
+			repoDir := filepath.Join(s.cfg.Workspace.Dir, repoName)
+			workspace.RemoveWorktree(context.Background(), repoDir, wtDir)
+			log.Infow("worktree.removed", "task_id", taskID, "repo", repoName)
+		}
+		_ = os.RemoveAll(wtBase)
+	}()
 
 	// Check cache first.
 	s.cacheTotal.Add(1)
@@ -1035,6 +1140,17 @@ func (s *apiServer) runAnalysis(taskID, inputDiff, inputDesc, cacheKey, sourceRe
 
 	tools := defaultTools(s.cfg.Workspace.Dir)
 	repos := configRepos(s.cfg)
+
+	// Override repo paths so orchestrator + workers search feature-branch code.
+	// Repos without a worktree (no branch input or worktree creation failed) keep
+	// their original master path — graceful degradation is built in.
+	for i, r := range repos {
+		if wtPath, ok := activeWorktrees[r.Name]; ok {
+			repos[i].Path = wtPath
+			log.Debugw("worktree.repo_path_overridden",
+				"task_id", taskID, "repo", r.Name, "path", wtPath)
+		}
+	}
 
 	cpDir := os.TempDir() + "/shirakami-checkpoints"
 	cp, err := checkpoint.NewFileCheckpointer(cpDir)
@@ -1373,6 +1489,19 @@ func (a *storageTaskAdapter) CreateTask(ctx context.Context, inputType, inputDif
 }
 
 // ---------------------------------------------------------------------------
+// errBranchNotFound is returned by fetchBranchDiff when the remote branch does
+// not exist. Callers can use errors.As to distinguish this from other failures
+// and treat the repo as having no diff (skip gracefully with a warning).
+type errBranchNotFound struct {
+	Repo   string
+	Branch string
+}
+
+func (e *errBranchNotFound) Error() string {
+	return fmt.Sprintf("branch %q not found on remote for repo %q", e.Branch, e.Repo)
+}
+
+// ---------------------------------------------------------------------------
 // fetchBranchDiff fetches the remote branch and returns the unified diff
 // between the repo's base branch (master/main) and the feature branch.
 //
@@ -1383,7 +1512,26 @@ func (a *storageTaskAdapter) CreateTask(ctx context.Context, inputType, inputDif
 func (s *apiServer) fetchBranchDiff(repoName, featureBranch string) (diff, baseBranch string, err error) {
 	repoDir := filepath.Join(s.cfg.Workspace.Dir, repoName)
 	if _, statErr := os.Stat(filepath.Join(repoDir, ".git")); os.IsNotExist(statErr) {
-		return "", "", fmt.Errorf("repo %q not found on NFS workspace (%s) — run `shirakami workspace sync` first", repoName, repoDir)
+		// Repo not cloned yet — try to clone it on-demand from shirakami.yaml config.
+		var repoURL string
+		for _, r := range s.cfg.Workspace.Repos {
+			if r.Name == repoName {
+				repoURL = r.URL
+				break
+			}
+		}
+		if repoURL == "" {
+			return "", "", fmt.Errorf("repo %q not found on NFS workspace (%s) and not configured in shirakami.yaml", repoName, repoDir)
+		}
+		cloneLog := logger.S()
+		cloneLog.Infow("workspace.clone_on_demand", "repo", repoName, "url", repoURL)
+		cloneCtx, cloneCancel := context.WithTimeout(context.Background(), 5*time.Minute)
+		defer cloneCancel()
+		cloneCmd := exec.CommandContext(cloneCtx, "git", "clone", "--depth=50", repoURL, repoDir)
+		if out, cloneErr := cloneCmd.CombinedOutput(); cloneErr != nil {
+			return "", "", fmt.Errorf("repo %q not found on NFS workspace and auto-clone failed: %w\n%s", repoName, cloneErr, out)
+		}
+		cloneLog.Infow("workspace.clone_on_demand_done", "repo", repoName)
 	}
 
 	// Serialise all git operations on this repo to prevent concurrent fetches
@@ -1417,6 +1565,9 @@ func (s *apiServer) fetchBranchDiff(repoName, featureBranch string) (diff, baseB
 	// 1. Fetch all remote refs (including the feature branch).
 	fetchCmd := exec.CommandContext(ctx, "git", "-C", repoDir, "fetch", "--depth=50", "origin", featureBranch)
 	if out, ferr := fetchCmd.CombinedOutput(); ferr != nil {
+		if strings.Contains(string(out), "couldn't find remote ref") {
+			return "", "", &errBranchNotFound{Repo: repoName, Branch: featureBranch}
+		}
 		return "", "", fmt.Errorf("git fetch origin %s: %w\n%s", featureBranch, ferr, out)
 	}
 

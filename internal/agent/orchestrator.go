@@ -162,6 +162,11 @@ type Orchestrator struct {
 	// Populated by extractChangedFunctions from Layer A+ hunk context and forwarded to
 	// Workers via WorkerTask.LineHints so the LLM can disambiguate same-named functions.
 	lineHints map[string]int
+	// addedFuncSet holds the bare function names that are brand-new additions in the diff
+	// (ChangeType == "added" from tool.ParseDiffFunctions). Forwarded to Workers via
+	// WorkerTask.NewFunctions so they can inject a "NEWLY ADDED FUNCTIONS" prompt section
+	// and exempt those nodes from the filterGhostNodes disk-existence check.
+	addedFuncSet map[string]bool
 }
 
 // IndexGraph is the interface consumed by Orchestrator for deterministic analysis.
@@ -329,6 +334,24 @@ func (o *Orchestrator) Run(ctx context.Context, input AnalysisInput) (*AnalysisO
 		"fn_count", len(changed),
 		"duration_ms", time.Since(step1).Milliseconds(),
 	)
+
+	// Build the set of newly-added functions (Plan B fallback).
+	// These are functions that appear as '+def'/'+func' in the diff — brand-new,
+	// not present in master workspace. Workers will include them as nodes and
+	// filterGhostNodes will exempt them from the disk-existence check.
+	o.addedFuncSet = make(map[string]bool)
+	if input.Diff != "" {
+		for _, cf := range tool.ParseDiffFunctions(input.Diff) {
+			if cf.ChangeType == "added" {
+				o.addedFuncSet[cf.FuncName] = true
+			}
+		}
+		if len(o.addedFuncSet) > 0 {
+			log.Infow("analyse.added_funcs",
+				"count", len(o.addedFuncSet),
+			)
+		}
+	}
 
 	output := &AnalysisOutput{
 		ChangedFunctions: changed,
@@ -1081,6 +1104,14 @@ func (o *Orchestrator) runWorkerBatch(ctx context.Context, pending map[string][]
 					worker.WithMetrics(o.metrics, o.llmModel)
 				}
 				workerStart := time.Now()
+				// Collect newly-added function names for this worker's repo (Plan B fallback).
+				// addedFuncSet is flat (bare function names); pass the full set to every worker
+				// since we don't track per-repo ownership here — filterGhostNodes will only
+				// exempt nodes whose Function matches, so false positives are benign.
+				var newFuncs []string
+				for fn := range o.addedFuncSet {
+					newFuncs = append(newFuncs, fn)
+				}
 				res, err := worker.Analyse(ctx, WorkerTask{
 					RepoName:         j.repo,
 					RepoPath:         repoPath,
@@ -1092,6 +1123,7 @@ func (o *Orchestrator) runWorkerBatch(ctx context.Context, pending map[string][]
 					Modes:            o.modes,
 					ExtraPrompt:      o.extraPrompt,
 					LineHints:        o.lineHints,
+					NewFunctions:     newFuncs,
 				})
 				if o.metrics != nil {
 					o.metrics.RecordWorkerDuration(j.priority, j.repo, time.Since(workerStart).Seconds())
