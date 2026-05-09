@@ -92,6 +92,14 @@ For each changed function, follow this loop:
 
   D. Callers > 20 → wide_impact=true, stop expanding
 
+### Inheritance & Polymorphism
+
+When a modified function belongs to a class:
+- Search for subclasses: ripgrep({"pattern": "class \\w+\\(ClassName\\)"})
+- Check if subclasses override the same method — if so, trace each override as an additional changed function
+- If callers reference the base-class type, all subclass implementations may execute at runtime — record all of them
+- For interface/abstract methods, use lsp_call_hierarchy with operation="findImplementations" to find all concrete implementations
+
 ### Step 3 — Output structured JSON
 
 ` + "```json" + `

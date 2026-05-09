@@ -13,7 +13,8 @@ import (
 // e.g. "class CDfwUpdateVmNetType(CDfwOp):" or "class Foo:".
 // When the @@ context is a class rather than a function, we need to scan
 // the hunk's context lines to find the enclosing method (def xxx).
-var classContextRE = regexp.MustCompile(`^\s*class\s+(\w+)`)
+// Group 1: class name. Group 2 (optional): parent class name inside parentheses.
+var classContextRE = regexp.MustCompile(`^\s*class\s+(\w+)(?:\((\w+)\))?`)
 
 // contextDefRE extracts a method/function name from a context line (no +/- prefix).
 // Matches Python "def name(" and similar patterns.
@@ -34,6 +35,77 @@ type DiffHunk struct {
 	StartLine   int    // first changed line number (new side)
 	EndLine     int    // last changed line number (new side)
 	FuncContext string // enclosing function name from @@ line context (may be empty)
+	// RawLines holds the +/- body lines of the hunk (e.g. "+x = 1", "-x = 0").
+	// Used to inject diff snippets into the Worker prompt so the LLM understands
+	// what changed, not just where. Limited to 40 lines to keep token usage bounded.
+	RawLines []string
+	// GlobalVar holds the name of a module-level variable definition detected
+	// in the changed lines (e.g. "TIMEOUT = 30" → GlobalVar = "TIMEOUT").
+	// When set, the Orchestrator emits a FILE_CHANGED_VAR sentinel so the Worker
+	// can search specifically for usage sites of that variable.
+	GlobalVar string
+	// ClassName holds the class name when the @@ hunk context is a class definition
+	// (e.g. "class CDfwUpdateVmNetType(CDfwOp):"). Always populated when the hunk
+	// context looks like a class — used together with ParentClass for 6-P2 hints.
+	ClassName string
+	// ParentClass holds the parent class name from "class Child(Parent):" syntax.
+	// Empty when the class has no explicit parent or the context is not a class.
+	ParentClass string
+}
+
+// globalVarDefRE matches module-level variable assignments in Python, Go, and JS/TS.
+// These are NOT function definitions, but their usage sites matter for call-chain
+// analysis (e.g. a changed timeout constant affects all callers that reference it).
+// Group 1 captures the variable name.
+var globalVarDefRE = regexp.MustCompile(`^[+](?:(?:var|const|let)\s+)?([A-Z_][A-Z0-9_]{2,})\s*(?::=|=)[^=]`)
+
+// sourceFuncDefREs holds language-specific patterns for finding function/method
+// definitions when scanning backward from a changed line (改进 1: Layer A+ disk fallback).
+// Each pattern must have at least one capture group — group 1 is the function name.
+// Patterns are applied to lines without the diff +/- prefix (raw file content).
+var sourceFuncDefREs = []*regexp.Regexp{
+	// Python: def funcname( or async def funcname(
+	regexp.MustCompile(`^\s*(?:async\s+)?def\s+(\w+)\s*\(`),
+	// Go: func FuncName( or func (r *T) FuncName(
+	regexp.MustCompile(`^func\s+(?:\([^)]+\)\s+)?(\w+)\s*\(`),
+	// Java/Kotlin/C#/C++: access-modifier returnType funcName(
+	regexp.MustCompile(`^\s*(?:public|private|protected|static|virtual|override|final|async|abstract)\s+[\w<>\[\]]+\s+(\w+)\s*\(`),
+	// JS/TS: function funcName( or async function funcName(
+	regexp.MustCompile(`^\s*(?:export\s+)?(?:async\s+)?function\s+(\w+)\s*\(`),
+	// JS/TS: const/let/var funcName = (args) => or = function(
+	regexp.MustCompile(`^\s*(?:export\s+)?(?:const|let|var)\s+(\w+)\s*=\s*(?:async\s*)?\(`),
+	// Ruby: def funcname
+	regexp.MustCompile(`^\s*def\s+(\w+)`),
+	// Rust: fn funcname(
+	regexp.MustCompile(`^\s*(?:pub\s+)?(?:async\s+)?fn\s+(\w+)\s*\(`),
+}
+
+// ResolveFuncAtLine scans backward from startLine (1-based) in lines to find the
+// enclosing function name using language-specific regex patterns.
+// It stops at the first match or after scanning maxScan lines.
+// Returns the function name, or "" if none found.
+// lines must contain the raw file content (no diff +/- prefix).
+func ResolveFuncAtLine(lines []string, startLine, maxScan int) string {
+	if startLine < 1 {
+		startLine = 1
+	}
+	idx := startLine - 1 // convert to 0-based index
+	if idx >= len(lines) {
+		idx = len(lines) - 1
+	}
+	limit := idx - maxScan
+	if limit < 0 {
+		limit = 0
+	}
+	for i := idx; i >= limit; i-- {
+		line := lines[i]
+		for _, re := range sourceFuncDefREs {
+			if m := re.FindStringSubmatch(line); len(m) > 1 {
+				return m[1]
+			}
+		}
+	}
+	return ""
 }
 
 // ParseDiffHunks extracts all changed-line ranges from a unified diff.
@@ -63,20 +135,41 @@ func ParseDiffHunks(diff string) []DiffHunk {
 	// hunkCtxIsClass is true when the current @@ context string looks like a
 	// class definition rather than a function/method definition.
 	hunkCtxIsClass := false
+	// currentClassName and currentParentClass hold the class/parent from the @@ context.
+	currentClassName := ""
+	currentParentClass := ""
+
+	// rawLinesBuf accumulates +/- lines for the current contiguous block.
+	// Capped at maxRawLines to limit token cost when injected into prompts.
+	const maxRawLines = 40
+	rawLinesBuf := make([]string, 0, 8)
+	// currentGlobalVar is the module-level variable name detected in the changed lines.
+	currentGlobalVar := ""
 
 	flushHunk := func() {
 		if inChange && currentFile != "" && hunkStart > 0 {
-			hunks = append(hunks, DiffHunk{
+			h := DiffHunk{
 				File:        currentFile,
 				StartLine:   hunkStart,
 				EndLine:     hunkEnd,
 				FuncContext: hunkFuncCtx,
-			})
+				ClassName:   currentClassName,
+				ParentClass: currentParentClass,
+				GlobalVar:   currentGlobalVar,
+			}
+			if len(rawLinesBuf) > 0 {
+				cp := make([]string, len(rawLinesBuf))
+				copy(cp, rawLinesBuf)
+				h.RawLines = cp
+			}
+			hunks = append(hunks, h)
 		}
 		inChange = false
 		hunkStart = 0
 		hunkEnd = 0
 		hunkFuncCtx = ""
+		rawLinesBuf = rawLinesBuf[:0]
+		currentGlobalVar = ""
 	}
 
 	for scanner.Scan() {
@@ -96,6 +189,8 @@ func ParseDiffHunks(diff string) []DiffHunk {
 			currentFuncCtx = ""
 			currentContextMethod = ""
 			hunkCtxIsClass = false
+			currentClassName = ""
+			currentParentClass = ""
 			continue
 		}
 
@@ -108,7 +203,24 @@ func ParseDiffHunks(diff string) []DiffHunk {
 			}
 			currentFuncCtx = parseHunkFuncContext(line)
 			currentContextMethod = ""
-			hunkCtxIsClass = isClassOnlyContext(currentFuncCtx)
+			// Use the raw (unstripped) context string for class detection so that
+			// "class Foo(Bar):" syntax is preserved for classContextRE to match.
+			rawCtx := parseHunkRawContext(line)
+			hunkCtxIsClass = isClassOnlyContext(rawCtx)
+			// Extract ClassName and ParentClass from the @@ context when it is a class.
+			if hunkCtxIsClass {
+				if m := classContextRE.FindStringSubmatch(rawCtx); len(m) > 1 {
+					currentClassName = m[1]
+					if len(m) > 2 {
+						currentParentClass = m[2]
+					} else {
+						currentParentClass = ""
+					}
+				}
+			} else {
+				currentClassName = ""
+				currentParentClass = ""
+			}
 			continue
 		}
 
@@ -140,12 +252,27 @@ func ParseDiffHunks(diff string) []DiffHunk {
 				}
 			}
 			hunkEnd = currentNewLine
+			// Accumulate raw line (capped).
+			if len(rawLinesBuf) < maxRawLines {
+				rawLinesBuf = append(rawLinesBuf, line)
+			}
+			// Detect module-level global variable assignment in added lines.
+			// Only detect on the first variable found; skip if already inside a function.
+			if currentGlobalVar == "" && hunkFuncCtx == "" {
+				if m := globalVarDefRE.FindStringSubmatch(line); len(m) > 1 {
+					currentGlobalVar = m[1]
+				}
+			}
 			continue
 		}
 
 		// Removed line: does not advance new-file line counter
 		// but breaks a contiguous + block
 		if strings.HasPrefix(line, "-") {
+			// Accumulate removed lines in raw buf too (for context).
+			if inChange && len(rawLinesBuf) < maxRawLines {
+				rawLinesBuf = append(rawLinesBuf, line)
+			}
 			// Don't flush — interleaved -/+ lines are part of the same logical change
 			continue
 		}
@@ -306,7 +433,8 @@ func parseDiff(diff string) []ChangedFunction {
 			currentHunkFuncCtx = parseHunkFuncContext(line)
 			hunkFuncEmitted = false
 			currentContextMethod = ""
-			hunkCtxIsClass = isClassOnlyContext(currentHunkFuncCtx)
+			rawCtx := parseHunkRawContext(line)
+			hunkCtxIsClass = isClassOnlyContext(rawCtx)
 			continue
 		}
 
@@ -432,6 +560,17 @@ func parseHunkFuncContext(line string) string {
 		return ""
 	}
 	return extractBareFunc(ctx)
+}
+
+// parseHunkRawContext returns the raw (unprocessed) context string after the
+// closing @@ delimiter, without stripping language decorators. Used for class
+// detection which requires the full "class Foo(Bar):" syntax to be intact.
+func parseHunkRawContext(line string) string {
+	m := hunkFuncContextRE.FindStringSubmatch(line)
+	if m == nil {
+		return ""
+	}
+	return strings.TrimSpace(m[1])
 }
 
 // extractBareFunc strips language-specific prefixes/decorators and returns

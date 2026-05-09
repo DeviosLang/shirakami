@@ -13,6 +13,8 @@
 - 输出格式：终端树状图 / JSON / Markdown
 - **Golden Test 基准框架**：人工标注的 expected.json 覆盖 Go/Python 多种场景，CI 门禁自动校验
 - **Ghost Node Rescue**：LLM 产生幻觉文件路径时，自动用 ripgrep 按函数名变体回搜真实位置，完成节点恢复；彻底找不到时才降级为 `warnings[]` 字段提示调用方
+- **跨仓调用长期记忆**：LLM 分析发现的跨仓调用边写入 `module_relationships` 表，高置信度关系（≥0.7）自动注入后续 Worker prompt，分析越多越精准
+- **多态/继承追踪**：自动检测被修改方法的子类 override，通过 `lsp_call_hierarchy findImplementations` 发现接口全部实现；diff 上下文注入 Worker，LLM 直接理解变更内容
 
 ## 系统要求
 
@@ -56,6 +58,8 @@ goose -dir migrations postgres "postgres://shirakami:shirakami@localhost:5432/sh
 | `002_symbol_graph.sql` | symbol_nodes / symbol_edges 符号图表 |
 | `003_contracts.sql` | contracts / contract_links 跨仓库合约表 |
 | `004_add_result_columns.sql` | analysis_tasks 加 modes/source_repo/queue_position；analysis_results 加 ut_suggestions/function_analyses/impact_summary 等列 |
+| `005_add_error_message.sql` | analysis_tasks / analysis_results 加 error_message 列，记录任务失败原因 |
+| `006_module_relationships.sql` | module_relationships 跨仓库调用关系表，存储 LLM 分析发现的调用边（confidence / seen_count 累加），用于后续分析的先验知识注入 |
 
 ### 4. 配置文件
 
@@ -149,6 +153,8 @@ scope:
 | 仓库重大重构 / 符号数量异常 | `index rebuild --repo <name>`（全量重建） |
 | CI 流水线 / 定期任务 | `index update`（全量增量扫描） |
 
+**夜间自动索引（shirakami-server）：** HTTP Server 在每天 **04:00 CST** 自动执行全量增量索引重建，确保次日分析使用最新符号图。无需额外配置，Server 启动后自动生效。
+
 **语言支持：** Go 仓库（有 `go.mod`）通过 `go/ast` + `go/types` 构建精确调用边，覆盖率 ≥ 90%。  
 Python 仓库（有 `requirements.txt` / `setup.py` / `pyproject.toml`）通过 pyright 索引，自动降级至 Layer C 兜底。
 
@@ -195,6 +201,16 @@ changes:
     diff: ./diffs/order.patch
     desc: 更新订单状态接口
 
+# 符号索引模式（控制 Layer B 在函数名提取中的作用方式）
+# 可选值：
+#   "off"           — 纯 LLM 路径，不使用索引（默认，适合首次部署/索引尚未建立时）
+#   "shadow"        — 并行查询索引但不影响结果，仅记录日志，用于评估索引质量
+#   "hybrid"        — 索引优先 + LLM fallback（推荐；索引覆盖时更快更准确）
+#   "deterministic" — 完全依赖索引，LLM 仅用于索引未覆盖的部分
+# 前提：需先通过 `shirakami workspace sync --index` 或夜间定时任务建立索引。
+# 环境变量覆盖：SHIRAKAMI_INDEX_MODE
+index_mode: hybrid
+
 # HTTP API Server 配置（shirakami-server 专用）
 server:
   addr: ":8080"                  # 监听地址
@@ -226,6 +242,7 @@ server:
 | `SHIRAKAMI_METRICS_PUSHGATEWAY_URL` | Prometheus Pushgateway 地址（可选，用于短生命周期任务指标推送） | `metrics.pushgateway_url` |
 | `SHIRAKAMI_METRICS_PUSH_INTERVAL` | 指标推送间隔（秒，默认 `15`） | `metrics.push_interval_seconds` |
 | `SHIRAKAMI_METRICS_JOB_NAME` | Pushgateway job 名称（默认 `shirakami`） | `metrics.job_name` |
+| `SHIRAKAMI_INDEX_MODE` | 符号索引模式（`off` / `shadow` / `hybrid` / `deterministic`，默认 `off`） | `index_mode` |
 
 环境变量优先级高于配置文件。
 
@@ -690,6 +707,10 @@ GET /healthz    # 健康检查，返回 200 ok
   ┌─────────────────────────────────┐
   │  DiffToSymbols（Layer A）        │
   │  ParseDiffHunks → 精确行号定位   │
+  │  @@ 无函数名时磁盘向上扫描兜底    │
+  │  diff 片段注入 → LLM 理解变更内容 │
+  │  FILE_CHANGED_VAR sentinel       │
+  │  ClassName/ParentClass 上下文捕获 │
   │  纯文本解析，零 LLM 调用          │
   └──────────────┬──────────────────┘
                  │ changed_functions
@@ -718,6 +739,9 @@ GET /healthz    # 健康检查，返回 200 ok
   │                                                         │
   │  Memory:                                                │
   │    Layer1: PostgreSQL 长期知识库                         │
+  │      - 符号语义摘要（symbol summaries，按 commit_hash 隔离）│
+  │      - 跨仓调用关系（module_relationships，confidence 累加）│
+  │      - 高置信度（≥0.7）关系自动注入下次 Worker prompt      │
   │    Layer2: Redis 任务状态 + 断点恢复                      │
   │    Layer3: System Prompt 动态注入                        │
   │                                                         │
@@ -837,7 +861,7 @@ Token 方式：将 URL 中的 `git@github.com:org/repo.git` 改为 `https://TOKE
 
 Layer B 对 Go 仓库有效（通过 `go/ast` + `go/types` 构建精确调用边，覆盖率 ≥ 90%），Python 仓库自动降级到 Layer C（LLM）。
 
-Layer B 生效的前提是**已对目标仓库建立索引**。若索引未建立或已过时（`index check` 显示 STALE），分析时自动降级到 Layer C，不影响结果正确性，但 LLM 消耗增加。
+Layer B 生效的前提是**已对目标仓库建立索引**，且配置文件中 `index_mode` 不为 `off`（推荐设置为 `hybrid`）。若索引未建立或已过时（`index check` 显示 STALE），分析时自动降级到 Layer C，不影响结果正确性，但 LLM 消耗增加。
 
 更新方式见「[构建并更新符号图索引](#6-构建并更新符号图索引layer-b)」章节。`go-cache-invalidation` 私有 case 用于测试 Layer B 自身，不对外提交。
 

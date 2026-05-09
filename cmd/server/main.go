@@ -29,6 +29,7 @@ import (
 	"github.com/DeviosLang/shirakami/internal/checkpoint"
 	"github.com/DeviosLang/shirakami/internal/config"
 	"github.com/DeviosLang/shirakami/internal/feedback"
+	"github.com/DeviosLang/shirakami/internal/index"
 	"github.com/DeviosLang/shirakami/internal/llm"
 	"github.com/DeviosLang/shirakami/internal/logger"
 	"github.com/DeviosLang/shirakami/internal/memory"
@@ -176,6 +177,12 @@ func runServer(cmd *cobra.Command, args []string) error {
 			workspace.CleanupWorktrees(cfg.Workspace.Dir, 2*time.Hour)
 		}
 	}()
+
+	// L4: nightly symbol index rebuild at 04:00 CST.
+	// Only runs when IndexMode is not "off" and a DB pool is available.
+	if cfg.IndexMode != "" && cfg.IndexMode != "off" && pool != nil {
+		go srv.scheduleNightlyIndex(ctx)
+	}
 
 	// Build webhook handler.
 	var commenter webhook.Commenter
@@ -1849,4 +1856,151 @@ func extractGhostWarnings(impactSummary string) []string {
 		))
 	}
 	return warns
+}
+
+// ---------------------------------------------------------------------------
+// Nightly index rebuild (改进 2)
+// ---------------------------------------------------------------------------
+
+// cstLocation is Asia/Shanghai (UTC+8), used for nightly index scheduling.
+var cstLocation = func() *time.Location {
+	loc, err := time.LoadLocation("Asia/Shanghai")
+	if err != nil {
+		// Fallback to a fixed +8 offset if the timezone database is unavailable.
+		loc = time.FixedZone("CST", 8*3600)
+	}
+	return loc
+}()
+
+// scheduleNightlyIndex waits until the next 04:00 CST then rebuilds the symbol
+// index for all configured repositories. It loops indefinitely — once per night.
+// The goroutine exits when ctx is cancelled.
+func (s *apiServer) scheduleNightlyIndex(ctx context.Context) {
+	log := logger.Must("production")
+	for {
+		next := nextRunAt(time.Now().In(cstLocation), 4, 0)
+		delay := time.Until(next)
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(delay):
+		}
+		// Fire.
+		log.Sugar().Infow("nightly_index_start", "scheduled_for", next.Format(time.RFC3339))
+		s.runNightlyIndex(ctx)
+		log.Sugar().Infow("nightly_index_done")
+	}
+}
+
+// nextRunAt returns the next wall-clock time when hour:minute occurs in the
+// given location. If now is already past that time today, it returns tomorrow.
+func nextRunAt(now time.Time, hour, minute int) time.Time {
+	candidate := time.Date(now.Year(), now.Month(), now.Day(), hour, minute, 0, 0, now.Location())
+	if !candidate.After(now) {
+		candidate = candidate.Add(24 * time.Hour)
+	}
+	return candidate
+}
+
+// runNightlyIndex rebuilds the full symbol index for every configured repository.
+// Language is auto-detected: repositories that contain .go files use GoIndexer;
+// repositories that contain only .py files use PythonIndexer.
+// Each repo's index is rebuilt serially to avoid overloading the NFS workspace.
+func (s *apiServer) runNightlyIndex(ctx context.Context) {
+	log := logger.Must("production")
+	store := index.NewStore(s.pool)
+
+	for _, r := range s.cfg.Workspace.Repos {
+		if ctx.Err() != nil {
+			return
+		}
+
+		repoPath := filepath.Join(s.cfg.Workspace.Dir, r.Name)
+
+		// Determine current HEAD commit hash.
+		commitHash := ""
+		if out, err := exec.CommandContext(ctx, "git", "-C", repoPath, "rev-parse", "HEAD").Output(); err == nil {
+			commitHash = strings.TrimSpace(string(out))
+		}
+
+		// Detect language.
+		lang := detectRepoLanguage(repoPath)
+		if lang == "unknown" {
+			log.Sugar().Infow("nightly_index_skip", "repo", r.Name, "reason", "unknown language")
+			continue
+		}
+
+		start := time.Now()
+		log.Sugar().Infow("nightly_index_repo_start", "repo", r.Name, "lang", lang, "commit", commitHash)
+
+		var result *index.IndexResult
+		var err error
+
+		switch lang {
+		case "go":
+			result, err = index.NewGoIndexer(r.Name, repoPath, commitHash).Index()
+		case "python":
+			result, err = index.NewPythonIndexer(r.Name, repoPath, commitHash).Index()
+		}
+
+		if err != nil {
+			log.Sugar().Warnw("nightly_index_repo_error", "repo", r.Name, "err", err)
+			continue
+		}
+
+		// Atomically replace the existing index: delete then save.
+		if delErr := store.DeleteByRepo(ctx, r.Name); delErr != nil {
+			log.Sugar().Warnw("nightly_index_delete_error", "repo", r.Name, "err", delErr)
+			continue
+		}
+		if saveErr := store.SaveNodes(ctx, result.Nodes); saveErr != nil {
+			log.Sugar().Warnw("nightly_index_save_nodes_error", "repo", r.Name, "err", saveErr)
+			continue
+		}
+		if saveErr := store.SaveEdges(ctx, result.Edges); saveErr != nil {
+			log.Sugar().Warnw("nightly_index_save_edges_error", "repo", r.Name, "err", saveErr)
+			// Non-fatal: nodes are saved; edges are best-effort.
+		}
+
+		durationMs := int(time.Since(start).Milliseconds())
+		meta := index.IndexMetadata{
+			Repo:         r.Name,
+			CommitHash:   commitHash,
+			IndexedAt:    time.Now(),
+			TotalFiles:   result.Files,
+			TotalSymbols: len(result.Nodes),
+			TotalEdges:   len(result.Edges),
+			Language:     lang,
+			DurationMs:   durationMs,
+		}
+		if metaErr := store.SaveMetadata(ctx, meta); metaErr != nil {
+			log.Sugar().Warnw("nightly_index_meta_error", "repo", r.Name, "err", metaErr)
+		}
+
+		log.Sugar().Infow("nightly_index_repo_done",
+			"repo", r.Name,
+			"symbols", len(result.Nodes),
+			"edges", len(result.Edges),
+			"files", result.Files,
+			"duration_ms", durationMs,
+		)
+	}
+}
+
+// detectRepoLanguage returns "go", "python", or "unknown" by probing the repo
+// directory for characteristic file extensions. Go is checked first because
+// many repos contain both .go and .py (scripts, tools) but their primary
+// language is Go.
+func detectRepoLanguage(repoPath string) string {
+	// Check for go.mod as the canonical Go indicator.
+	if _, err := os.Stat(filepath.Join(repoPath, "go.mod")); err == nil {
+		return "go"
+	}
+	// Check for setup.py / pyproject.toml / requirements.txt as Python indicators.
+	for _, marker := range []string{"setup.py", "pyproject.toml", "requirements.txt"} {
+		if _, err := os.Stat(filepath.Join(repoPath, marker)); err == nil {
+			return "python"
+		}
+	}
+	return "unknown"
 }

@@ -61,6 +61,10 @@ type WorkerTask struct {
 	// prompt includes "(around line N)" hints so the LLM can distinguish between
 	// multiple same-named functions in the same file.
 	LineHints map[string]int
+	// DiffSnippets maps "file::funcname" → the actual +/- lines from the hunk (改进 4).
+	// Injected into the Worker prompt so the LLM understands WHAT changed, not just
+	// WHERE. Limited to 40 lines per function to keep token cost bounded.
+	DiffSnippets map[string][]string
 	// NewFunctions lists function names that are brand-new additions in the diff
 	// (ChangeType == "added" from ParseDiffFunctions). These functions do not exist
 	// in the master workspace but ARE present in a feature-branch worktree.
@@ -360,10 +364,23 @@ func (w *WorkerAgent) Analyse(ctx context.Context, task WorkerTask) (*WorkerResu
 
 	// Resolve FILE_CHANGED sentinels: convert "FILE_CHANGED:repo/path/file.py" into
 	// a human-readable instruction for the Worker to search the file broadly.
+	// Also handle FILE_CHANGED_VAR sentinels (改进 5) which target a specific
+	// global variable usage site rather than the whole file.
 	resolvedFuncs := make([]string, 0, len(task.ChangedFunctions))
 	fileOnlyTasks := make([]string, 0)
+	varOnlyTasks := make([]string, 0) // "filePath:varName" pairs
 	for _, fn := range task.ChangedFunctions {
-		if strings.HasPrefix(fn, "FILE_CHANGED:") {
+		if strings.HasPrefix(fn, "FILE_CHANGED_VAR:") {
+			// Format: "FILE_CHANGED_VAR:repo/file.py:VAR_NAME"
+			rest := strings.TrimPrefix(fn, "FILE_CHANGED_VAR:")
+			// Split on last ":" to get filePath + varName
+			lastColon := strings.LastIndex(rest, ":")
+			if lastColon > 0 {
+				varOnlyTasks = append(varOnlyTasks, rest[:lastColon]+"\x00"+rest[lastColon+1:])
+			} else {
+				fileOnlyTasks = append(fileOnlyTasks, rest)
+			}
+		} else if strings.HasPrefix(fn, "FILE_CHANGED:") {
 			filePath := strings.TrimPrefix(fn, "FILE_CHANGED:")
 			fileOnlyTasks = append(fileOnlyTasks, filePath)
 		} else {
@@ -377,24 +394,46 @@ func (w *WorkerAgent) Analyse(ctx context.Context, task WorkerTask) (*WorkerResu
 		combinedFuncs = append(combinedFuncs,
 			fmt.Sprintf("[search all changed functions in file: %s]", fp))
 	}
+	// 改进 5: FILE_CHANGED_VAR — target a specific global variable usage site.
+	for _, pair := range varOnlyTasks {
+		parts := strings.SplitN(pair, "\x00", 2)
+		if len(parts) == 2 {
+			combinedFuncs = append(combinedFuncs,
+				fmt.Sprintf("[search all callers of global variable %s in file: %s]", parts[1], parts[0]))
+		}
+	}
 	if len(combinedFuncs) == 0 {
 		combinedFuncs = task.ChangedFunctions
 	}
 
-	// Annotate function entries with line-number hints when available.
-	// This helps the LLM disambiguate same-named functions in the same file
-	// (e.g. multiple get_data() overloads). The hint format is:
-	//   "repo/file.py::funcname (changed around line 209)"
-	// The hint is purely informational — it does NOT change the canonical
-	// FILE::FUNCNAME key used for deduplication elsewhere.
+	// Annotate function entries with line-number hints and diff snippets when available.
+	// Line hints help the LLM disambiguate same-named functions in the same file.
+	// Diff snippets (改进 4) show WHAT changed so the LLM understands context without
+	// having to read the file. Format:
+	//   "repo/file.py::funcname (changed around line 209)\n  Diff:\n  +x = 1\n  -x = 0"
 	annotatedFuncs := make([]string, 0, len(combinedFuncs))
 	for _, fn := range combinedFuncs {
+		// Strip any pre-existing annotation before looking up hints
+		// (sentinels like "[search all...]" are passed through unchanged).
+		lookupKey := fn
+		if idx := strings.Index(fn, " (changed around line"); idx > 0 {
+			lookupKey = fn[:idx]
+		}
+
+		annotated := fn
 		if task.LineHints != nil {
-			if lineNum, ok := task.LineHints[fn]; ok && lineNum > 0 {
-				fn = fmt.Sprintf("%s (changed around line %d)", fn, lineNum)
+			if lineNum, ok := task.LineHints[lookupKey]; ok && lineNum > 0 {
+				annotated = fmt.Sprintf("%s (changed around line %d)", fn, lineNum)
 			}
 		}
-		annotatedFuncs = append(annotatedFuncs, fn)
+		// Append diff snippet if available (改进 4).
+		if task.DiffSnippets != nil {
+			if lines, ok := task.DiffSnippets[lookupKey]; ok && len(lines) > 0 {
+				snippet := strings.Join(lines, "\n  ")
+				annotated = annotated + "\n  Diff:\n  " + snippet
+			}
+		}
+		annotatedFuncs = append(annotatedFuncs, annotated)
 	}
 
 	// Build contract hints section (from shirakami.yaml contracts declarations).
@@ -438,64 +477,59 @@ func (w *WorkerAgent) Analyse(ctx context.Context, task WorkerTask) (*WorkerResu
 			"%s"+
 			"%s"+
 			"ENTRY-ROLE REPOSITORIES (stop tracing when you reach these): %s\n\n"+
-			"MANDATORY INSTRUCTIONS:\n\n"+
-			"## STEP 1 — Trace call chains (upward)\n"+
-			"For EACH changed function:\n"+
-			"  - If the entry says '[search all changed functions in file: X]', use ripgrep to\n"+
-			"    find all function definitions in that file, then trace each one upward.\n"+
-			"  a. Determine the best search pattern:\n"+
-			"     - If function name is generic (handler/run/execute/main/process/start),\n"+
-			"       search the MODULE name instead\n"+
-			"       e.g. 'compute.procedure.get_cbs_ciphertext.handler' → search 'get_cbs_ciphertext'\n"+
-			"     - Otherwise use the function name directly\n"+
-			"  b. ripgrep({\"pattern\": \"<search_pattern>\", \"repo\": \"%s\"}) — MUST search actual code\n"+
-			"  c. For each result path:\n"+
-			"     - Starts with \"%s/\" → same repo, trace caller upward\n"+
-			"     - Starts with another repo name → CROSS-REPO: record in BOTH cross_repo_calls AND search_results\n"+
-			"     - Repo is in entry-role list → stop, record as entry_point with endpoint info\n"+
-			"  d. No results in this repo → ripgrep WITHOUT repo param (global search)\n"+
-			"  e. Callers > 20 → wide_impact=true, stop\n"+
-			"  f. Record ALL ripgrep result file paths in search_results[] — Go uses these as fallback\n\n"+
-			"## STEP 1b — Probe entry-role repos (MANDATORY after STEP 1)\n"+
-			"For EACH entry-role repo in the list above that you have NOT yet found a caller in:\n"+
-			"  - Search for the SOURCE REPOSITORY name (%s) in that entry-role repo:\n"+
-			"    ripgrep({\"pattern\": \"%s\", \"repo\": \"<entry_role_repo>\"})\n"+
-			"  - Also search for the module path or package name of each CHANGED FUNCTION\n"+
-			"    (e.g. 'compute.procedure.book_resource', 'host_network_info', etc.) in that repo.\n"+
-			"  - If you find any callers, record them as cross_repo_calls AND entry_points.\n"+
-			"  - If STILL no results: search for 'dispatch' or 'handler' patterns in that repo that\n"+
-			"    reference compute operations (e.g. 'compute', 'vstation', 'host_info').\n"+
-			"This step ensures entry-role repos are not missed when direct ripgrep doesn't find them.\n\n"+
-			"## CRITICAL RULES FOR cross_repo_calls:\n"+
-			"You MUST only record cross_repo_calls that you PERSONALLY verified via ripgrep.\n"+
-			"For each entry:\n"+
-			"  - to_repo: the repo name (first segment) of the file path you saw in ripgrep results\n"+
-			"  - caller_function: the EXACT function name that appears in caller_file at caller_line,\n"+
-			"    as shown by the ripgrep result line. Do NOT GUESS or INVENT function names.\n"+
-			"    If you cannot determine the caller function from the search result, leave caller_function\n"+
-			"    EMPTY — the system will fall back to file-based search.\n"+
-			"  - caller_file: the verbatim file path from ripgrep\n"+
-			"  - caller_line: the verbatim line number from ripgrep\n"+
-			"  - target_function: the function IN THE CURRENT REPO (%s) that is being called.\n"+
-			"DO NOT record cross_repo_calls for repos you did not see in ripgrep results (no guessing about\n"+
-			"aurora, vstation_nano, or other hypothetical repos). If a repo is only mentioned in comments or\n"+
-			"documentation, do NOT record it.\n\n"+
-			"## CRITICAL RULES FOR nodes[] and entry_points[]:\n"+
-			"The \"file\" field MUST be a verbatim path you actually saw in a ripgrep result.\n"+
-			"NEVER guess or invent file paths based on function-name conventions\n"+
-			"(e.g. do NOT write \"api/ResetInstanceNetType.py\" just because the function is named that).\n"+
-			"If you did not see a file path in ripgrep output, leave \"file\": \"\" and \"line\": 0.\n\n"+
-			"## WHEN ripgrep returns 0 results — mandatory fallback sequence (DO NOT skip):\n"+
-			"Before recording any node with a guessed file path, exhaust ALL steps below:\n"+
-			"  1. Naming-style conversion: try both CamelCase and snake_case variants.\n"+
-			"     e.g. \"ResetInstanceNetType\" → also try \"reset_instance_net_type\", \"reset_net_type\"\n"+
-			"  2. Partial keyword search: extract the most distinctive 1-2 words from the function name.\n"+
-			"     e.g. \"ResetInstanceNetType\" → try \"NetType\", \"reset_net\", \"ResetNet\"\n"+
-			"  3. Remove the repo restriction — search ALL repos:\n"+
-			"     ripgrep({\"pattern\": \"<keyword>\"})  ← no \"repo\" param\n"+
-			"  4. Only if ALL steps above return 0 results: record the node with \"file\": \"\", \"line\": 0.\n"+
-			"     DO NOT invent a path. The system will handle the gap.\n\n"+
-			"## STEP 2 — Output single JSON block (NO file_reader calls needed)\n"+
+			"## Your Goal\n\n"+
+			"Trace the complete call chain for every CHANGED FUNCTION above.\n"+
+			"Find all entry points in entry-role repositories (HTTP handlers / gRPC endpoints)\n"+
+			"that can ultimately reach the changed code.\n\n"+
+			"If an entry says '[search all changed functions in file: X]', first use ripgrep to\n"+
+			"discover all function definitions in that file, then trace each one.\n\n"+
+			"## Tools Available\n\n"+
+			"- ripgrep: search actual source code for callers\n"+
+			"- file_reader: read file contents to understand context (use when ripgrep results are ambiguous)\n"+
+			"- lsp_call_hierarchy: precise call hierarchy queries — incomingCalls, outgoingCalls, findImplementations\n\n"+
+			"## Search Constraints (MUST follow)\n\n"+
+			"- Every ripgrep call MUST be executed; never infer callers from memory.\n"+
+			"- If a function name is generic (handler/run/execute/main/process/start),\n"+
+			"  search the MODULE name instead.\n"+
+			"  e.g. 'compute.procedure.get_cbs_ciphertext.handler' → search 'get_cbs_ciphertext'\n"+
+			"- When ripgrep returns 0 results, exhaust this fallback sequence before giving up:\n"+
+			"    1. Naming-style conversion: try both CamelCase and snake_case variants.\n"+
+			"       e.g. 'ResetInstanceNetType' → also try 'reset_instance_net_type', 'reset_net_type'\n"+
+			"    2. Partial keyword search: extract the most distinctive 1-2 words.\n"+
+			"       e.g. 'ResetInstanceNetType' → try 'NetType', 'reset_net', 'ResetNet'\n"+
+			"    3. Remove the repo restriction — search ALL repos:\n"+
+			"       ripgrep({\"pattern\": \"<keyword>\"})  ← no \"repo\" param\n"+
+			"    4. Only after ALL steps above return 0 results: record the node with\n"+
+			"       \"file\": \"\", \"line\": 0. DO NOT invent a path.\n"+
+			"- Callers > 20 → set wide_impact=true and stop expanding that function.\n"+
+			"- Record ALL ripgrep result file paths in search_results[].\n\n"+
+			"## Cross-Repository Constraints\n\n"+
+			"- When a ripgrep result path starts with a DIFFERENT repo name, record a cross_repo_calls entry.\n"+
+			"- When a ripgrep result is in an entry-role repo, stop tracing and record as entry_point.\n"+
+			"- For entry-role repos not yet reached via direct search, probe them:\n"+
+			"  search for '%s' (the source repo name) or the changed function's module/package name\n"+
+			"  inside each entry-role repo using ripgrep.\n"+
+			"  If still no results, try 'dispatch' or 'handler' patterns referencing the source domain.\n\n"+
+			"## Inheritance & Polymorphism\n\n"+
+			"- If a modified function belongs to a class, check for subclasses:\n"+
+			"  ripgrep({\"pattern\": \"class \\\\w+\\\\(ClassName\\\\)\", \"repo\": \"%s\"})\n"+
+			"- If a subclass overrides the same method, treat each override as an additional changed function\n"+
+			"  and trace it upward as well.\n"+
+			"- If callers reference the base-class type (polymorphic dispatch), all subclass implementations\n"+
+			"  may execute at runtime — record all of them.\n"+
+			"- For interface/abstract methods, use lsp_call_hierarchy with operation=\"findImplementations\"\n"+
+			"  to find all concrete implementations.\n\n"+
+			"## Output Integrity Rules\n\n"+
+			"- cross_repo_calls.to_repo: MUST be the first path segment seen in an actual ripgrep result;\n"+
+			"  never guess a repo name.\n"+
+			"- cross_repo_calls.caller_function: MUST be the real function name from the ripgrep result line;\n"+
+			"  if unclear, leave it empty — the system will fall back to file-based search.\n"+
+			"- cross_repo_calls.target_function: the function in THIS repo (%s) being called.\n"+
+			"- nodes[].file and entry_points[].file: MUST be verbatim paths from ripgrep results;\n"+
+			"  if not seen in output, leave \"file\": \"\" and \"line\": 0.\n"+
+			"- DO NOT record cross_repo_calls for repos seen only in comments or documentation.\n\n"+
+			"## Output Format\n\n"+
+			"When done, output a single JSON block and nothing else:\n"+
 			"```json\n"+
 			"{\n"+
 			"  \"repo\": \"%s\",\n"+
@@ -514,12 +548,10 @@ func (w *WorkerAgent) Analyse(ctx context.Context, task WorkerTask) (*WorkerResu
 		importContextSection,
 		newFunctionsSection,
 		entryRepoList,
-		task.RepoName,
-		task.RepoName,
-		task.RepoName, // STEP 1b: source repo name used as search pattern
-		task.RepoName, // STEP 1b: source repo name used as search pattern (2nd %s)
-		task.RepoName, // CRITICAL RULES: target_function repo name
-		task.RepoName, // STEP 2 JSON template: repo field
+		task.RepoName, // cross-repo probe: source repo name
+		task.RepoName, // inheritance: class search repo param
+		task.RepoName, // output integrity: target_function repo name
+		task.RepoName, // JSON template: repo field
 	)
 
 	taskID := "worker-" + task.RepoName

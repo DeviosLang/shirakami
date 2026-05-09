@@ -80,6 +80,17 @@ changes:
 # scope:
 #   only_cross_repos: [order-service, api-gateway]  # 只分析这些仓库的跨仓调用
 
+# 符号索引模式（改进 3）
+# 控制 Layer B（DB 符号索引）在函数名提取中的作用方式。
+# 可选值：
+#   "off"           — 纯 LLM 路径，不使用索引（默认值，适合首次部署/索引尚未建立时）
+#   "shadow"        — 并行查询索引但不影响结果，仅记录日志，用于评估索引质量
+#   "hybrid"        — 索引优先 + LLM fallback（推荐；索引覆盖时更快更准确）
+#   "deterministic" — 完全依赖索引，LLM 仅用于索引未覆盖的部分
+# 前提：需先通过夜间定时索引（改进 2）或 `shirakami workspace sync --index` 建立索引数据。
+# 环境变量覆盖：SHIRAKAMI_INDEX_MODE
+index_mode: hybrid
+
 # Prometheus Pushgateway 配置（可选）
 # 适合部署在内网、无法被 Prometheus 主动 scrape 时使用
 # 环境变量覆盖：

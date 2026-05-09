@@ -1,8 +1,11 @@
 package agent
 
 import (
+	"bufio"
 	"context"
 	"fmt"
+	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"sync"
@@ -162,6 +165,15 @@ type Orchestrator struct {
 	// Populated by extractChangedFunctions from Layer A+ hunk context and forwarded to
 	// Workers via WorkerTask.LineHints so the LLM can disambiguate same-named functions.
 	lineHints map[string]int
+	// diffSnippets maps "repo/file::funcname" → diff body lines (改进 4).
+	// Holds the actual +/- lines from ParseDiffHunks so the Worker prompt can show
+	// what changed, not just where. Forwarded via WorkerTask.DiffSnippets.
+	diffSnippets map[string][]string
+	// parentClassHints maps "repo/file::funcname" → parent class name (改进 6-P2).
+	// When a hunk context is "class Child(Parent):", this maps the child's qualified
+	// function key to "Parent" so the Orchestrator can inject inheritance hints into
+	// the Worker's ExtraPrompt for polymorphism-aware tracing.
+	parentClassHints map[string]string
 	// addedFuncSet holds the bare function names that are brand-new additions in the diff
 	// (ChangeType == "added" from tool.ParseDiffFunctions). Forwarded to Workers via
 	// WorkerTask.NewFunctions so they can inject a "NEWLY ADDED FUNCTIONS" prompt section
@@ -524,6 +536,12 @@ func (o *Orchestrator) Run(ctx context.Context, input AnalysisInput) (*AnalysisO
 			fromSearch := o.extractCrossRepoCallsFromSearch(repoName, result.SearchResults)
 			fromNodes := o.extractCrossRepoCallsFromNodes(repoName, result.Nodes)
 			crossCalls := mergeCrossRepoCalls(llmCalls, fromSearch, fromNodes)
+
+			// 改进 8: persist discovered cross-repo edges to module_relationships
+			// so future analyses of the same repos can skip redundant searches.
+			if o.layer1 != nil && len(llmCalls) > 0 {
+				o.saveRelationshipsAsync(repoName, llmCalls)
+			}
 			if len(crossCalls) > len(llmCalls) {
 				log.Infow("round.cross_repo_enriched",
 					"round", round,
@@ -744,17 +762,49 @@ func (o *Orchestrator) extractChangedFunctions(ctx context.Context, input Analys
 	// line number (new-file side) where the change starts. Forwarded to Workers
 	// so the LLM can disambiguate between multiple same-named functions in one file.
 	hunkLineHints := make(map[string]int)
+	// hunkDiffSnippets maps qualified key → raw +/- lines from the hunk (改进 4).
+	hunkDiffSnippets := make(map[string][]string)
+	// hunkParentClass maps qualified key → parent class name (改进 6-P2).
+	hunkParentClass := make(map[string]string)
 	{
 		seenCtx := make(map[string]bool)
 		for _, h := range hunks {
-			if h.FuncContext == "" {
-				continue
-			}
 			filePath := h.File
 			if input.SourceRepo != "" && !strings.HasPrefix(filePath, input.SourceRepo+"/") {
 				filePath = input.SourceRepo + "/" + filePath
 			}
-			qualified := filePath + "::" + h.FuncContext
+
+			funcCtx := h.FuncContext
+			// 改进 1: Layer A+ disk fallback — when git did NOT provide a function name
+			// in the @@ hunk header, scan the actual disk file upward from the changed
+			// line to find the enclosing function definition.
+			if funcCtx == "" && o.workspaceDir != "" {
+				funcCtx = o.resolveFuncNameFromDisk(filePath, h.StartLine)
+				if funcCtx != "" {
+					log.Debugw("extract.layerA+.diskFallback",
+						"file", filePath,
+						"line", h.StartLine,
+						"resolved", funcCtx,
+					)
+				}
+			}
+
+			if funcCtx == "" {
+				// 改进 5: emit FILE_CHANGED_VAR sentinel when a global variable was
+				// changed but no enclosing function was found. This lets the Worker
+				// search specifically for usage sites of the variable rather than
+				// doing a broad file scan.
+				if h.GlobalVar != "" {
+					sentinel := "FILE_CHANGED_VAR:" + filePath + ":" + h.GlobalVar
+					if !seenCtx[sentinel] {
+						seenCtx[sentinel] = true
+						hunkContextFunctions = append(hunkContextFunctions, sentinel)
+					}
+				}
+				continue
+			}
+
+			qualified := filePath + "::" + funcCtx
 			if !seenCtx[qualified] {
 				seenCtx[qualified] = true
 				hunkContextFunctions = append(hunkContextFunctions, qualified)
@@ -764,10 +814,35 @@ func (o *Orchestrator) extractChangedFunctions(ctx context.Context, input Analys
 			if existing, ok := hunkLineHints[qualified]; !ok || h.StartLine < existing {
 				hunkLineHints[qualified] = h.StartLine
 			}
+			// 改进 4: accumulate diff snippet lines (first hunk wins for brevity).
+			if _, already := hunkDiffSnippets[qualified]; !already && len(h.RawLines) > 0 {
+				hunkDiffSnippets[qualified] = h.RawLines
+			}
+			// 改进 6-P2: record parent class when the hunk context is a class definition.
+			if h.ParentClass != "" {
+				if _, already := hunkParentClass[qualified]; !already {
+					hunkParentClass[qualified] = h.ParentClass
+				}
+			}
 		}
-		log.Debugw("extract.layerA+", "hunk_context_funcs", len(hunkContextFunctions))
+		log.Debugw("extract.layerA+",
+			"hunk_context_funcs", len(hunkContextFunctions),
+			"disk_fallbacks", func() int {
+				n := 0
+				for _, fn := range hunkContextFunctions {
+					if !strings.HasPrefix(fn, "FILE_CHANGED") {
+						if _, ok := hunkLineHints[fn]; ok {
+							n++
+						}
+					}
+				}
+				return n
+			}(),
+		)
 		// Store hints on the Orchestrator so runWorkerBatch can forward them to Workers.
 		o.lineHints = hunkLineHints
+		o.diffSnippets = hunkDiffSnippets
+		o.parentClassHints = hunkParentClass
 	}
 
 	// -----------------------------------------------------------------------
@@ -918,6 +993,39 @@ Rules:
 
 // filterDiffToFiles returns the lines of diff that pertain to any of the given file paths.
 // Used to send only uncovered sections to the LLM, reducing token cost.
+// resolveFuncNameFromDisk opens the source file on disk and scans backward from
+// startLine to find the nearest enclosing function definition.
+// filePath is a qualified path with repo prefix (e.g. "myrepo/pkg/foo.py").
+// Returns the function name, or "" if the file cannot be read or no definition found.
+//
+// This is the Layer A+ disk fallback (改进 1): used when git did NOT embed a function
+// name in the @@ hunk header (e.g. a repo without .gitattributes, or a file type
+// git doesn't recognise). Scans up to 100 lines backward from the changed line.
+func (o *Orchestrator) resolveFuncNameFromDisk(filePath string, startLine int) string {
+	if o.workspaceDir == "" || filePath == "" || startLine <= 0 {
+		return ""
+	}
+	// filePath already has "repoName/..." prefix — join with workspace root directly.
+	absPath := filepath.Join(o.workspaceDir, filePath)
+	f, err := os.Open(absPath)
+	if err != nil {
+		return ""
+	}
+	defer f.Close()
+
+	// Read all lines (file content is needed for backward scan).
+	var lines []string
+	sc := bufio.NewScanner(f)
+	for sc.Scan() {
+		lines = append(lines, sc.Text())
+	}
+	if len(lines) == 0 {
+		return ""
+	}
+	const maxScan = 100
+	return tool.ResolveFuncAtLine(lines, startLine, maxScan)
+}
+
 func filterDiffToFiles(diff string, files map[string]bool) string {
 	if len(files) == 0 {
 		return diff
@@ -1112,17 +1220,50 @@ func (o *Orchestrator) runWorkerBatch(ctx context.Context, pending map[string][]
 				for fn := range o.addedFuncSet {
 					newFuncs = append(newFuncs, fn)
 				}
+				// Build ExtraPrompt: combine global extra prompt with any parent-class hints
+				// for functions being traced in this worker (改进 6-P2).
+				extraPromptForWorker := o.extraPrompt
+				var parentHints []string
+				for _, fn := range j.funcs {
+					// Strip FILE_CHANGED* sentinels — they have no parent class hint.
+					if strings.HasPrefix(fn, "FILE_CHANGED") {
+						continue
+					}
+					// Strip "(changed around line N)" annotation before lookup.
+					lookupKey := fn
+					if idx := strings.Index(fn, " (changed around line"); idx > 0 {
+						lookupKey = fn[:idx]
+					}
+					if parent, ok := o.parentClassHints[lookupKey]; ok && parent != "" {
+						parentHints = append(parentHints, fmt.Sprintf(
+							"Function %s belongs to a class that inherits from %s — "+
+								"check whether sibling subclasses also override the same method "+
+								"and trace each override independently.",
+							lookupKey, parent,
+						))
+					}
+				}
+				if len(parentHints) > 0 {
+					joinedHints := strings.Join(parentHints, "\n")
+					if extraPromptForWorker != "" {
+						extraPromptForWorker = extraPromptForWorker + "\n\n" + joinedHints
+					} else {
+						extraPromptForWorker = joinedHints
+					}
+				}
+
 				res, err := worker.Analyse(ctx, WorkerTask{
 					RepoName:         j.repo,
 					RepoPath:         repoPath,
 					WorkspaceDir:     o.workspaceDir,
 					ChangedFunctions: j.funcs,
 					Priority:         j.priority,
-					ContractHints:    o.contractHints,
+					ContractHints:    o.contractHintsForRepo(ctx, j.repo),
 					ImportContext:    o.importContext,
 					Modes:            o.modes,
-					ExtraPrompt:      o.extraPrompt,
+					ExtraPrompt:      extraPromptForWorker,
 					LineHints:        o.lineHints,
+					DiffSnippets:     o.diffSnippets,
 					NewFunctions:     newFuncs,
 				})
 				if o.metrics != nil {
@@ -2466,4 +2607,38 @@ func (o *Orchestrator) writeBackToLayer1(result *WorkerResult, commitHash string
 		)
 		o.layer1.SaveSymbolSummaryAsync(result.RepoName, ep.Function, ep.File, ep.Line, summary, commitHash)
 	}
+}
+
+// saveRelationshipsAsync persists LLM-discovered cross-repo call edges to the
+// module_relationships table asynchronously. Only processes LLM-primary calls
+// (not synthesized from search/nodes) to avoid amplifying false positives.
+func (o *Orchestrator) saveRelationshipsAsync(fromRepo string, calls []CrossRepoCall) {
+	for _, cross := range calls {
+		if cross.TargetRepo == "" || cross.TargetFunction == "" {
+			continue
+		}
+		callerFunc := cross.CallerNode.Function
+		if callerFunc == "" {
+			continue
+		}
+		o.layer1.UpsertRelationshipAsync(fromRepo, callerFunc, cross.TargetRepo, cross.TargetFunction)
+	}
+}
+
+// contractHintsForRepo returns the static contract hints merged with up to 20
+// high-confidence (≥0.7) relationships discovered in previous analyses for repoName.
+// Falls back to static-only hints when layer1 is nil or the query fails.
+func (o *Orchestrator) contractHintsForRepo(ctx context.Context, repoName string) []string {
+	if o.layer1 == nil {
+		return o.contractHints
+	}
+	rels, err := o.layer1.GetHighConfidenceRelationships(ctx, repoName, 0.7, 20)
+	if err != nil || len(rels) == 0 {
+		return o.contractHints
+	}
+	dynamic := memory.FormatRelationshipHints(rels)
+	merged := make([]string, 0, len(o.contractHints)+len(dynamic))
+	merged = append(merged, o.contractHints...)
+	merged = append(merged, dynamic...)
+	return merged
 }

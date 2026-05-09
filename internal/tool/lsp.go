@@ -58,7 +58,8 @@ func (t *LSPTool) Description() string {
 	server := lspServerForLanguage(lang)
 	return fmt.Sprintf(
 		"Query call hierarchy via %s LSP (%s). "+
-			"Operations: incomingCalls (find callers), outgoingCalls (find callees). "+
+			"Operations: incomingCalls (find callers), outgoingCalls (find callees), "+
+			"findImplementations (find all concrete implementations of an abstract/interface method). "+
 			"Use 'repo' parameter to specify which repository to analyse.",
 		server, lang,
 	)
@@ -174,8 +175,8 @@ func (t *LSPTool) InputSchema() map[string]interface{} {
 		"properties": map[string]interface{}{
 			"operation": map[string]interface{}{
 				"type":        "string",
-				"enum":        []string{"incomingCalls", "outgoingCalls"},
-				"description": "incomingCalls: find callers of the function; outgoingCalls: find callees",
+				"enum":        []string{"incomingCalls", "outgoingCalls", "findImplementations"},
+				"description": "incomingCalls: find callers of the function; outgoingCalls: find callees; findImplementations: find all concrete implementations of an abstract/interface method",
 			},
 			"file_path": map[string]interface{}{
 				"type":        "string",
@@ -209,8 +210,8 @@ func (t *LSPTool) Execute(ctx context.Context, input json.RawMessage) (string, e
 	if inp.FilePath == "" {
 		return "", fmt.Errorf("lsp_call_hierarchy: file_path is required")
 	}
-	if inp.Operation != "incomingCalls" && inp.Operation != "outgoingCalls" {
-		return "", fmt.Errorf("lsp_call_hierarchy: operation must be incomingCalls or outgoingCalls")
+	if inp.Operation != "incomingCalls" && inp.Operation != "outgoingCalls" && inp.Operation != "findImplementations" {
+		return "", fmt.Errorf("lsp_call_hierarchy: operation must be incomingCalls, outgoingCalls, or findImplementations")
 	}
 
 	absFile, err := filepath.Abs(inp.FilePath)
@@ -225,6 +226,22 @@ func (t *LSPTool) Execute(ctx context.Context, input json.RawMessage) (string, e
 		return "", fmt.Errorf("lsp_call_hierarchy: failed to start gopls: %w", err)
 	}
 	t.mu.Unlock()
+
+	// findImplementations uses textDocument/implementation directly.
+	if inp.Operation == "findImplementations" {
+		implParams := map[string]interface{}{
+			"textDocument": map[string]interface{}{"uri": fileURI},
+			"position": map[string]interface{}{
+				"line":      inp.Line - 1,
+				"character": inp.Character - 1,
+			},
+		}
+		implResult, err := t.sendRequest(ctx, "textDocument/implementation", implParams)
+		if err != nil {
+			return "No implementations found.", nil
+		}
+		return formatLocations(implResult, t.repoName()), nil
+	}
 
 	// Step 1: textDocument/prepareCallHierarchy
 	prepareParams := map[string]interface{}{
@@ -745,6 +762,37 @@ func (m *lspManager) Close() {
 	for _, t := range tools {
 		t.Close()
 	}
+}
+
+// lspLocation represents a single LSP Location result (e.g. from textDocument/implementation).
+type lspLocation struct {
+	URI   string   `json:"uri"`
+	Range lspRange `json:"range"`
+}
+
+// formatLocations converts a raw textDocument/implementation response (Location[]) into
+// a JSON array of CallNode, using repo as the repo name for each result.
+func formatLocations(raw lspjson.RawMessage, repo string) string {
+	var locs []lspLocation
+	if err := lspjson.Unmarshal(raw, &locs); err != nil || len(locs) == 0 {
+		// Try single location
+		var loc lspLocation
+		if err2 := lspjson.Unmarshal(raw, &loc); err2 == nil && loc.URI != "" {
+			locs = []lspLocation{loc}
+		} else {
+			return "No implementations found."
+		}
+	}
+	var nodes []CallNode
+	for _, loc := range locs {
+		nodes = append(nodes, CallNode{
+			File: uriToPath(loc.URI),
+			Line: loc.Range.Start.Line + 1,
+			Repo: repo,
+		})
+	}
+	out, _ := lspjson.MarshalIndent(nodes, "", "  ")
+	return string(out)
 }
 
 // pathToURI converts an absolute file path to a file:// URI.
