@@ -696,6 +696,7 @@ func (s *apiServer) submitTask(w http.ResponseWriter, r *http.Request) {
 		for _, res := range results {
 			if res.err != nil {
 				var notFound *errBranchNotFound
+				var emptyDiff *errEmptyDiff
 				if errors.As(res.err, &notFound) {
 					// Branch doesn't exist on remote — skip this repo and warn.
 					// The task still runs for the remaining repos.
@@ -703,6 +704,15 @@ func (s *apiServer) submitTask(w http.ResponseWriter, r *http.Request) {
 					submitWarnings = append(submitWarnings, warnMsg)
 					logger.S().Warnw("fetchBranchDiff.branch_not_found_skipped",
 						"repo", res.repo, "branch", res.branch)
+					continue
+				}
+				if errors.As(res.err, &emptyDiff) {
+					// Branch exists but has no diff (already merged / squash-merged).
+					// Skip gracefully — the remaining repos still get analysed.
+					warnMsg := fmt.Sprintf("branch %q for repo %q has empty diff (already merged?) — skipped", res.branch, res.repo)
+					submitWarnings = append(submitWarnings, warnMsg)
+					logger.S().Warnw("fetchBranchDiff.empty_diff_skipped",
+						"repo", res.repo, "branch", res.branch, "detail", emptyDiff.Detail)
 					continue
 				}
 				errMsg := fmt.Sprintf("branch diff failed for %s@%s: %s", res.repo, res.branch, res.err.Error())
@@ -1559,6 +1569,25 @@ func (e *errBranchNotFound) Error() string {
 	return fmt.Sprintf("branch %q not found on remote for repo %q", e.Branch, e.Repo)
 }
 
+// errEmptyDiff is returned by fetchBranchDiff when the branch exists but
+// produces an empty diff against the base branch (already merged / squash-merged
+// / rebase-merged). Callers treat this the same as branch-not-found: skip the
+// repo with a warning and continue analysing the remaining repos.
+type errEmptyDiff struct {
+	Repo       string
+	Branch     string
+	BaseBranch string
+	Detail     string
+}
+
+func (e *errEmptyDiff) Error() string {
+	msg := fmt.Sprintf("branch %q has no diff against %s/%s (already merged or empty)", e.Branch, e.Repo, e.BaseBranch)
+	if e.Detail != "" {
+		msg += ": " + e.Detail
+	}
+	return msg
+}
+
 // ---------------------------------------------------------------------------
 // fetchBranchDiff fetches the remote branch and returns the unified diff
 // between the repo's base branch (master/main) and the feature branch.
@@ -1701,11 +1730,18 @@ func (s *apiServer) fetchBranchDiff(repoName, featureBranch string) (diff, baseB
 		if mergeErr == nil && recovered != "" {
 			return recovered, baseBranch, nil
 		}
-		hint := ""
+		detail := ""
 		if mergeErr != nil {
-			hint = fmt.Sprintf(" (merge-commit search: %v)", mergeErr)
+			detail = mergeErr.Error()
 		}
-		return "", baseBranch, fmt.Errorf("branch %q has no diff against %s/%s — branch may not exist or diff is empty%s", featureBranch, repoName, baseBranch, hint)
+		// Return errEmptyDiff so callers can skip this repo gracefully instead
+		// of aborting the whole multi-repo submission.
+		return "", baseBranch, &errEmptyDiff{
+			Repo:       repoName,
+			Branch:     featureBranch,
+			BaseBranch: baseBranch,
+			Detail:     detail,
+		}
 	}
 	return diffStr, baseBranch, nil
 }
