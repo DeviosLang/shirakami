@@ -297,6 +297,17 @@ func buildAnalyzeCmd() *cobra.Command {
 				// Trades coverage for speed — typically 2-3x faster, keeps direct
 				// and one-hop upstream coverage, skips deep transitive exploration.
 				orch.SetMaxRounds(3)
+			} else if cfg.MaxRounds > 0 {
+				// Apply max_rounds from config when --fast flag is not set.
+				orch.SetMaxRounds(cfg.MaxRounds)
+			}
+			// Apply P1 step budget from config (default 150 via config default).
+			if cfg.P1StepBudget > 0 {
+				orch.SetP1StepBudget(cfg.P1StepBudget)
+			}
+			// Apply P0 step budget from config (default 0 = no cap).
+			if cfg.P0StepBudget > 0 {
+				orch.SetP0StepBudget(cfg.P0StepBudget)
 			}
 
 			// Inject declared contract hints from config into Worker prompts.

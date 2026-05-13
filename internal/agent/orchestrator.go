@@ -19,6 +19,10 @@ import (
 	"github.com/DeviosLang/shirakami/internal/memory"
 	"github.com/DeviosLang/shirakami/internal/resolve"
 	"github.com/DeviosLang/shirakami/internal/tool"
+	itrace "github.com/DeviosLang/shirakami/internal/trace"
+
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
 )
 
 // AnalysisInput is the input to an Orchestrator run.
@@ -123,6 +127,15 @@ type Orchestrator struct {
 	// batchPriorities maps batchKey → priority metadata, populated by applyTriage.
 	// Used by runWorkerBatch to schedule and budget Workers.
 	batchPriorities map[string]BatchPriority
+	// p1StepBudget is the step budget for P1-priority Workers.
+	// 0 = use the global default (maxSteps = 300).
+	// Recommended production value: 150 (set via config.p1_step_budget).
+	p1StepBudget int
+	// p0StepBudget is the step budget for P0-priority Workers.
+	// 0 = no cap (maxSteps = 300). Recommended: 200 to prevent a single large-diff
+	// Worker from monopolising concurrency for 40+ minutes while still providing
+	// deep tracing for critical paths.
+	p0StepBudget int
 	// maxRounds caps the cross-repo hop count.
 	// 0 = default (10, deep mode); lower values (e.g. 3) enable fast mode.
 	maxRounds int
@@ -239,6 +252,41 @@ func (o *Orchestrator) SetMaxRounds(n int) {
 	o.maxRounds = n
 }
 
+// SetP1StepBudget sets the per-Worker step budget for P1-priority files.
+// 0 = use the global default (300 steps). Recommended: 150.
+// P0 Workers always use the full budget; P2 Workers are hard-capped at 50.
+func (o *Orchestrator) SetP1StepBudget(n int) {
+	o.p1StepBudget = n
+}
+
+// SetP0StepBudget sets the per-Worker step budget for P0-priority files.
+// 0 = no cap (legacy behavior, up to 300 steps).
+// Recommended: 200 to bound worst-case runtime on large diffs while keeping
+// enough headroom for deep critical-path tracing.
+func (o *Orchestrator) SetP0StepBudget(n int) {
+	o.p0StepBudget = n
+}
+
+// budgetForPriority returns the step budget to use for a Worker of the given
+// priority tier.  Returns 0 when no cap applies (i.e. the global maxSteps of
+// 300 is used by AgentLoop).  Extracted from runWorkerBatch so it can be unit
+// tested independently.
+func (o *Orchestrator) budgetForPriority(priority string) int {
+	switch priority {
+	case "P2":
+		return 50
+	case "P1":
+		if o.p1StepBudget > 0 {
+			return o.p1StepBudget
+		}
+	case "P0":
+		if o.p0StepBudget > 0 {
+			return o.p0StepBudget
+		}
+	}
+	return 0
+}
+
 // SetContractHints provides pre-declared cross-repo relationships from config.
 // Each hint is a formatted string like:
 //
@@ -311,6 +359,12 @@ func (o *Orchestrator) Run(ctx context.Context, input AnalysisInput) (*AnalysisO
 	log := logger.S()
 	runStart := time.Now()
 
+	// Start a root span for the entire orchestrator analysis pass.
+	ctx, span := itrace.Start(ctx, itrace.OpOrchestratorAnalyze,
+		attribute.String(itrace.AttrSourceRepo, input.SourceRepo),
+	)
+	defer span.End()
+
 	// Capture modes for this run so runWorkerBatch can pass them to Workers.
 	o.modes = input.Modes
 	o.extraPrompt = input.ExtraPrompt
@@ -324,6 +378,7 @@ func (o *Orchestrator) Run(ctx context.Context, input AnalysisInput) (*AnalysisO
 	if maxRounds < 10 {
 		mode = "fast"
 	}
+	span.SetAttributes(attribute.String(itrace.AttrMode, mode))
 
 	log.Infow("analyse.start",
 		"source_repo", input.SourceRepo,
@@ -340,8 +395,11 @@ func (o *Orchestrator) Run(ctx context.Context, input AnalysisInput) (*AnalysisO
 	if err != nil {
 		log.Errorw("extract.failed", "err", err.Error(),
 			"duration_ms", time.Since(step1).Milliseconds())
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
 		return nil, fmt.Errorf("extract changed functions: %w", err)
 	}
+	span.SetAttributes(attribute.Int(itrace.AttrFuncCount, len(changed)))
 	log.Infow("extract.done",
 		"fn_count", len(changed),
 		"duration_ms", time.Since(step1).Milliseconds(),
@@ -512,6 +570,20 @@ func (o *Orchestrator) Run(ctx context.Context, input AnalysisInput) (*AnalysisO
 				output.EntryPoints = append(output.EntryPoints, taggedEntries...)
 			}
 
+			// wide_impact rescue: when the LLM truncated caller expansion due to
+			// wide_impact, it may have missed same-repo entry points. Promote
+			// SearchResult entries belonging to entry-role repos into entry_points.
+			if len(result.WideImpactFunctions) > 0 {
+				rescued := o.rescueWideImpactEntryPoints(repoName, result)
+				if len(rescued) > 0 {
+					log.Infow("wide_impact.rescued",
+						"repo", repoName,
+						"rescued", len(rescued),
+					)
+					output.EntryPoints = append(output.EntryPoints, rescued...)
+				}
+			}
+
 			// Collect constraint and test scenario analyses.
 			output.FunctionAnalyses = append(output.FunctionAnalyses, result.FunctionAnalyses...)
 
@@ -619,6 +691,49 @@ func (o *Orchestrator) Run(ctx context.Context, input AnalysisInput) (*AnalysisO
 			totalCross += len(crossCalls)
 			totalEntries += len(result.EntryPoints)
 
+			// Fix A — thin-trace guard: when a Worker returns very few nodes and
+			// no cross-repo calls, it likely traced a dead-end inner function.
+			// Queue a FILE_CHANGED sentinel so the next round searches the whole
+			// file broadly, recovering call chains that the inner-function path missed.
+			// Condition: ≤2 nodes, 0 cross calls, and the traced function(s) look like
+			// inner closures (short generic names that are commonly nested helpers).
+			if len(result.Nodes) <= 2 && len(crossCalls) == 0 && len(result.EntryPoints) == 0 {
+				for _, fn := range pending[repoName] {
+					if looksLikeInnerFunc(fn) {
+						// Derive the file path from the qualified "file::func" string.
+						var fileSentinel string
+						if idx := strings.Index(fn, "::"); idx > 0 {
+							qualifiedFile := fn[:idx] // e.g. "cvm_api/framework/prototype/bone.py"
+							// Strip repo prefix so we get "framework/prototype/bone.py",
+							// then rebuild as repoName/file for the sentinel.
+							fileRel := qualifiedFile
+							if sep := strings.Index(qualifiedFile, "/"); sep > 0 {
+								prefix := qualifiedFile[:sep]
+								if prefix == repoName {
+									fileRel = qualifiedFile[sep+1:]
+								}
+							}
+							fileSentinel = "FILE_CHANGED:" + repoName + "/" + fileRel
+						} else {
+							// fn has no "::" — treat the whole string as a function name;
+							// we cannot derive a file path, so skip.
+							continue
+						}
+						key := repoName + ":" + fileSentinel
+						if !visited[key] {
+							visited[key] = true
+							nextPending[repoName] = append(nextPending[repoName], fileSentinel)
+							log.Infow("thin_trace.fallback",
+								"round", round,
+								"repo", repoName,
+								"original_func", fn,
+								"sentinel", fileSentinel,
+							)
+						}
+					}
+				}
+			}
+
 			log.Infow("round.merged",
 				"round", round,
 				"repo", repoName,
@@ -679,7 +794,9 @@ func (o *Orchestrator) Run(ctx context.Context, input AnalysisInput) (*AnalysisO
 		)
 	}
 
-	// Deduplicate entry points, then filter out non-HTTP process-main entries.
+	// Deduplicate call graph nodes, then deduplicate entry points and filter
+	// out non-HTTP process-main entries.
+	output.CallGraph = dedupeCallNodes(output.CallGraph)
 	output.EntryPoints = dedupeCallNodes(output.EntryPoints)
 	output.EntryPoints = filterSpuriousEntryPoints(output.EntryPoints)
 
@@ -775,31 +892,97 @@ func (o *Orchestrator) extractChangedFunctions(ctx context.Context, input Analys
 			}
 
 			funcCtx := h.FuncContext
+
+			// 改进 5 (优先级提前): 当 gitdiff.go 检测到模块级变量变更时，GlobalVar
+			// 已被设置且 FuncContext 已被清除（见 gitdiff.go globalVarDefRE 检测逻辑）。
+			// 此处直接发出 FILE_CHANGED_VAR sentinel，**跳过磁盘回退** — 因为磁盘回退
+			// 会向上扫描找到最近的 def，给出与 git @@ 上下文同样错误的归属。
+			if h.GlobalVar != "" {
+				sentinel := "FILE_CHANGED_VAR:" + filePath + ":" + h.GlobalVar
+				if !seenCtx[sentinel] {
+					seenCtx[sentinel] = true
+					hunkContextFunctions = append(hunkContextFunctions, sentinel)
+					log.Debugw("extract.layerA+.globalVar",
+						"file", filePath,
+						"var", h.GlobalVar,
+					)
+				}
+				continue
+			}
+
 			// 改进 1: Layer A+ disk fallback — when git did NOT provide a function name
 			// in the @@ hunk header, scan the actual disk file upward from the changed
 			// line to find the enclosing function definition.
+			// We use resolveFuncHierarchyFromDisk (instead of the old single-level scan)
+			// so that we always get the outermost (module-level) function even when
+			// the changed line sits inside a nested inner function.
 			if funcCtx == "" && o.workspaceDir != "" {
-				funcCtx = o.resolveFuncNameFromDisk(filePath, h.StartLine)
-				if funcCtx != "" {
+				hier := o.resolveFuncHierarchyFromDisk(filePath, h.StartLine)
+				if hier.Outer != "" {
+					funcCtx = hier.Outer
+					h.OuterFuncName = hier.Outer
 					log.Debugw("extract.layerA+.diskFallback",
 						"file", filePath,
 						"line", h.StartLine,
-						"resolved", funcCtx,
+						"inner", hier.Inner,
+						"outer", hier.Outer,
 					)
+				} else if hier.Inner != "" {
+					funcCtx = hier.Inner
+					log.Debugw("extract.layerA+.diskFallback.innerOnly",
+						"file", filePath,
+						"line", h.StartLine,
+						"inner", hier.Inner,
+					)
+				}
+				// else: both empty — changed line is at module scope (e.g. a
+				// module-level variable whose multi-line literal's closing brace
+				// was modified). Fall through to the FILE_CHANGED sentinel below.
+			}
+
+			// 改进 1b: When git @@ context provided a name, check whether that name
+			// belongs to a nested inner function (indentation > 0). If so, override
+			// funcCtx with the enclosing module-level function so the Orchestrator
+			// traces the right entry point instead of a dead-end inner closure.
+			if funcCtx != "" && o.workspaceDir != "" && h.OuterFuncName == "" {
+				hier := o.resolveFuncHierarchyFromDisk(filePath, h.StartLine)
+				if hier.Outer == "" && hier.Inner == "" {
+					// Disk scan found no enclosing function — the changed line is
+					// at module scope even though git @@ heuristic reported a function
+					// name (e.g. the nearest def above belongs to an adjacent function
+					// that already ended before the changed line). Clear funcCtx so we
+					// fall through to the FILE_CHANGED sentinel below.
+					log.Debugw("extract.layerA+.moduleScopeOverride",
+						"file", filePath,
+						"line", h.StartLine,
+						"cleared_func", funcCtx,
+					)
+					funcCtx = ""
+				} else if hier.Outer != "" && hier.Outer != funcCtx {
+					log.Debugw("extract.layerA+.outerOverride",
+						"file", filePath,
+						"line", h.StartLine,
+						"inner_git", funcCtx,
+						"outer_disk", hier.Outer,
+					)
+					funcCtx = hier.Outer
+					h.OuterFuncName = hier.Outer
 				}
 			}
 
 			if funcCtx == "" {
-				// 改进 5: emit FILE_CHANGED_VAR sentinel when a global variable was
-				// changed but no enclosing function was found. This lets the Worker
-				// search specifically for usage sites of the variable rather than
-				// doing a broad file scan.
-				if h.GlobalVar != "" {
-					sentinel := "FILE_CHANGED_VAR:" + filePath + ":" + h.GlobalVar
-					if !seenCtx[sentinel] {
-						seenCtx[sentinel] = true
-						hunkContextFunctions = append(hunkContextFunctions, sentinel)
-					}
+				// Module-scope change with no enclosing function detected.
+				// Emit a FILE_CHANGED sentinel so the Worker searches the whole
+				// file and can discover callers of the changed module-level symbol
+				// (e.g. white_set → schema_core_loop → all @schema.request handlers).
+				sentinel := "FILE_CHANGED:" + filePath
+				if !seenCtx[sentinel] {
+					seenCtx[sentinel] = true
+					hunkContextFunctions = append(hunkContextFunctions, sentinel)
+					log.Debugw("extract.layerA+.moduleScope.fileChanged",
+						"file", filePath,
+						"line", h.StartLine,
+					)
 				}
 				continue
 			}
@@ -1026,6 +1209,37 @@ func (o *Orchestrator) resolveFuncNameFromDisk(filePath string, startLine int) s
 	return tool.ResolveFuncAtLine(lines, startLine, maxScan)
 }
 
+// resolveFuncHierarchyFromDisk is the hierarchy-aware successor to
+// resolveFuncNameFromDisk. It reads the file at filePath from disk, then
+// calls tool.ResolveFuncHierarchy to return both the innermost and outermost
+// enclosing function definitions (by indentation level).
+//
+// Use this instead of resolveFuncNameFromDisk whenever you need to distinguish
+// a nested inner function from its enclosing module-level function — e.g. when
+// git's @@ hunk header only exposes an inner closure name.
+func (o *Orchestrator) resolveFuncHierarchyFromDisk(filePath string, startLine int) tool.FuncHierarchy {
+	if o.workspaceDir == "" || filePath == "" || startLine <= 0 {
+		return tool.FuncHierarchy{}
+	}
+	absPath := filepath.Join(o.workspaceDir, filePath)
+	f, err := os.Open(absPath)
+	if err != nil {
+		return tool.FuncHierarchy{}
+	}
+	defer f.Close()
+
+	var lines []string
+	sc := bufio.NewScanner(f)
+	for sc.Scan() {
+		lines = append(lines, sc.Text())
+	}
+	if len(lines) == 0 {
+		return tool.FuncHierarchy{}
+	}
+	const maxScan = 200
+	return tool.ResolveFuncHierarchy(lines, startLine, maxScan)
+}
+
 func filterDiffToFiles(diff string, files map[string]bool) string {
 	if len(files) == 0 {
 		return diff
@@ -1180,11 +1394,11 @@ func (o *Orchestrator) runWorkerBatch(ctx context.Context, pending map[string][]
 
 		for _, j := range jobs {
 			j := j
-			// Step budget: P2 gets tighter budget (50) to cap shallow scans.
-			budget := 0 // default (300)
-			if j.priority == "P2" {
-				budget = 50
-			}
+			// Step budget per priority tier (delegated to budgetForPriority):
+			//   P0 → o.p0StepBudget (default 0 = 300 steps) — critical paths
+			//   P1 → o.p1StepBudget (default 150) — supporting paths
+			//   P2 → 50 steps — shallow scan only
+			budget := o.budgetForPriority(j.priority)
 
 			wg.Add(1)
 			sem <- struct{}{}
@@ -1304,6 +1518,7 @@ func (o *Orchestrator) runWorkerBatch(ctx context.Context, pending map[string][]
 			existing.EntryPoints = append(existing.EntryPoints, res.EntryPoints...)
 			existing.FunctionAnalyses = append(existing.FunctionAnalyses, res.FunctionAnalyses...)
 			existing.EntryScenarios = append(existing.EntryScenarios, res.EntryScenarios...)
+			existing.UTAnalyses = append(existing.UTAnalyses, res.UTAnalyses...)
 			existing.SearchResults = append(existing.SearchResults, res.SearchResults...)
 			if res.ReachedEntry {
 				existing.ReachedEntry = true
@@ -1803,6 +2018,69 @@ func dedupeCallNodes(nodes []CallNode) []CallNode {
 		}
 	}
 	return out
+}
+
+// rescueWideImpactEntryPoints promotes SearchResult entries that belong to
+// entry-role repos (including the current repo itself) into entry points.
+//
+// When the LLM sets wide_impact=true for a function it found >20 callers and
+// stopped expanding. As a result, only a handful of callers were recorded as
+// entry_points, and the rest were silently dropped. The SearchResults still
+// contain all the raw ripgrep hits the LLM collected before it stopped — this
+// function lifts those into entry_points so they are not lost.
+//
+// Only SearchResult entries in entry-role repos are rescued; library / service
+// repo hits are ignored (they are not test entry points).
+func (o *Orchestrator) rescueWideImpactEntryPoints(currentRepo string, result *WorkerResult) []CallNode {
+	if len(result.WideImpactFunctions) == 0 || len(result.SearchResults) == 0 {
+		return nil
+	}
+
+	// Build the set of repos that are configured with role="entry".
+	entryRoleSet := make(map[string]bool)
+	for _, r := range o.repos {
+		if strings.EqualFold(r.Role, "entry") {
+			entryRoleSet[r.Name] = true
+		}
+	}
+	// The current (source) repo is always a candidate — when source_repo is itself
+	// an entry-role repo (e.g. cvm_api) its handlers are valid entry points.
+	entryRoleSet[currentRepo] = true
+
+	seen := make(map[string]bool)
+	var rescued []CallNode
+	for _, sr := range result.SearchResults {
+		if sr.File == "" {
+			continue
+		}
+		// Determine the repo that owns this file. SearchResult.File is either:
+		//   "<repo>/<path>" (multi-repo workspace), or just "<path>" (same repo).
+		repo := currentRepo
+		filePath := sr.File
+		if idx := strings.Index(sr.File, "/"); idx > 0 {
+			candidate := sr.File[:idx]
+			if o.repoExists(candidate) {
+				repo = candidate
+				filePath = sr.File[idx+1:]
+			}
+		}
+		if !entryRoleSet[repo] {
+			continue
+		}
+		key := repo + ":" + filePath + ":" + sr.Function
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		rescued = append(rescued, CallNode{
+			Repo:     repo,
+			File:     filePath,
+			Line:     sr.Line,
+			Function: sr.Function,
+			Source:   "wide_impact_rescue",
+		})
+	}
+	return rescued
 }
 
 // filterSpuriousEntryPoints removes entry points that are clearly process-level
@@ -2625,7 +2903,32 @@ func (o *Orchestrator) saveRelationshipsAsync(fromRepo string, calls []CrossRepo
 	}
 }
 
-// contractHintsForRepo returns the static contract hints merged with up to 20
+// looksLikeInnerFunc returns true when a qualified function string (e.g.
+// "cvm_api/framework/prototype/bone.py::worker") has a local name that commonly
+// belongs to a nested inner closure rather than a module-level definition.
+// Used by the thin-trace guard to decide whether to emit a FILE_CHANGED fallback.
+func looksLikeInnerFunc(qualifiedFunc string) bool {
+	// Extract the bare function name after the last "::"
+	name := qualifiedFunc
+	if idx := strings.LastIndex(qualifiedFunc, "::"); idx >= 0 {
+		name = qualifiedFunc[idx+2:]
+	}
+	// Strip any parameter list (unlikely in our qualified names, but safe).
+	if idx := strings.IndexByte(name, '('); idx >= 0 {
+		name = name[:idx]
+	}
+	name = strings.TrimSpace(name)
+
+	// Well-known inner-function names used as nested workers/callbacks.
+	// These are almost never module-level entry points.
+	switch name {
+	case "worker", "inner", "_", "handle", "callback", "run",
+		"task", "do_work", "do_request", "execute", "process",
+		"job", "handler", "wrapper", "wrapped", "_inner", "_run":
+		return true
+	}
+	return false
+}
 // high-confidence (≥0.7) relationships discovered in previous analyses for repoName.
 // Falls back to static-only hints when layer1 is nil or the query fails.
 func (o *Orchestrator) contractHintsForRepo(ctx context.Context, repoName string) []string {

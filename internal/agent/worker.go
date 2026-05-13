@@ -13,6 +13,10 @@ import (
 	"github.com/DeviosLang/shirakami/internal/checkpoint"
 	"github.com/DeviosLang/shirakami/internal/logger"
 	"github.com/DeviosLang/shirakami/internal/tool"
+	itrace "github.com/DeviosLang/shirakami/internal/trace"
+
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
 )
 
 // CallNode represents one function in a call chain.
@@ -97,6 +101,11 @@ type WorkerResult struct {
 	UTAnalyses []UTAnalysis
 	// SearchResults holds raw ripgrep hits for the fallback cross-repo extractor.
 	SearchResults []SearchResult
+	// WideImpactFunctions lists function names for which the LLM set wide_impact=true,
+	// meaning ripgrep found more callers than the expansion threshold and tracing was
+	// stopped early. Used by the Orchestrator to rescue same-repo entry points that
+	// were truncated.
+	WideImpactFunctions []string
 	// RawContent holds the full LLM text output for display / debugging.
 	RawContent string
 	// GhostFiles holds file paths that were referenced by the LLM output but
@@ -557,6 +566,15 @@ func (w *WorkerAgent) Analyse(ctx context.Context, task WorkerTask) (*WorkerResu
 	taskID := "worker-" + task.RepoName
 	log := logger.S()
 	workerStart := time.Now()
+
+	// Start a span for the entire per-repo analysis pass.
+	ctx, span := itrace.Start(ctx, itrace.OpWorkerAnalyze,
+		attribute.String(itrace.AttrRepo, task.RepoName),
+		attribute.Int(itrace.AttrFuncCount, len(task.ChangedFunctions)),
+		attribute.String(itrace.AttrTriageTier, task.Priority),
+	)
+	defer span.End()
+
 	log.Infow("worker.start",
 		"repo", task.RepoName,
 		"funcs", len(task.ChangedFunctions),
@@ -565,6 +583,8 @@ func (w *WorkerAgent) Analyse(ctx context.Context, task WorkerTask) (*WorkerResu
 
 	result, err := w.loop.Run(ctx, taskID, prompt)
 	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
 		log.Errorw("worker.trace_failed",
 			"repo", task.RepoName,
 			"err", err.Error(),
@@ -572,6 +592,9 @@ func (w *WorkerAgent) Analyse(ctx context.Context, task WorkerTask) (*WorkerResu
 		)
 		return nil, fmt.Errorf("worker %s: %w", task.RepoName, err)
 	}
+	span.SetAttributes(
+		attribute.Int(itrace.AttrStepCount, result.StepCount),
+	)
 	log.Infow("worker.trace_done",
 		"repo", task.RepoName,
 		"steps", result.StepCount,
@@ -590,7 +613,14 @@ func (w *WorkerAgent) Analyse(ctx context.Context, task WorkerTask) (*WorkerResu
 	// Skip follow-up if the primary content is tiny (<150 bytes) — that means
 	// the LLM produced essentially nothing (e.g. "no results found"), and a
 	// JSON-reformatting prompt would just loop without useful input.
-	if extractJSON(result.Content) == "" && len(strings.TrimSpace(result.Content)) >= 150 {
+	//
+	// Skip follow-up when the loop was truncated (hit maxSteps). The content is
+	// incomplete by definition; asking the LLM to reformat it produces a JSON
+	// block built from a partial analysis, which in turn yields zero entry points
+	// and causes the scenario-generation pass to be skipped entirely.
+	// parseWorkerOutput will extract whatever partial structure exists from the
+	// truncated content without risking a second wasted LLM call.
+	if !result.Truncated && extractJSON(result.Content) == "" && len(strings.TrimSpace(result.Content)) >= 150 {
 		log.Infow("worker.followup_json",
 			"repo", task.RepoName,
 			"reason", "no JSON block found in primary output",
@@ -612,6 +642,16 @@ func (w *WorkerAgent) Analyse(ctx context.Context, task WorkerTask) (*WorkerResu
 	// Parse the structured JSON output from the LLM.
 	workerResult := parseWorkerOutput(task.RepoName, result.Content)
 	workerResult.RawContent = result.Content
+
+	// Backfill File="" nodes: LLMs sometimes emit nodes/entry-points with a valid
+	// Function name but omit the File field entirely.  backfillEmptyFiles uses
+	// ripgrep (via the same toolSearchSymbol helper as filterGhostNodes) to locate
+	// the file on disk and fill it in before filterGhostNodes runs.
+	// This must run BEFORE filterGhostNodes so that rescued nodes are not
+	// incorrectly exempted by the fileExists("") == true short-circuit.
+	if task.RepoPath != "" {
+		backfillEmptyFiles(workerResult, task.RepoPath, task.WorkspaceDir)
+	}
 
 	// Filter hallucinated file paths: any node whose File field points to a path
 	// that does not exist on disk is almost certainly an LLM fabrication.
@@ -928,6 +968,7 @@ func workerModeEnabled(modes []string, mode string) bool {
 //  2. Find a bare JSON object in the output.
 //  3. Parse prose output heuristically (extract file paths, function names).
 func parseWorkerOutput(repoName, content string) *WorkerResult {
+	log := logger.S()
 	out := &WorkerResult{RepoName: repoName}
 
 	raw := extractJSON(content)
@@ -944,7 +985,17 @@ func parseWorkerOutput(repoName, content string) *WorkerResult {
 
 	var parsed llmWorkerOutput
 	if err := json.Unmarshal([]byte(raw), &parsed); err != nil {
-		out.Nodes = []CallNode{{Repo: repoName, Function: content}}
+		// JSON block was found but could not be parsed (e.g. trailing comma, unescaped
+		// newline inside a string value). Do NOT write the raw content as a Function —
+		// that would produce a node whose Function field is a multi-kilobyte blob.
+		// Instead, log and return an empty result so the caller can treat this Worker
+		// as producing no structured output, which is far less harmful than injecting
+		// garbage nodes into the call graph.
+		log.Warnw("worker.parse_json_failed",
+			"repo", repoName,
+			"err", err.Error(),
+			"raw_len", len(raw),
+		)
 		return out
 	}
 
@@ -1022,7 +1073,14 @@ func parseWorkerOutput(repoName, content string) *WorkerResult {
 				out.CrossRepoCalls = append(out.CrossRepoCalls, CrossRepoCall{
 					TargetRepo:     n.Repo,
 					TargetFunction: n.Function,
-					CallerNode:     CallNode{Repo: repoName, Function: cf.Name},
+					// CallerNode describes where in the current repo the call is made.
+					// Use n.File / n.Line — the LLM records the call site there, not on cf.
+					CallerNode: CallNode{
+						Repo:     repoName,
+						File:     n.File,
+						Line:     n.Line,
+						Function: cf.Name,
+					},
 				})
 			}
 		}
@@ -1091,6 +1149,16 @@ func parseWorkerOutput(repoName, content string) *WorkerResult {
 					Function: n.Function,
 				})
 			}
+		}
+	}
+
+	// Propagate wide_impact function names so the Orchestrator can rescue
+	// same-repo entry points that were truncated by the expansion threshold.
+	out.WideImpactFunctions = append(out.WideImpactFunctions, parsed.WideImpactFunctions...)
+	// Also collect per-function wide_impact flags from changed_functions.
+	for _, cf := range parsed.ChangedFunctions {
+		if cf.WideImpact && cf.Name != "" {
+			out.WideImpactFunctions = append(out.WideImpactFunctions, cf.Name)
 		}
 	}
 
@@ -1467,6 +1535,94 @@ func parseUTAnalyses(content string) []UTAnalysis {
 		out = append(out, ut)
 	}
 	return out
+}
+
+// backfillEmptyFiles fills in the File field for nodes and entry-points whose
+// File is empty ("") but whose Function name is non-empty.  The LLM sometimes
+// knows the function name but omits the file path, leaving File="".
+//
+// For each such node, backfillEmptyFiles runs a ripgrep search (using
+// namingVariants for robustness) across the repo directory.  When a match is
+// found, File and Line are updated in-place.  Nodes that still have File=""
+// after this pass are left as-is; filterGhostNodes will subsequently exempt
+// them via the fileExists("") == true short-circuit, so they are never dropped.
+//
+// This function must run BEFORE filterGhostNodes to avoid that short-circuit
+// masking File="" nodes that could otherwise be resolved.
+func backfillEmptyFiles(result *WorkerResult, repoPath, workspaceDir string) {
+	log := logger.S()
+	repoBase := filepath.Base(repoPath)
+
+	// Shared 8-second timeout across all backfill searches.
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	defer cancel()
+
+	// tryFill attempts to locate funcName on disk and returns the updated
+	// (File, Line) pair.  It searches repoPath first, then workspaceDir.
+	tryFill := func(funcName, nodeRepo string) (string, int, bool) {
+		if funcName == "" {
+			return "", 0, false
+		}
+		// Determine search roots.  Cross-repo nodes are more likely to be found
+		// under workspaceDir than under the current repoPath.
+		searchDirs := []string{repoPath}
+		if workspaceDir != "" && workspaceDir != repoPath {
+			if nodeRepo != "" && nodeRepo != result.RepoName {
+				searchDirs = []string{workspaceDir}
+			} else {
+				searchDirs = append(searchDirs, workspaceDir)
+			}
+		}
+		for _, pattern := range namingVariants(funcName) {
+			if ctx.Err() != nil {
+				return "", 0, false
+			}
+			for _, dir := range searchDirs {
+				file, line, ok := toolSearchSymbol(ctx, pattern, dir)
+				if ok {
+					// Convert to a consistent workspace-relative path.
+					relFile := file
+					if dir != workspaceDir {
+						relFile = filepath.Join(repoBase, file)
+					}
+					return relFile, line, true
+				}
+			}
+		}
+		return "", 0, false
+	}
+
+	// Backfill Nodes.
+	for i := range result.Nodes {
+		if result.Nodes[i].File != "" {
+			continue
+		}
+		if relFile, line, ok := tryFill(result.Nodes[i].Function, result.Nodes[i].Repo); ok {
+			log.Infow("worker.backfill_empty_file",
+				"repo", result.RepoName,
+				"func", result.Nodes[i].Function,
+				"file", relFile,
+			)
+			result.Nodes[i].File = relFile
+			result.Nodes[i].Line = line
+		}
+	}
+
+	// Backfill EntryPoints.
+	for i := range result.EntryPoints {
+		if result.EntryPoints[i].File != "" {
+			continue
+		}
+		if relFile, line, ok := tryFill(result.EntryPoints[i].Function, result.EntryPoints[i].Repo); ok {
+			log.Infow("worker.backfill_empty_file",
+				"repo", result.RepoName,
+				"func", result.EntryPoints[i].Function,
+				"file", relFile,
+			)
+			result.EntryPoints[i].File = relFile
+			result.EntryPoints[i].Line = line
+		}
+	}
 }
 
 // filterGhostNodes removes CallNode entries whose File field refers to a path

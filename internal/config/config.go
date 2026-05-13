@@ -19,6 +19,20 @@ type Config struct {
 	// Can be overridden per-run via the --index-mode CLI flag.
 	// Environment variable: SHIRAKAMI_INDEX_MODE
 	IndexMode string `mapstructure:"index_mode"`
+	// MaxRounds caps the cross-repo hop iterations (orchestrator rounds).
+	// 0 = default (10, deep mode). Set to 3 for fast mode.
+	// Environment variable: SHIRAKAMI_MAX_ROUNDS
+	MaxRounds int `mapstructure:"max_rounds"`
+	// P1StepBudget is the step budget for P1-priority Workers.
+	// 0 = use global default (300). Recommended: 150 to balance coverage vs. speed.
+	// P0 Workers always use the full budget; P2 Workers are hard-capped at 50.
+	// Environment variable: SHIRAKAMI_P1_STEP_BUDGET
+	P1StepBudget int `mapstructure:"p1_step_budget"`
+	// P0StepBudget is the step budget for P0-priority Workers.
+	// 0 = no cap (legacy behavior, 300 steps). Recommended: 200 to prevent a single
+	// large-diff Worker from monopolising all concurrency for 40+ minutes.
+	// Environment variable: SHIRAKAMI_P0_STEP_BUDGET
+	P0StepBudget int `mapstructure:"p0_step_budget"`
 	// Server holds HTTP server configuration (used in server mode).
 	Server ServerConfig `mapstructure:"server"`
 	// Metrics holds Prometheus export settings.
@@ -163,6 +177,9 @@ func Load(cfgFile string) (*Config, error) {
 	_ = viper.BindEnv("webhook.gitlab_token", "SHIRAKAMI_GITLAB_TOKEN")
 	_ = viper.BindEnv("webhook.github_token", "SHIRAKAMI_GITHUB_TOKEN")
 	_ = viper.BindEnv("index_mode", "SHIRAKAMI_INDEX_MODE")
+	_ = viper.BindEnv("max_rounds", "SHIRAKAMI_MAX_ROUNDS")
+	_ = viper.BindEnv("p1_step_budget", "SHIRAKAMI_P1_STEP_BUDGET")
+	_ = viper.BindEnv("p0_step_budget", "SHIRAKAMI_P0_STEP_BUDGET")
 	_ = viper.BindEnv("server.addr", "SHIRAKAMI_SERVER_ADDR")
 	_ = viper.BindEnv("server.max_concurrent_analyses", "SHIRAKAMI_SERVER_MAX_CONCURRENT")
 	_ = viper.BindEnv("server.default_modes", "SHIRAKAMI_SERVER_DEFAULT_MODES")
@@ -178,6 +195,8 @@ func Load(cfgFile string) (*Config, error) {
 	viper.SetDefault("llm.max_tokens", 128000)
 	viper.SetDefault("llm.request_timeout", 120)
 	viper.SetDefault("index_mode", "off")
+	viper.SetDefault("max_rounds", 3)
+	viper.SetDefault("p1_step_budget", 150)
 	viper.SetDefault("server.addr", ":8080")
 	viper.SetDefault("server.max_concurrent_analyses", 1)
 	viper.SetDefault("server.default_modes", []string{"chain", "e2e", "ut"})

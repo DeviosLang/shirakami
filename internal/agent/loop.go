@@ -8,10 +8,14 @@ import (
 	"sync"
 	"time"
 
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+
 	"github.com/DeviosLang/shirakami/internal/checkpoint"
 	"github.com/DeviosLang/shirakami/internal/compress"
 	"github.com/DeviosLang/shirakami/internal/llm"
 	"github.com/DeviosLang/shirakami/internal/logger"
+	itrace "github.com/DeviosLang/shirakami/internal/trace"
 )
 
 const maxSteps = 300
@@ -75,6 +79,10 @@ type AgentLoop struct {
 	metricsModel string
 	// metricsTaskType is the task_type label (e.g. "worker", "triage") for token metrics.
 	metricsTaskType string
+	// notFoundPaths tracks how many times each file path returned a not_found error.
+	// When a path fails ≥ 2 consecutive times the loop injects a hard-stop UserMessage
+	// so the LLM stops retrying the same non-existent path and wastes no more steps.
+	notFoundPaths map[string]int
 }
 
 // NewAgentLoop constructs a new AgentLoop.
@@ -186,8 +194,16 @@ func (a *AgentLoop) Run(ctx context.Context, taskID string, task string) (*Resul
 		}
 
 		stepStart := time.Now()
-		resp, err := a.llm.Complete(ctx, messages, toolDefs)
+		llmCtx, llmSpan := itrace.Start(ctx, itrace.OpLLMComplete,
+			attribute.String(itrace.AttrTaskID, taskID),
+			attribute.Int(itrace.AttrStepCount, stepCount),
+			attribute.Int(itrace.AttrMessageCount, len(messages)),
+		)
+		resp, err := a.llm.Complete(llmCtx, messages, toolDefs)
 		if err != nil {
+			llmSpan.RecordError(err)
+			llmSpan.SetStatus(codes.Error, err.Error())
+			llmSpan.End()
 			log.Errorw("loop.llm_failed",
 				"task_id", taskID,
 				"step", stepCount,
@@ -196,6 +212,10 @@ func (a *AgentLoop) Run(ctx context.Context, taskID string, task string) (*Resul
 			)
 			return nil, fmt.Errorf("step %d llm complete: %w", stepCount, err)
 		}
+		llmSpan.SetAttributes(
+			attribute.Int(itrace.AttrTokenCount, resp.Usage.TotalTokens),
+		)
+		llmSpan.End()
 		stepCount++
 
 		log.Debugw("loop.step",
@@ -259,6 +279,61 @@ func (a *AgentLoop) Run(ctx context.Context, taskID string, task string) (*Resul
 			toolResults := a.executeTools(ctx, resp.ToolCalls)
 			for _, tr := range toolResults {
 				messages = append(messages, tr)
+			}
+
+			// not_found dedup: if the same file path has returned not_found ≥ 2 times,
+			// inject a hard-stop UserMessage into the conversation so the LLM stops
+			// retrying the path and moves on instead of wasting steps on a loop.
+			var blockedPaths []string
+			for i, tc := range resp.ToolCalls {
+				var content string
+				if tr, ok := toolResults[i].(llm.ToolResultMessage); ok {
+					content = tr.Content
+				}
+				if !strings.Contains(content, `"not_found"`) {
+					continue
+				}
+				// Extract the file_path argument (works for file_reader; other tools
+				// that return not_found will use a fallback key).
+				var args struct {
+					FilePath string `json:"file_path"`
+					Path     string `json:"path"`
+					Pattern  string `json:"pattern"`
+				}
+				_ = json.Unmarshal(tc.Arguments, &args)
+				key := args.FilePath
+				if key == "" {
+					key = args.Path
+				}
+				if key == "" {
+					key = args.Pattern
+				}
+				if key == "" {
+					key = tc.Name + ":" + string(tc.Arguments)
+				}
+				if a.notFoundPaths == nil {
+					a.notFoundPaths = make(map[string]int)
+				}
+				a.notFoundPaths[key]++
+				if a.notFoundPaths[key] >= 2 {
+					blockedPaths = append(blockedPaths, key)
+				}
+			}
+			if len(blockedPaths) > 0 {
+				var sb strings.Builder
+				sb.WriteString("⚠️  以下路径/模式已连续失败，文件不存在，禁止再次尝试读取或搜索：\n")
+				for _, p := range blockedPaths {
+					sb.WriteString("  - ")
+					sb.WriteString(p)
+					sb.WriteString("\n")
+				}
+				sb.WriteString("请使用 ripgrep 搜索函数定义所在的正确路径，或直接跳过该节点继续分析。")
+				messages = append(messages, llm.UserMessage{Content: sb.String()})
+				log.Debugw("loop.not_found_blocked",
+					"task_id", taskID,
+					"step", stepCount,
+					"paths", blockedPaths,
+				)
 			}
 
 		default:

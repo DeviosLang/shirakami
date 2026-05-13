@@ -27,6 +27,134 @@ func isClassOnlyContext(ctx string) bool {
 	return classContextRE.MatchString(ctx)
 }
 
+// FuncHierarchy holds the innermost and outermost enclosing function
+// discovered by scanning backward from a changed line.
+// When the changed line is inside a nested function, Inner is the nested
+// function name (e.g. "worker") and Outer is the module-level function that
+// contains it (e.g. "concurrency_worker_executor").
+// When the changed line is directly inside a module-level function, Inner and
+// Outer are the same value.
+// Both fields are empty when no enclosing function is found.
+type FuncHierarchy struct {
+	Inner string // nearest enclosing function (may be indented/nested)
+	Outer string // outermost enclosing function at indent=0 (same as Inner when not nested)
+}
+
+// ResolveFuncHierarchy scans backward from startLine (1-based) in lines to
+// find both the innermost and outermost enclosing function definition.
+//
+// Algorithm:
+//  1. Scan upward from startLine; on the first function def found, record as
+//     Inner and note its indentation depth.
+//  2. Validate that the candidate function actually encloses startLine: scan
+//     forward from the def line to startLine and verify no same-or-lower
+//     indented non-blank non-comment line terminates the function body before
+//     reaching startLine. If the function ended before startLine, discard it
+//     (the changed line is at module scope, not inside any function).
+//  3. If Inner has indentation > 0 (it is a nested/inner function), continue
+//     scanning upward to find the first def with indentation == 0, which is
+//     the Outer function.
+//  4. If Inner has indentation == 0, Outer = Inner (already at module level).
+//
+// lines must contain raw file content (no diff +/- prefix).
+// maxScan is the maximum number of lines to scan upward.
+func ResolveFuncHierarchy(lines []string, startLine, maxScan int) FuncHierarchy {
+	if startLine < 1 {
+		startLine = 1
+	}
+	idx := startLine - 1 // convert to 0-based
+	if idx >= len(lines) {
+		idx = len(lines) - 1
+	}
+	limit := idx - maxScan
+	if limit < 0 {
+		limit = 0
+	}
+
+	var h FuncHierarchy
+	innerIndent := -1 // indentation of the Inner function line (-1 = not found yet)
+
+	for i := idx; i >= limit; i-- {
+		line := lines[i]
+		for _, re := range sourceFuncDefREs {
+			if m := re.FindStringSubmatch(line); len(m) > 1 {
+				name := m[1]
+				indent := len(line) - len(strings.TrimLeft(line, " \t"))
+
+				if h.Inner == "" {
+					// First (innermost) candidate — validate it actually encloses startLine.
+					// Scan forward from the def line (i) to idx; if we encounter a
+					// non-blank, non-comment line with indentation <= indent that is NOT
+					// the def line itself and is NOT a continuation of the function body
+					// (i.e. it starts at the same or lower indentation as the def), the
+					// function ended before startLine so this def does not enclose it.
+					if funcEndsBeforeIdx(lines, i, idx, indent) {
+						// This def does not enclose startLine — it came before it at
+						// module level. The changed line is at module scope with no
+						// enclosing function.
+						return FuncHierarchy{}
+					}
+					h.Inner = name
+					innerIndent = indent
+					if indent == 0 {
+						// Already at module level — no outer to find
+						h.Outer = name
+						return h
+					}
+					// Inner is nested; continue searching for Outer
+				} else {
+					// Already found Inner; looking for the first unindented def
+					if indent == 0 {
+						h.Outer = name
+						return h
+					}
+					// Still indented; keep scanning (could be a deeper outer)
+					// but only accept if this def's indent < innerIndent,
+					// which means it is a closer enclosing scope.
+					if indent < innerIndent {
+						innerIndent = indent // update to closer enclosing level
+					}
+				}
+				break // only one pattern can match per line
+			}
+		}
+	}
+
+	// If we found Inner but never found an unindented Outer, use Inner as Outer.
+	if h.Inner != "" && h.Outer == "" {
+		h.Outer = h.Inner
+	}
+	return h
+}
+
+// funcEndsBeforeIdx returns true when the function defined at defIdx (0-based)
+// with bodyIndent (the def line's indentation) ends before targetIdx.
+//
+// A Python/Go function body ends when a non-blank, non-comment line appears
+// at indentation <= bodyIndent AND that line is not the def line itself.
+// We scan forward from defIdx+1 to targetIdx-1; if any such line is found,
+// the function body terminated before targetIdx.
+func funcEndsBeforeIdx(lines []string, defIdx, targetIdx, bodyIndent int) bool {
+	for j := defIdx + 1; j < targetIdx; j++ {
+		raw := lines[j]
+		trimmed := strings.TrimLeft(raw, " \t")
+		if trimmed == "" {
+			continue // blank line: function body continues (Python blank lines are fine)
+		}
+		// Single-line comments: Python '#', Go '//', C-style '/*'
+		if strings.HasPrefix(trimmed, "#") || strings.HasPrefix(trimmed, "//") || strings.HasPrefix(trimmed, "/*") {
+			continue
+		}
+		lineIndent := len(raw) - len(trimmed)
+		if lineIndent <= bodyIndent {
+			// A real statement at the same or lower indentation than the def —
+			// the function has ended.
+			return true
+		}
+	}
+	return false
+}
+
 // DiffHunk represents a contiguous block of changed lines in one file.
 // Used by the deterministic diff parser (Layer A) to map diff hunks to
 // symbol definitions without LLM involvement.
@@ -35,6 +163,11 @@ type DiffHunk struct {
 	StartLine   int    // first changed line number (new side)
 	EndLine     int    // last changed line number (new side)
 	FuncContext string // enclosing function name from @@ line context (may be empty)
+	// OuterFuncName holds the outermost (module-level) enclosing function when
+	// FuncContext points to a nested inner function. Set by the Orchestrator's
+	// Layer A+ disk fallback (resolveFuncHierarchyFromDisk). Empty when
+	// FuncContext is already a top-level function or when disk scan is unavailable.
+	OuterFuncName string
 	// RawLines holds the +/- body lines of the hunk (e.g. "+x = 1", "-x = 0").
 	// Used to inject diff snippets into the Worker prompt so the LLM understands
 	// what changed, not just where. Limited to 40 lines to keep token usage bounded.
@@ -56,8 +189,25 @@ type DiffHunk struct {
 // globalVarDefRE matches module-level variable assignments in Python, Go, and JS/TS.
 // These are NOT function definitions, but their usage sites matter for call-chain
 // analysis (e.g. a changed timeout constant affects all callers that reference it).
+//
+// Key design: the pattern requires the variable name to start immediately after the
+// '+' diff prefix (no spaces), which means it only matches TOP-LEVEL (module-scope)
+// assignments. Indented assignments (inside functions or classes) will have leading
+// spaces after '+', so they won't match this pattern.
+//
+// Examples that DO match (module-level):
+//   +WHITE_SET = {...}           (Python constant)
+//   +white_set = {...}           (Python module-level set)
+//   +timeout = 30                (Python/Go module-level variable)
+//   +var MaxRetry = 10           (Go package-level var)
+//   +const DefaultTimeout = 30   (Go/JS constant)
+//
+// Examples that do NOT match (indented, i.e. inside functions/classes):
+//   +    timeout = 20            (Python/Go local variable — leading spaces after '+')
+//   +  self.white_set = {...}    (Python attribute assignment — leading spaces)
+//
 // Group 1 captures the variable name.
-var globalVarDefRE = regexp.MustCompile(`^[+](?:(?:var|const|let)\s+)?([A-Z_][A-Z0-9_]{2,})\s*(?::=|=)[^=]`)
+var globalVarDefRE = regexp.MustCompile(`^[+](?:(?:var|const|let)\s+)?([A-Za-z_]\w*)\s*(?::=|=)[^=]`)
 
 // sourceFuncDefREs holds language-specific patterns for finding function/method
 // definitions when scanning backward from a changed line (改进 1: Layer A+ disk fallback).
@@ -257,10 +407,23 @@ func ParseDiffHunks(diff string) []DiffHunk {
 				rawLinesBuf = append(rawLinesBuf, line)
 			}
 			// Detect module-level global variable assignment in added lines.
-			// Only detect on the first variable found; skip if already inside a function.
-			if currentGlobalVar == "" && hunkFuncCtx == "" {
+			// globalVarDefRE only matches unindented assignments (no leading whitespace
+			// after the '+' prefix), so it is inherently restricted to module-scope.
+			//
+			// We intentionally run this check even when hunkFuncCtx is non-empty.
+			// Git's @@ hunk context heuristic uses the *nearest* enclosing "def"
+			// above the changed lines, which can be a function that ended before the
+			// module-level variable — a false attribution. When the changed line itself
+			// is unindented, the git context is wrong and we override it:
+			//   - Set currentGlobalVar to the variable name.
+			//   - Clear hunkFuncCtx so the Orchestrator emits a FILE_CHANGED_VAR
+			//     sentinel (variable usage search) instead of a function-caller search.
+			if currentGlobalVar == "" {
 				if m := globalVarDefRE.FindStringSubmatch(line); len(m) > 1 {
 					currentGlobalVar = m[1]
+					// Override any misattributed function context from the @@ hunk header.
+					// Module-level assignment cannot be inside the attributed function.
+					hunkFuncCtx = ""
 				}
 			}
 			continue
