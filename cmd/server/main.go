@@ -35,8 +35,13 @@ import (
 	"github.com/DeviosLang/shirakami/internal/memory"
 	"github.com/DeviosLang/shirakami/internal/storage"
 	itool "github.com/DeviosLang/shirakami/internal/tool"
+	itrace "github.com/DeviosLang/shirakami/internal/trace"
 	"github.com/DeviosLang/shirakami/internal/webhook"
 	"github.com/DeviosLang/shirakami/internal/workspace"
+
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
 )
 
 var (
@@ -69,6 +74,20 @@ func runServer(cmd *cobra.Command, args []string) error {
 	}
 	log := logger.Must("production")
 	defer log.Sync() //nolint:errcheck
+
+	// Initialise OpenTelemetry tracing provider.
+	// Uses OTEL_EXPORTER_OTLP_ENDPOINT or OTEL_STDOUT_TRACE env vars;
+	// falls back to no-op when neither is set.
+	otelShutdown, otelErr := itrace.InitProvider("shirakami", version)
+	if otelErr != nil {
+		log.Sugar().Warnw("otel.init_failed", "err", otelErr)
+	} else {
+		defer func() {
+			shutCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			_ = otelShutdown(shutCtx)
+		}()
+	}
 
 	// CLI flag overrides config.
 	listenAddr := cfg.Server.Addr
@@ -234,7 +253,9 @@ func runServer(cmd *cobra.Command, args []string) error {
 	}
 
 	log.Sugar().Infof("listening on %s", listenAddr)
-	return http.ListenAndServe(listenAddr, mux)
+	// Wrap mux with OTel HTTP instrumentation so every request gets a root span
+	// carrying the HTTP method, route, and status code attributes.
+	return http.ListenAndServe(listenAddr, otelhttp.NewHandler(mux, "shirakami"))
 }
 
 // ---------------------------------------------------------------------------
@@ -1041,6 +1062,14 @@ func (s *apiServer) clearProgress(taskID string) {
 // Pass nil when no branch input is available (bare diff / orphan requeue).
 func (s *apiServer) runAnalysis(taskID, inputDiff, inputDesc, cacheKey, sourceRepo string, modes []string, extraPrompt string, activeBranches []BranchEntry) {
 	ctx := context.Background()
+
+	// Root span for the complete analysis lifecycle (semaphore wait → result persist).
+	ctx, rootSpan := itrace.Start(ctx, itrace.OpAnalysisRun,
+		attribute.String(itrace.AttrTaskID, taskID),
+		attribute.String(itrace.AttrSourceRepo, sourceRepo),
+	)
+	defer rootSpan.End()
+
 	log := logger.S()
 
 	// Increment queue counter while waiting for semaphore.
@@ -1084,7 +1113,7 @@ func (s *apiServer) runAnalysis(taskID, inputDiff, inputDesc, cacheKey, sourceRe
 		repoDir := filepath.Join(s.cfg.Workspace.Dir, be.Repo)
 		wtDir := filepath.Join(wtBase, be.Repo)
 		ref := "origin/" + be.Branch
-		wtCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
+		wtCtx, cancel := context.WithTimeout(ctx, 3*time.Minute)
 		if err := workspace.CreateWorktree(wtCtx, repoDir, wtDir, ref); err != nil {
 			log.Warnw("worktree.create_failed (falling back to master)",
 				"task_id", taskID, "repo", be.Repo, "branch", be.Branch, "err", err)
@@ -1110,6 +1139,7 @@ func (s *apiServer) runAnalysis(taskID, inputDiff, inputDesc, cacheKey, sourceRe
 	// Check cache first.
 	s.cacheTotal.Add(1)
 	if cached, ok := s.cache.Get(ctx, cacheKey); ok {
+		rootSpan.SetAttributes(attribute.Bool(itrace.AttrCacheHit, true))
 		s.cacheHits.Add(1)
 		if s.metrics != nil {
 			hits := float64(s.cacheHits.Load())
@@ -1187,6 +1217,19 @@ func (s *apiServer) runAnalysis(taskID, inputDiff, inputDesc, cacheKey, sourceRe
 	if len(contractHints) > 0 {
 		orch.SetContractHints(contractHints)
 	}
+	// Apply max_rounds from config (default 3 via config default).
+	// CLI fast mode uses SetMaxRounds(3); here we read the configured value directly.
+	if s.cfg.MaxRounds > 0 {
+		orch.SetMaxRounds(s.cfg.MaxRounds)
+	}
+	// Apply P1 step budget from config (default 150 via config default).
+	if s.cfg.P1StepBudget > 0 {
+		orch.SetP1StepBudget(s.cfg.P1StepBudget)
+	}
+	// Apply P0 step budget from config (default 0 = no cap).
+	if s.cfg.P0StepBudget > 0 {
+		orch.SetP0StepBudget(s.cfg.P0StepBudget)
+	}
 	if s.cfg.IndexMode != "" && s.cfg.IndexMode != "off" {
 		orch.SetIndexMode(s.cfg.IndexMode)
 	}
@@ -1207,6 +1250,8 @@ func (s *apiServer) runAnalysis(taskID, inputDiff, inputDesc, cacheKey, sourceRe
 	})
 	if err != nil {
 		log.Errorw("analysis failed", "task_id", taskID, "err", err)
+		rootSpan.RecordError(err)
+		rootSpan.SetStatus(codes.Error, err.Error())
 		_ = s.store.UpdateTaskStatusWithError(ctx, taskID, err.Error())
 		if s.metrics != nil {
 			s.metrics.RecordTask("failed")
@@ -1576,8 +1621,14 @@ func (s *apiServer) fetchBranchDiff(repoName, featureBranch string) (diff, baseB
 	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 	defer cancel()
 
-	// 1. Fetch all remote refs (including the feature branch).
-	fetchCmd := exec.CommandContext(ctx, "git", "-C", repoDir, "fetch", "--depth=50", "origin", featureBranch)
+	// 1. Fetch the feature branch and explicitly map it to a remote-tracking ref
+	// (refs/remotes/origin/<branch>) so that "git worktree add origin/<branch>"
+	// works even when the repo was cloned with --single-branch (only master in
+	// the fetch refspec). Without the explicit refspec, git fetch only updates
+	// FETCH_HEAD and leaves refs/remotes/origin/<branch> missing.
+	remoteRef := fmt.Sprintf("refs/remotes/origin/%s", featureBranch)
+	fetchRefspec := fmt.Sprintf("%s:%s", featureBranch, remoteRef)
+	fetchCmd := exec.CommandContext(ctx, "git", "-C", repoDir, "fetch", "--depth=50", "origin", fetchRefspec)
 	if out, ferr := fetchCmd.CombinedOutput(); ferr != nil {
 		if strings.Contains(string(out), "couldn't find remote ref") {
 			return "", "", &errBranchNotFound{Repo: repoName, Branch: featureBranch}
@@ -1599,13 +1650,45 @@ func (s *apiServer) fetchBranchDiff(repoName, featureBranch string) (diff, baseB
 	//    git will append enclosing function names to @@ hunk headers because
 	//    WriteGitInfoAttributes has already wired up the built-in diff drivers
 	//    (python, golang, cpp, …) via .git/info/attributes.
+
+	// Always (re-)fetch the base branch so that origin/<baseBranch> is a real
+	// remote-tracking ref with sufficient history for the three-dot diff below.
+	// A conditional check is not enough: a shallow clone may have the ref but
+	// lack the merge-base commit, causing `git diff origin/<base>...FETCH_HEAD`
+	// to exit 128.  The fetch also handles base branches with slashes (e.g.
+	// "tce/master") where the ref path can be ambiguous in some git versions.
+	baseRemoteRef := fmt.Sprintf("refs/remotes/origin/%s", baseBranch)
+	fetchBaseCmd := exec.CommandContext(ctx, "git", "-C", repoDir, "fetch", "--depth=50", "origin",
+		fmt.Sprintf("refs/heads/%s:%s", baseBranch, baseRemoteRef))
+	if fetchBaseOut, fetchBaseErr := fetchBaseCmd.CombinedOutput(); fetchBaseErr != nil {
+		return "", baseBranch, fmt.Errorf("git fetch origin %s (base branch for diff): %w\n%s", baseBranch, fetchBaseErr, fetchBaseOut)
+	}
+
 	diffRef := fmt.Sprintf("origin/%s...FETCH_HEAD", baseBranch)
 	diffCmd := exec.CommandContext(ctx, "git", "-C", repoDir, "diff", diffRef)
 	out, derr := diffCmd.Output()
 	if derr != nil {
-		// Exit code 1 from git diff means non-empty diff — that's fine.
-		// Any other error is a real failure.
-		if exitErr, ok := derr.(*exec.ExitError); !ok || exitErr.ExitCode() != 1 {
+		// Exit code 1 from git diff means "non-empty diff" — that's fine.
+		// Exit code 128 often means shallow clone lacks the merge-base commit;
+		// deepen and retry once before giving up.
+		exitErr, isExit := derr.(*exec.ExitError)
+		if !isExit {
+			return "", baseBranch, fmt.Errorf("git diff %s: %w", diffRef, derr)
+		}
+		if exitErr.ExitCode() == 128 {
+			// Deepen both sides and retry.
+			exec.CommandContext(ctx, "git", "-C", repoDir, "fetch", "--deepen=100", "origin").Run() //nolint:errcheck
+			exec.CommandContext(ctx, "git", "-C", repoDir, "fetch", "--depth=100", "origin",
+				fmt.Sprintf("refs/heads/%s:%s", baseBranch, baseRemoteRef)).Run() //nolint:errcheck
+			diffCmd2 := exec.CommandContext(ctx, "git", "-C", repoDir, "diff", diffRef)
+			out2, derr2 := diffCmd2.Output()
+			if derr2 != nil {
+				if exitErr2, ok2 := derr2.(*exec.ExitError); !ok2 || exitErr2.ExitCode() != 1 {
+					return "", baseBranch, fmt.Errorf("git diff %s: %w", diffRef, derr2)
+				}
+			}
+			out = out2
+		} else if exitErr.ExitCode() != 1 {
 			return "", baseBranch, fmt.Errorf("git diff %s: %w", diffRef, derr)
 		}
 	}
@@ -1908,6 +1991,14 @@ func nextRunAt(now time.Time, hour, minute int) time.Time {
 // Each repo's index is rebuilt serially to avoid overloading the NFS workspace.
 func (s *apiServer) runNightlyIndex(ctx context.Context) {
 	log := logger.Must("production")
+
+	// Respect the same FIFO semaphore as runAnalysis so that a nightly index run
+	// never bypasses the server's concurrency limit and races with user tasks.
+	s.queueCounter.Add(1)
+	s.semaphore <- struct{}{}
+	s.queueCounter.Add(-1)
+	defer func() { <-s.semaphore }()
+
 	store := index.NewStore(s.pool)
 
 	for _, r := range s.cfg.Workspace.Repos {
