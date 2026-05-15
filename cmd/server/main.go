@@ -1675,7 +1675,10 @@ func (s *apiServer) fetchBranchDiff(repoName, featureBranch string) (diff, baseB
 	}
 
 	// 3. Compute three-dot diff: changes on featureBranch not yet in baseBranch.
-	//    Using FETCH_HEAD (just fetched) vs origin/<baseBranch> keeps it self-contained.
+	//    Use origin/<featureBranch> (the remote-tracking ref written by step 1)
+	//    rather than FETCH_HEAD.  The base-branch fetch in step 3a overwrites
+	//    FETCH_HEAD with the base branch tip, making the diff empty — using the
+	//    named remote-tracking ref avoids this race.
 	//    git will append enclosing function names to @@ hunk headers because
 	//    WriteGitInfoAttributes has already wired up the built-in diff drivers
 	//    (python, golang, cpp, …) via .git/info/attributes.
@@ -1683,7 +1686,7 @@ func (s *apiServer) fetchBranchDiff(repoName, featureBranch string) (diff, baseB
 	// Always (re-)fetch the base branch so that origin/<baseBranch> is a real
 	// remote-tracking ref with sufficient history for the three-dot diff below.
 	// A conditional check is not enough: a shallow clone may have the ref but
-	// lack the merge-base commit, causing `git diff origin/<base>...FETCH_HEAD`
+	// lack the merge-base commit, causing `git diff origin/<base>...origin/<feature>`
 	// to exit 128.  The fetch also handles base branches with slashes (e.g.
 	// "tce/master") where the ref path can be ambiguous in some git versions.
 	baseRemoteRef := fmt.Sprintf("refs/remotes/origin/%s", baseBranch)
@@ -1693,7 +1696,9 @@ func (s *apiServer) fetchBranchDiff(repoName, featureBranch string) (diff, baseB
 		return "", baseBranch, fmt.Errorf("git fetch origin %s (base branch for diff): %w\n%s", baseBranch, fetchBaseErr, fetchBaseOut)
 	}
 
-	diffRef := fmt.Sprintf("origin/%s...FETCH_HEAD", baseBranch)
+	// Use origin/<featureBranch> instead of FETCH_HEAD so that the base-branch
+	// fetch above (which also updates FETCH_HEAD) does not clobber the ref.
+	diffRef := fmt.Sprintf("origin/%s...origin/%s", baseBranch, featureBranch)
 	diffCmd := exec.CommandContext(ctx, "git", "-C", repoDir, "diff", diffRef)
 	out, derr := diffCmd.Output()
 	if derr != nil {
