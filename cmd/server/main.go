@@ -730,8 +730,8 @@ func (s *apiServer) submitTask(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		if len(descParts) == 0 {
-			// Every repo was skipped (all branches missing). Nothing to analyse.
-			errMsg := "all branches not found on remote: " + strings.Join(submitWarnings, "; ")
+			// Every repo was skipped (branch not found or already merged). Nothing to analyse.
+			errMsg := "all branches skipped (not found or already merged): " + strings.Join(submitWarnings, "; ")
 			s.recordFailedSubmit(r.Context(), req, errMsg)
 			jsonError(w, errMsg, http.StatusBadRequest)
 			return

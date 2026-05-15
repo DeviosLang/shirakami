@@ -269,6 +269,11 @@ try:
     resp = http_json(TASKS_URL, request_body, timeout=180)
 except urllib.error.HTTPError as e:
     body = e.read().decode(errors="replace")
+    # 所有分支均已合入 base branch（empty diff）时服务器返回 400，
+    # 这不是真正的错误——分支已合入说明代码已上线，无需分析，CI 正常退出。
+    if e.code == 400 and "already merged" in body:
+        print(f"提示：所有分支已合入目标分支，无新增 diff，跳过分析。({body})")
+        sys.exit(0)
     print(f"错误：提交失败 HTTP {e.code}: {body}", file=sys.stderr)
     sys.exit(1)
 
