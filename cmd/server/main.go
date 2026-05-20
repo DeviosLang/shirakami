@@ -230,7 +230,6 @@ func runServer(cmd *cobra.Command, args []string) error {
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", handleHealthz)
-	mux.Handle("/metrics", feedback.Handler())
 	mux.HandleFunc("/api/v1/repos", srv.handleRepos)
 	mux.HandleFunc("/api/v1/repos/register", srv.handleReposRegister)
 	mux.HandleFunc("/api/v1/tasks", srv.handleTasks)
@@ -253,6 +252,21 @@ func runServer(cmd *cobra.Command, args []string) error {
 	}
 
 	log.Sugar().Infof("listening on %s", listenAddr)
+
+	// Start a dedicated metrics server on a separate port so that /metrics is
+	// never reachable through the external-facing Service/LoadBalancer.
+	// The port defaults to :9091 and can be overridden via
+	// SHIRAKAMI_SERVER_METRICS_ADDR or shirakami.yaml server.metrics_addr.
+	metricsAddr := cfg.Server.MetricsAddr
+	metricsMux := http.NewServeMux()
+	metricsMux.Handle("/metrics", feedback.Handler())
+	go func() {
+		log.Sugar().Infof("metrics listening on %s", metricsAddr)
+		if err := http.ListenAndServe(metricsAddr, metricsMux); err != nil {
+			log.Sugar().Errorw("metrics server error", "err", err)
+		}
+	}()
+
 	// Wrap mux with OTel HTTP instrumentation so every request gets a root span
 	// carrying the HTTP method, route, and status code attributes.
 	return http.ListenAndServe(listenAddr, otelhttp.NewHandler(mux, "shirakami"))

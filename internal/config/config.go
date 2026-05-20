@@ -110,6 +110,12 @@ type ServerConfig struct {
 	// Environment variable: SHIRAKAMI_SERVER_ADDR
 	Addr string `mapstructure:"addr"`
 
+	// MetricsAddr is the listen address for the Prometheus /metrics endpoint.
+	// It is intentionally separated from the main API port so that /metrics is
+	// never exposed through the external-facing Service/LoadBalancer.
+	// Default: ":9091". Environment variable: SHIRAKAMI_SERVER_METRICS_ADDR
+	MetricsAddr string `mapstructure:"metrics_addr"`
+
 	// MaxConcurrentAnalyses limits how many analysis jobs run simultaneously.
 	// Useful for NFS-backed workspaces where concurrent git operations conflict.
 	// Default: 1. Environment variable: SHIRAKAMI_SERVER_MAX_CONCURRENT
@@ -181,6 +187,7 @@ func Load(cfgFile string) (*Config, error) {
 	_ = viper.BindEnv("p1_step_budget", "SHIRAKAMI_P1_STEP_BUDGET")
 	_ = viper.BindEnv("p0_step_budget", "SHIRAKAMI_P0_STEP_BUDGET")
 	_ = viper.BindEnv("server.addr", "SHIRAKAMI_SERVER_ADDR")
+	_ = viper.BindEnv("server.metrics_addr", "SHIRAKAMI_SERVER_METRICS_ADDR")
 	_ = viper.BindEnv("server.max_concurrent_analyses", "SHIRAKAMI_SERVER_MAX_CONCURRENT")
 	_ = viper.BindEnv("server.default_modes", "SHIRAKAMI_SERVER_DEFAULT_MODES")
 	_ = viper.BindEnv("metrics.pushgateway_url", "SHIRAKAMI_METRICS_PUSHGATEWAY_URL")
@@ -198,6 +205,7 @@ func Load(cfgFile string) (*Config, error) {
 	viper.SetDefault("max_rounds", 3)
 	viper.SetDefault("p1_step_budget", 150)
 	viper.SetDefault("server.addr", ":8080")
+	viper.SetDefault("server.metrics_addr", ":9091")
 	viper.SetDefault("server.max_concurrent_analyses", 1)
 	viper.SetDefault("server.default_modes", []string{"chain", "e2e", "ut"})
 	viper.SetDefault("metrics.push_interval_seconds", 30)
